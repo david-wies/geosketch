@@ -10,7 +10,7 @@ This document describes a moving target. The repo will grow source code, a packa
 - **Domain model** — when the spec in `spec/MVP.md` changes, reconcile the eight-point list here (especially ID prefixes, angle conventions, and the vector endpoint formula).
 - **UI architecture** — once real widgets exist, replace the "when implementation begins" framing with pointers to the actual modules.
 - Add a **Common commands** section the first time there are commands worth listing.
-- Add a **Git workflow** note once the repo is initialized and has a remote — branch naming, PR conventions, whatever the user adopts.
+- Add a **Git workflow** note once the repo has a remote — branch naming, PR conventions, whatever the user adopts.
 
 If you're unsure whether a change warrants a CLAUDE.md edit, err toward updating: a small stale line is worse than a small redundant one.
 
@@ -72,8 +72,7 @@ spec/               ← product spec and UI/UX design (source of truth)
     _generate_drawio.py        ← regenerate the drawio; run after any change
     diagrams/                  ← earlier wireframe sketches (reference only)
 docs/
-  design/
-    geo-sketch-design.md       ← architecture and design document
+  geo-sketch-design.md         ← architecture and design document
 ```
 
 The real entry point is `geometry/__main__.py` (declared in `pyproject.toml`). `main.py` at the repo root is a convenience shim for `python main.py` during development; keep all startup logic in `geometry/__main__.py`.
