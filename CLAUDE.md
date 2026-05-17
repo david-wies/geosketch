@@ -10,7 +10,7 @@ This document describes a moving target. The repo will grow source code, a packa
 - **Domain model** — when the spec in `spec/MVP.md` changes, reconcile the eight-point list here (especially ID prefixes, angle conventions, and the vector endpoint formula).
 - **UI architecture** — once real widgets exist, replace the "when implementation begins" framing with pointers to the actual modules.
 - Add a **Common commands** section the first time there are commands worth listing.
-- Add a **Git workflow** note once the repo has a remote — branch naming, PR conventions, whatever the user adopts.
+- Add a **Git workflow** note once branch naming and PR conventions are decided.
 
 If you're unsure whether a change warrants a CLAUDE.md edit, err toward updating: a small stale line is worse than a small redundant one.
 
@@ -76,6 +76,8 @@ docs/
 ```
 
 The real entry point is `geometry/__main__.py` (declared in `pyproject.toml`). `main.py` at the repo root is a convenience shim for `python main.py` during development; keep all startup logic in `geometry/__main__.py`.
+
+**Remote**: https://github.com/david-wies/geosketch (public, Apache 2.0).
 
 There is **no functional code to run yet**. Do not invent `python -m geometry` / `pytest` invocations until implementation begins.
 
