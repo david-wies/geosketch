@@ -35,4 +35,4 @@ jobs:
         run: pylint $(git ls-files '*.py')
 
       - name: Test (pytest)
-        run: pytest --tb=short; code=$?; [ $code -eq 5 ] && echo "No tests collected." || exit $code
+        run: pytest --tb=short || { code=$?; [ $code -eq 5 ] && echo "No tests collected." || exit $code; }
