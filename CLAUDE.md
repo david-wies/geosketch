@@ -10,7 +10,6 @@ This document describes a moving target. The repo will grow source code, a packa
 - **Domain model** — when the spec in `spec/MVP.md` changes, reconcile the eight-point list here (especially ID prefixes, angle conventions, and the vector endpoint formula).
 - **UI architecture** — once real widgets exist, replace the "when implementation begins" framing with pointers to the actual modules.
 - Add a **Common commands** section the first time there are commands worth listing.
-- Add a **Git workflow** note once branch naming and PR conventions are decided.
 
 If you're unsure whether a change warrants a CLAUDE.md edit, err toward updating: a small stale line is worse than a small redundant one.
 
@@ -138,6 +137,17 @@ The UI design is fixed by `spec/design/geometry-app-ui-ux.md` (text spec) and `s
 - **Polygon file import dialog** also exposes `Vertex ordering` radios (`Boundary order` / `Sort (centroid + polar angle)`); see `MVP.md`.
 - **Edit reuses the create dialog** with fields prefilled — do not build a separate edit form.
 - **Render-on-demand canvas**: the canvas only redraws when explicitly requested, not on every model change. The trigger list lives in `MVP.md` §Canvas Display.
+
+## Git workflow
+
+**Never commit directly to `main`.** All changes — including documentation, spec edits, and code — must go through a feature branch and a pull request.
+
+1. Create a branch before making any changes: `git checkout -b <type>/<short-description>` (e.g. `feat/point-model`, `fix/polygon-winding`, `docs/update-readme`).
+2. Commit your work on the branch.
+3. Open a PR against `main` on GitHub (`gh pr create`).
+4. Do not push directly to `main` or use `git push origin main`.
+
+Branch naming convention: `<type>/<kebab-description>` where type is one of `feat`, `fix`, `refactor`, `docs`, `chore`, `test`.
 
 ## `.github/` directory — what's actually loaded
 
