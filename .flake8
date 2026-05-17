@@ -1,0 +1,10 @@
+[flake8]
+max-line-length = 100
+exclude =
+    .venv,
+    .git,
+    .claude,
+    .github,
+    .ruff_cache,
+    __pycache__,
+    *.egg-info
