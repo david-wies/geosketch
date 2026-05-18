@@ -15,6 +15,7 @@
 
 ## Checklist
 
+- [ ] Branch is **not** `main` (all changes must come from a feature branch)
 - [ ] New Python files include the Apache 2.0 license header
 - [ ] `CLAUDE.md` updated if the domain model, layout, or commands changed
 - [ ] No debug prints or commented-out code left in

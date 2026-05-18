@@ -13,5 +13,17 @@
 # limitations under the License.
 
 
+from importlib.metadata import version, PackageNotFoundError
+
+try:
+    _VERSION = version("geosketch")
+except PackageNotFoundError:
+    _VERSION = "unknown"
+
+
 def main() -> None:
-    pass
+    print(f"GeoSketch v{_VERSION} — UI not yet implemented")
+
+
+if __name__ == "__main__":
+    main()
