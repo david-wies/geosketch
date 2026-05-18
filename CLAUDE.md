@@ -146,10 +146,10 @@ After completing a PR review, **always post the findings as a comment on the PR*
 When a PR includes a **Test Plan** section (a checklist of test steps), **execute every step** as part of the review — even if the checklist items are already marked done. After running each step, update the comment to mark passing items with `[x]` and failing items with a note. Do this on every review pass, including re-reviews before merge, so the test plan reflects the current state of the code.
 
 ### Issue implementation
-When implementing an issue that contains **Acceptance Criteria**, treat each criterion as a gate:
-1. After finishing implementation, go through every criterion one by one and verify it is satisfied.
-2. Post a comment on the issue (or PR that closes it) marking each criterion `[x]` (done) or `[ ]` (not done) with a brief note.
-3. Do not consider the implementation complete until all criteria are checked off.
+When implementing an issue that contains **Acceptance Criteria** and/or a **Definition of Done**, treat each item as a gate:
+1. After finishing implementation, go through every Acceptance Criterion and every Definition of Done item one by one and verify it is satisfied.
+2. Post a comment on the issue **and** on any PR that closes it, marking each item `[x]` (done) or `[ ]` (not done) with a brief note.
+3. **Do not merge the PR and do not close the issue until every item is marked `[x]`.** If an item cannot be satisfied, surface the blocker explicitly before proceeding.
 
 ## Git workflow
 
