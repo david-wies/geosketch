@@ -16,13 +16,13 @@
 from importlib.metadata import version, PackageNotFoundError
 
 try:
-    _version = version("geosketch")
+    _VERSION = version("geosketch")
 except PackageNotFoundError:
-    _version = "unknown"
+    _VERSION = "unknown"
 
 
 def main() -> None:
-    print(f"GeoSketch v{_version} — UI not yet implemented")
+    print(f"GeoSketch v{_VERSION} — UI not yet implemented")
 
 
 if __name__ == "__main__":
