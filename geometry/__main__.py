@@ -14,4 +14,8 @@
 
 
 def main() -> None:
-    pass
+    print("GeoSketch v0.1.0 — UI not yet implemented")
+
+
+if __name__ == "__main__":
+    main()

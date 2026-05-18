@@ -47,7 +47,7 @@ When adding a third-party dependency, verify it carries a license compatible wit
 
 ## Repository status
 
-The project has a scaffolded package structure but **no implementation yet**. Source files are empty stubs. Do not treat any module as functional until code is actually written inside it.
+The project has a scaffolded package structure. Most source files are empty stubs, but the entry point is wired and runnable (`geometry/__main__.py` prints a placeholder). Do not treat any module beyond `__main__.py` as functional until code is actually written inside it.
 
 Key layout:
 ```
@@ -78,7 +78,7 @@ The real entry point is `geometry/__main__.py` (declared in `pyproject.toml`). `
 
 **Remote**: https://github.com/david-wies/geosketch (public, Apache 2.0).
 
-There is **no functional code to run yet**. Do not invent `python -m geometry` / `pytest` invocations until implementation begins.
+The entry point is functional: `python -m geometry` (or `python main.py`) prints the placeholder banner. All other modules remain stubs.
 
 ## Environment + common commands
 
@@ -137,6 +137,19 @@ The UI design is fixed by `spec/design/geometry-app-ui-ux.md` (text spec) and `s
 - **Polygon file import dialog** also exposes `Vertex ordering` radios (`Boundary order` / `Sort (centroid + polar angle)`); see `MVP.md`.
 - **Edit reuses the create dialog** with fields prefilled — do not build a separate edit form.
 - **Render-on-demand canvas**: the canvas only redraws when explicitly requested, not on every model change. The trigger list lives in `MVP.md` §Canvas Display.
+
+## PR review and issue implementation workflow
+
+### PR reviews
+After completing a PR review, **always post the findings as a comment on the PR** using `gh pr comment <number> --body "..."`. Do not just report findings in the conversation — they must be recorded on the PR itself.
+
+When a PR includes a **Test Plan** section (a checklist of test steps), **execute every step** as part of the review — even if the checklist items are already marked done. After running each step, update the comment to mark passing items with `[x]` and failing items with a note. Do this on every review pass, including re-reviews before merge, so the test plan reflects the current state of the code.
+
+### Issue implementation
+When implementing an issue that contains **Acceptance Criteria**, treat each criterion as a gate:
+1. After finishing implementation, go through every criterion one by one and verify it is satisfied.
+2. Post a comment on the issue (or PR that closes it) marking each criterion `[x]` (done) or `[ ]` (not done) with a brief note.
+3. Do not consider the implementation complete until all criteria are checked off.
 
 ## Git workflow
 
