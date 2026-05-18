@@ -243,6 +243,8 @@ Direction metadata = `direction: float` (radians) + `direction_mode: DirectionMo
 
 Model objects are mutable dataclasses (allows in-place undo). Commands snapshot the before-state when constructed so they can restore it on `undo()`. Do not mutate model objects outside of command `do()` / `undo()`.
 
+In particular, `Polygon.point_ids` is a plain mutable `list[str]`. It must only be modified by `ModifyPolygonVerticesCommand`; nothing else should append, remove, or reorder elements directly.
+
 ---
 
 ## Geometry Services (`services/geometry.py`)

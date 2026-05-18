@@ -572,7 +572,8 @@ Measurement tools compute scalar properties of existing objects. They are read-o
         "direction": 0.7854,
         "direction_mode": "azimuth",
         "direction_units": "radians",
-        "length": 100.0
+        "length": 100.0,
+        "endpoint_id": null
       }
     },
     {
