@@ -12,24 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from geometry.models.circle import Circle
-from geometry.models.common import DirectionMode, DirectionUnits, GeoObject
-from geometry.models.line import Line
-from geometry.models.point import Point
-from geometry.models.polygon import Polygon
-from geometry.models.ray import Ray
-from geometry.models.tangent import Tangent
-from geometry.models.vector import Vector
+from __future__ import annotations
 
-__all__ = [
-    "GeoObject",
-    "DirectionMode",
-    "DirectionUnits",
-    "Point",
-    "Line",
-    "Polygon",
-    "Ray",
-    "Vector",
-    "Circle",
-    "Tangent",
-]
+from dataclasses import dataclass
+
+from geometry.models.common import GeoObject
+
+
+@dataclass
+class Point(GeoObject):
+    """A UTM point with easting and northing coordinates.
+
+    Coordinates are in meters. Easting comes first in tuples (UTM convention).
+
+    Fields
+    ------
+    easting : float
+        UTM easting in metres.
+    northing : float
+        UTM northing in metres.
+    color : str
+        Hex colour string for the marker (e.g. ``"#FF0000"``).
+    """
+
+    easting: float
+    northing: float
+    color: str

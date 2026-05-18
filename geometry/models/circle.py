@@ -12,24 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from geometry.models.circle import Circle
-from geometry.models.common import DirectionMode, DirectionUnits, GeoObject
-from geometry.models.line import Line
-from geometry.models.point import Point
-from geometry.models.polygon import Polygon
-from geometry.models.ray import Ray
-from geometry.models.tangent import Tangent
-from geometry.models.vector import Vector
+from __future__ import annotations
 
-__all__ = [
-    "GeoObject",
-    "DirectionMode",
-    "DirectionUnits",
-    "Point",
-    "Line",
-    "Polygon",
-    "Ray",
-    "Vector",
-    "Circle",
-    "Tangent",
-]
+from dataclasses import dataclass
+
+from geometry.models.common import GeoObject
+
+
+@dataclass
+class Circle(GeoObject):
+    """A circle defined by a centre point and a radius.
+
+    Fields
+    ------
+    center_id : str
+        ID of the centre point.
+    radius : float
+        Radius in metres.
+    line_color : str
+        Hex colour string for the outline stroke.
+    fill_color : str
+        Hex colour string for the interior fill.
+    """
+
+    center_id: str
+    radius: float
+    line_color: str
+    fill_color: str
