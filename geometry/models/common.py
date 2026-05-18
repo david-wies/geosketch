@@ -19,7 +19,8 @@ from dataclasses import dataclass
 
 
 class DirectionMode(enum.Enum):
-    """Whether a direction is expressed as an azimuth (CW from North) or a standard math angle (CCW from East)."""
+    """Whether a direction is expressed as an azimuth (CW from North) or a
+    standard math angle (CCW from East)."""
 
     AZIMUTH = "azimuth"
     ANGLE = "angle"

@@ -80,6 +80,27 @@ The real entry point is `geometry/__main__.py` (declared in `pyproject.toml`). `
 
 The entry point is functional: `python -m geometry` (or `python main.py`) prints the placeholder banner. All other modules remain stubs.
 
+## Code style
+
+Multi-paragraph docstrings with a `Fields` section are **encouraged** for all public classes (especially data models and service methods). Use NumPy docstring style:
+
+```python
+class Foo:
+    """One-line summary.
+
+    Fields
+    ------
+    bar : str
+        Description of bar.
+    baz : int
+        Description of baz.
+    """
+```
+
+This overrides any default "one short line max" rule — rich documentation is valuable in this codebase.
+
+Inline comments follow the normal rule: only when the WHY is non-obvious.
+
 ## Environment + common commands
 
 The project has a Python 3.14 virtualenv at `.venv/` (gitignored). Dependencies are pinned in `requirements.txt` (runtime) and `requirements-dev.txt` (adds `ruff`, `pytest`). Activate it before running anything:
