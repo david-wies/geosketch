@@ -109,10 +109,10 @@ The project has a Python 3.14 virtualenv at `.venv/` (gitignored). Dependencies 
 source .venv/bin/activate          # or: .venv/bin/python <cmd>
 ```
 
-- `python3 -m venv .venv && .venv/bin/python -m pip install -r requirements-dev.txt` — recreate the venv from scratch (e.g. on a fresh clone).
+- `python3 -m venv .venv && .venv/bin/python -m pip install -r requirements-dev.txt` — recreate the venv from scratch (e.g. on a fresh clone). Use the **venv's own pip** (`.venv/bin/python -m pip`), not the system pip — system pip on Debian redirects `--prefix` installs to a `local/` subdirectory and skips entry-point script creation.
 - `.venv/bin/python spec/design/_generate_drawio.py` — regenerate `spec/design/geometry-app-ui-ux.drawio` from the Python source. Run this whenever you change the generator; never hand-edit the drawio XML.
-- `.venv/lib/python3.14/site-packages/bin/ruff check .` — lint. (`ruff` was installed with `--target` so its binary lands here, not in `.venv/bin/`).
-- `.venv/bin/python -m pytest` — run tests. (`pytest` has no bin wrapper because packages were installed with `--target`; always invoke via `python -m pytest`, never `.venv/bin/pytest`).
+- `.venv/bin/ruff check .` — lint.
+- `.venv/bin/pytest` — run tests.
 
 The target stack:
 
