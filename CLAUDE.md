@@ -111,6 +111,7 @@ source .venv/bin/activate          # or: .venv/bin/python <cmd>
 
 - `python3 -m venv .venv && .venv/bin/python -m pip install -r requirements-dev.txt` — recreate the venv from scratch (e.g. on a fresh clone). Use the **venv's own pip** (`.venv/bin/python -m pip`), not the system pip — system pip on Debian redirects `--prefix` installs to a `local/` subdirectory and skips entry-point script creation.
 - `.venv/bin/python spec/design/_generate_drawio.py` — regenerate `spec/design/geometry-app-ui-ux.drawio` from the Python source. Run this whenever you change the generator; never hand-edit the drawio XML.
+- `.venv/bin/ruff format .` — format. Run this **before** `ruff check`; CI runs both and will fail if either is skipped.
 - `.venv/bin/ruff check .` — lint.
 - `.venv/bin/pytest` — run tests.
 
