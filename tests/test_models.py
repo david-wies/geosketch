@@ -63,8 +63,15 @@ def test_geo_object_fields():
 
 
 def test_point_instantiation():
-    pt = Point(id="pt_001", name="A", alpha=1.0, visibility=True,
-               easting=100.0, northing=200.0, color="#ff0000")
+    pt = Point(
+        id="pt_001",
+        name="A",
+        alpha=1.0,
+        visibility=True,
+        easting=100.0,
+        northing=200.0,
+        color="#ff0000",
+    )
     assert pt.type == "point"
     assert pt.easting == 100.0
     assert pt.northing == 200.0
@@ -78,71 +85,123 @@ def test_point_type_not_in_init():
 
 
 def test_line_instantiation():
-    ln = Line(id="ln_001", name="AB", alpha=1.0, visibility=True,
-              point_a_id="pt_001", point_b_id="pt_002",
-              direction=0.785, direction_mode=DirectionMode.AZIMUTH,
-              direction_units=DirectionUnits.RADIANS,
-              line_color="#0000ff", fill_color="#0000ff")
+    ln = Line(
+        id="ln_001",
+        name="AB",
+        alpha=1.0,
+        visibility=True,
+        point_a_id="pt_001",
+        point_b_id="pt_002",
+        direction=0.785,
+        direction_mode=DirectionMode.AZIMUTH,
+        direction_units=DirectionUnits.RADIANS,
+        line_color="#0000ff",
+        fill_color="#0000ff",
+    )
     assert ln.type == "line"
     assert ln.point_a_id == "pt_001"
 
 
 def test_polygon_instantiation():
-    pg = Polygon(id="pg_001", name="Tri", alpha=0.8, visibility=True,
-                 point_ids=["pt_001", "pt_002", "pt_003"],
-                 is_convex=True, line_color="#ffff00", fill_color="#ffffcc")
+    pg = Polygon(
+        id="pg_001",
+        name="Tri",
+        alpha=0.8,
+        visibility=True,
+        point_ids=["pt_001", "pt_002", "pt_003"],
+        is_convex=True,
+        line_color="#ffff00",
+        fill_color="#ffffcc",
+    )
     assert pg.type == "polygon"
     assert pg.point_ids == ["pt_001", "pt_002", "pt_003"]
     assert pg.is_convex is True
 
 
 def test_ray_instantiation():
-    ry = Ray(id="ry_001", name="R", alpha=1.0, visibility=True,
-             origin_id="pt_001", direction=1.571,
-             direction_mode=DirectionMode.AZIMUTH,
-             direction_units=DirectionUnits.RADIANS,
-             line_color="#ff00ff", fill_color="#ff00ff")
+    ry = Ray(
+        id="ry_001",
+        name="R",
+        alpha=1.0,
+        visibility=True,
+        origin_id="pt_001",
+        direction=1.571,
+        direction_mode=DirectionMode.AZIMUTH,
+        direction_units=DirectionUnits.RADIANS,
+        line_color="#ff00ff",
+        fill_color="#ff00ff",
+    )
     assert ry.type == "ray"
     assert ry.origin_id == "pt_001"
 
 
 def test_vector_instantiation_length_direction():
-    vc = Vector(id="vc_001", name="V", alpha=1.0, visibility=True,
-                origin_id="pt_001", direction=0.785,
-                direction_mode=DirectionMode.AZIMUTH,
-                direction_units=DirectionUnits.RADIANS,
-                length=100.0, endpoint_id=None,
-                line_color="#00ffff", fill_color="#00ffff")
+    vc = Vector(
+        id="vc_001",
+        name="V",
+        alpha=1.0,
+        visibility=True,
+        origin_id="pt_001",
+        direction=0.785,
+        direction_mode=DirectionMode.AZIMUTH,
+        direction_units=DirectionUnits.RADIANS,
+        length=100.0,
+        endpoint_id=None,
+        line_color="#00ffff",
+        fill_color="#00ffff",
+    )
     assert vc.type == "vector"
     assert vc.endpoint_id is None
     assert vc.length == 100.0
 
 
 def test_vector_instantiation_origin_endpoint():
-    vc = Vector(id="vc_002", name="V2", alpha=1.0, visibility=True,
-                origin_id="pt_001", direction=0.785,
-                direction_mode=DirectionMode.AZIMUTH,
-                direction_units=DirectionUnits.RADIANS,
-                length=50.0, endpoint_id="pt_002",
-                line_color="#00ffff", fill_color="#00ffff")
+    vc = Vector(
+        id="vc_002",
+        name="V2",
+        alpha=1.0,
+        visibility=True,
+        origin_id="pt_001",
+        direction=0.785,
+        direction_mode=DirectionMode.AZIMUTH,
+        direction_units=DirectionUnits.RADIANS,
+        length=50.0,
+        endpoint_id="pt_002",
+        line_color="#00ffff",
+        fill_color="#00ffff",
+    )
     assert vc.endpoint_id == "pt_002"
 
 
 def test_circle_instantiation():
-    ci = Circle(id="ci_001", name="C", alpha=1.0, visibility=True,
-                center_id="pt_001", radius=50.0,
-                line_color="#ff6600", fill_color="#ffd699")
+    ci = Circle(
+        id="ci_001",
+        name="C",
+        alpha=1.0,
+        visibility=True,
+        center_id="pt_001",
+        radius=50.0,
+        line_color="#ff6600",
+        fill_color="#ffd699",
+    )
     assert ci.type == "circle"
     assert ci.radius == 50.0
 
 
 def test_tangent_instantiation():
-    tg = Tangent(id="tg_001", name="T", alpha=1.0, visibility=True,
-                 circle_id="ci_001", point_id="pt_004",
-                 direction=2.356,
-                 direction_mode=DirectionMode.AZIMUTH,
-                 direction_units=DirectionUnits.RADIANS,
-                 line_color="#00ff66", fill_color="#00ff66")
+    tg = Tangent(
+        id="tg_001",
+        name="T",
+        alpha=1.0,
+        visibility=True,
+        circle_id="ci_001",
+        point_id="pt_004",
+        direction=2.356,
+        direction_mode=DirectionMode.AZIMUTH,
+        direction_units=DirectionUnits.RADIANS,
+        line_color="#00ff66",
+        fill_color="#00ff66",
+    )
     assert tg.type == "tangent"
     assert tg.circle_id == "ci_001"
     assert tg.point_id == "pt_004"
