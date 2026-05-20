@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from geometry.models.common import GeoObject
 
@@ -36,3 +36,4 @@ class Point(GeoObject):
     easting: float
     northing: float
     color: str
+    type: str = field(init=False, default="point")

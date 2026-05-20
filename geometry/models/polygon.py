@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from geometry.models.common import GeoObject
 
@@ -43,3 +43,4 @@ class Polygon(GeoObject):
     is_convex: bool
     line_color: str
     fill_color: str
+    type: str = field(init=False, default="polygon")

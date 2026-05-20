@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+# pylint: disable=duplicate-code
+from dataclasses import dataclass, field
 
 from geometry.models.common import DirectionMode, DirectionUnits, GeoObject
 
@@ -59,3 +60,4 @@ class Vector(GeoObject):
     endpoint_id: str | None
     line_color: str
     fill_color: str
+    type: str = field(init=False, default="vector")

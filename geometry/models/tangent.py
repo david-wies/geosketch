@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+# pylint: disable=duplicate-code
+from dataclasses import dataclass, field
 
 from geometry.models.common import DirectionMode, DirectionUnits, GeoObject
 
 
 @dataclass
 class Tangent(GeoObject):
-    """A tangent line from an external point to a circle.
+    """A tangent line at a point on a circle's circumference, perpendicular to the radius.
 
     The canonical direction is the azimuth of the tangent:
         direction = (radius_azimuth + π/2) mod 2π
@@ -32,7 +33,7 @@ class Tangent(GeoObject):
     circle_id : str
         ID of the target circle.
     point_id : str
-        ID of the external point from which the tangent is drawn.
+        ID of the point on the circumference where the tangent is drawn.
     direction : float
         Tangent direction in radians (canonical: ``(radius_azimuth + π/2) mod 2π``).
     direction_mode : DirectionMode
@@ -52,3 +53,4 @@ class Tangent(GeoObject):
     direction_units: DirectionUnits
     line_color: str
     fill_color: str
+    type: str = field(init=False, default="tangent")

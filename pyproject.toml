@@ -22,7 +22,7 @@ extend-exclude = [".claude", ".github", "spec"]
 ignore-paths = ["spec", ".claude", ".github", ".venv"]
 
 [tool.pylint.messages_control]
-disable = ["C0114", "C0115", "C0116", "R0801"]
+disable = ["C0114", "C0115", "C0116"]
 
 [tool.pylint.design]
 max-args = 8
