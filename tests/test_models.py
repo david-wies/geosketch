@@ -269,7 +269,17 @@ def test_tangent_instantiation():
 
 def test_no_forbidden_imports():
     """Verify no model file imports from services, canvas, ui, or persistence."""
-    forbidden = {"geometry.services", "geometry.canvas", "geometry.ui", "geometry.persistence"}
+    # Models must not reach into any layer above utils/. ``geometry.project``
+    # sits above services in the layer stack (see docs/geo-sketch-design.md
+    # §Layer rules) so it is forbidden too — preventative even though no
+    # current model imports it.
+    forbidden = {
+        "geometry.services",
+        "geometry.canvas",
+        "geometry.ui",
+        "geometry.persistence",
+        "geometry.project",
+    }
     models_dir = pathlib.Path(__file__).parent.parent / "geometry" / "models"
 
     for py_file in models_dir.glob("*.py"):

@@ -22,11 +22,12 @@ from geometry.models.common import DirectionMode, DirectionUnits, GeoObject
 class Tangent(GeoObject):
     """A tangent line at a point on a circle's circumference, perpendicular to the radius.
 
-    The canonical direction is the azimuth of the tangent:
-        direction = (radius_azimuth + π/2) mod 2π
-
     Direction is always stored internally in radians.  ``fill_color`` is
     stored for schema consistency but is not rendered for this 1-D object.
+
+    The canonical direction formula relating ``direction`` to the underlying
+    circle/point geometry lives in ``services/geometry.py``; the model layer
+    just stores whatever radians value it is given.
 
     Fields
     ------
@@ -35,7 +36,7 @@ class Tangent(GeoObject):
     point_id : str
         ID of the point on the circumference where the tangent is drawn.
     direction : float
-        Tangent direction in radians (canonical: ``(radius_azimuth + π/2) mod 2π``).
+        Tangent direction in radians.
     direction_mode : DirectionMode
         Whether ``direction`` represents an azimuth or a standard math angle.
     direction_units : DirectionUnits

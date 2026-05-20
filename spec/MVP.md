@@ -75,7 +75,7 @@ Validation that a tangent point lies on its circle uses `|distance(point, center
 - `type`: "point"
 - `easting`: float (UTM easting coordinate)
 - `northing`: float (UTM northing coordinate)
-- `color`: RGB tuple or hex code
+- `color`: hex color code (e.g. `#FF0000`)
 - `alpha`: float (transparency level, 0.0 to 1.0)
 - `visibility`: boolean
 
@@ -807,7 +807,7 @@ The cascade-delete **confirmation dialog from §Deletion is still required** eve
 | Angle, `direction_units = radians` | `0 ≤ value < 2π` |
 | Angle, `direction_units = degrees` | `0 ≤ value < 360` |
 | Length/Radius | Must be positive float > 0 |
-| Color | Valid hex code (#RRGGBB) or RGB tuple |
+| Color | Valid hex code (`#RRGGBB`) |
 | Name | Non-empty string, max 100 characters |
 | Point selection | Must select valid, existing point |
 | Polygon vertex count | Minimum 3 points required |

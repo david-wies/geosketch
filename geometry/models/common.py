@@ -50,7 +50,14 @@ class GeoObject:
     name : str
         User-visible label.
     type : str
-        Lowercase type tag matching the ID prefix (e.g. ``"pt"``, ``"ln"``).
+        Lowercase canonical type name (e.g. ``"point"``, ``"line"``,
+        ``"polygon"``, ``"ray"``, ``"vector"``, ``"circle"``, ``"tangent"``).
+        Distinct from the 2-letter ID prefix used in ``id`` (``pt`` for a
+        Point, ``ln`` for a Line, etc.). Pinned at construction time via
+        ``field(init=False, default=...)`` on every concrete subclass; treat
+        it as a read-only class invariant after construction (post-init
+        reassignment is technically legal because the dataclass is mutable,
+        but no code outside of test fixtures should rely on that).
     alpha : float
         Opacity in [0.0, 1.0].
     visibility : bool
