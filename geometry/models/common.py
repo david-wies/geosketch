@@ -35,6 +35,13 @@ class DirectionUnits(enum.Enum):
 class GeoObject:
     """Base data class shared by all seven geometry object types.
 
+    ``GeoObject`` is not instantiable on its own — every concrete object must
+    be one of the seven subclasses (Point, Line, Polygon, Ray, Vector, Circle,
+    Tangent), each of which pins ``type`` to a canonical literal via
+    ``field(init=False, default=...)``. The ``__post_init__`` guard below
+    enforces this so service code cannot accidentally produce a base object
+    with a bogus ``type`` string.
+
     Fields
     ------
     id : str
@@ -55,3 +62,14 @@ class GeoObject:
     type: str
     alpha: float
     visibility: bool
+
+    def __post_init__(self) -> None:
+        # `isinstance` would be True for every concrete subclass too, defeating
+        # the guard — exact-type identity is the correct check here.
+        if type(self) is GeoObject:  # pylint: disable=unidiomatic-typecheck
+            raise TypeError(
+                "GeoObject is an abstract base class and must not be "
+                "instantiated directly; use one of the seven concrete "
+                "subclasses (Point, Line, Polygon, Ray, Vector, Circle, "
+                "Tangent)."
+            )

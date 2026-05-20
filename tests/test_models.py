@@ -18,6 +18,8 @@ import ast
 import dataclasses
 import pathlib
 
+import pytest
+
 from geometry.models import (
     Circle,
     DirectionMode,
@@ -30,6 +32,16 @@ from geometry.models import (
     Tangent,
     Vector,
 )
+
+SUBCLASS_TYPES = [
+    (Point, "point"),
+    (Line, "line"),
+    (Polygon, "polygon"),
+    (Ray, "ray"),
+    (Vector, "vector"),
+    (Circle, "circle"),
+    (Tangent, "tangent"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -78,10 +90,53 @@ def test_point_instantiation():
     assert pt.color == "#ff0000"
 
 
-def test_point_type_not_in_init():
-    sig = dataclasses.fields(Point)
-    init_fields = [f.name for f in sig if f.init]
-    assert "type" not in init_fields
+@pytest.mark.parametrize(("cls", "expected_type"), SUBCLASS_TYPES)
+def test_type_not_in_init(cls, expected_type):
+    init_field_names = [f.name for f in dataclasses.fields(cls) if f.init]
+    assert "type" not in init_field_names
+    type_field = next(f for f in dataclasses.fields(cls) if f.name == "type")
+    assert type_field.default == expected_type
+
+
+@pytest.mark.parametrize(("cls", "_"), SUBCLASS_TYPES)
+def test_subclass_inherits_geo_object(cls, _):
+    assert issubclass(cls, GeoObject)
+
+
+def test_geo_object_direct_instantiation_rejected():
+    with pytest.raises(TypeError, match="abstract base class"):
+        GeoObject(id="x_001", name="X", type="bogus", alpha=1.0, visibility=True)
+
+
+def test_point_isinstance_geo_object():
+    pt = Point(
+        id="pt_001",
+        name="A",
+        alpha=1.0,
+        visibility=True,
+        easting=0.0,
+        northing=0.0,
+        color="#000000",
+    )
+    assert isinstance(pt, GeoObject)
+
+
+def test_polygon_point_ids_defensively_copied():
+    shared = ["pt_001", "pt_002", "pt_003"]
+    pg = Polygon(
+        id="pg_001",
+        name="P",
+        alpha=1.0,
+        visibility=True,
+        point_ids=shared,
+        is_convex=True,
+        line_color="#000000",
+        fill_color="#ffffff",
+    )
+    assert pg.point_ids == shared
+    assert pg.point_ids is not shared
+    shared.append("pt_999")
+    assert "pt_999" not in pg.point_ids
 
 
 def test_line_instantiation():

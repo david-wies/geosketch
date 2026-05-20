@@ -211,6 +211,8 @@ class GeoObject:
 
 Point extends GeoObject with `color`. All other types extend GeoObject with `line_color` + `fill_color`.
 
+`GeoObject` is treated as abstract: its `__post_init__` raises `TypeError` if `type(self) is GeoObject`, so callers cannot construct a base object with an arbitrary `type` string. Every concrete subclass pins `type` to its canonical literal via `field(init=False, default="<type>")`.
+
 ### Enumerations
 
 ```python
@@ -243,7 +245,9 @@ Direction metadata = `direction: float` (radians) + `direction_mode: DirectionMo
 
 Model objects are mutable dataclasses (allows in-place undo). Commands snapshot the before-state when constructed so they can restore it on `undo()`. Do not mutate model objects outside of command `do()` / `undo()`.
 
-In particular, `Polygon.point_ids` is a plain mutable `list[str]`. It must only be modified by `ModifyPolygonVerticesCommand`; nothing else should append, remove, or reorder elements directly.
+In particular, `Polygon.point_ids` is a plain mutable `list[str]`. It must only be modified by `ModifyPolygonVerticesCommand`; nothing else should append, remove, or reorder elements directly. The `Polygon` constructor defensively copies the supplied iterable (`self.point_ids = list(self.point_ids)`), so two polygons constructed from the same source iterable never share storage — undo snapshots and command-time mutations therefore cannot leak across polygons.
+
+`dataclasses.replace()` caveat for command authors: `replace(some_point, easting=5.0)` works as expected, but `replace(some_point, type="other")` raises `TypeError` because every concrete subclass declares `type` as `init=False`. This is correct behaviour — `type` is a class invariant, not a runtime knob — but worth noting for future undo/snapshot code that might otherwise round-trip a `type` argument by mistake.
 
 ---
 

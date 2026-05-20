@@ -27,10 +27,17 @@ class Polygon(GeoObject):
     ``is_convex`` is set by the services layer (using the cross-product
     method) on creation and after any modification.
 
+    The ``point_ids`` list is **defensively copied** in ``__post_init__`` so
+    that two Polygons constructed from the same source iterable do not share
+    the same list object — without this, mutating one polygon's vertex list
+    via ``ModifyPolygonVerticesCommand`` would silently alter every polygon
+    that aliased it.
+
     Fields
     ------
     point_ids : list[str]
-        Ordered point IDs in CCW winding order.
+        Ordered point IDs in CCW winding order. The constructor accepts any
+        iterable; the result is always a fresh list owned by this polygon.
     is_convex : bool
         True if the polygon is convex; cached by the services layer.
     line_color : str
@@ -44,3 +51,7 @@ class Polygon(GeoObject):
     line_color: str
     fill_color: str
     type: str = field(init=False, default="polygon")
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.point_ids = list(self.point_ids)
