@@ -31,6 +31,11 @@ class Point(GeoObject):
         UTM northing in metres.
     color : str
         Hex colour string for the marker (e.g. ``"#FF0000"``).
+
+    See Also
+    --------
+    geometry.models.common.GeoObject : Shared envelope fields (``id``, ``name``,
+        ``type``, ``alpha``, ``visibility``) inherited by every concrete model.
     """
 
     easting: float
