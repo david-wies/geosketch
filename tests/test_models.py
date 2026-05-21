@@ -22,6 +22,7 @@ import pytest
 
 from geometry.models import (
     Circle,
+    DirectedObject,
     DirectionMode,
     DirectionUnits,
     GeoObject,
@@ -106,6 +107,20 @@ def test_subclass_inherits_geo_object(cls, _):
 def test_geo_object_direct_instantiation_rejected():
     with pytest.raises(TypeError, match="abstract base class"):
         GeoObject(id="x_001", name="X", type="bogus", alpha=1.0, visibility=True)
+
+
+def test_directed_object_direct_instantiation_rejected():
+    with pytest.raises(TypeError, match="abstract base class"):
+        DirectedObject(
+            id="x_001",
+            name="X",
+            type="bogus",
+            alpha=1.0,
+            visibility=True,
+            direction=0.0,
+            direction_mode=DirectionMode.AZIMUTH,
+            direction_units=DirectionUnits.RADIANS,
+        )
 
 
 def test_point_isinstance_geo_object():

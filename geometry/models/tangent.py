@@ -12,18 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pylint: disable=duplicate-code
 from dataclasses import dataclass, field
 
-from geometry.models.common import DirectionMode, DirectionUnits, GeoObject
+from geometry.models.common import DirectedObject
 
 
 @dataclass
-class Tangent(GeoObject):
+class Tangent(DirectedObject):
     """A tangent line at a point on a circle's circumference, perpendicular to the radius.
 
-    Direction is always stored internally in radians.  ``fill_color`` is
-    stored for schema consistency but is not rendered for this 1-D object.
+    Inherits ``direction``, ``direction_mode``, and ``direction_units`` from
+    ``DirectedObject``.  ``fill_color`` is stored for schema consistency but
+    is not rendered for this 1-D object.
 
     The canonical direction formula relating ``direction`` to the underlying
     circle/point geometry lives in ``services/geometry.py``; the model layer
@@ -35,12 +35,6 @@ class Tangent(GeoObject):
         ID of the target circle.
     point_id : str
         ID of the point on the circumference where the tangent is drawn.
-    direction : float
-        Tangent direction in radians.
-    direction_mode : DirectionMode
-        Whether ``direction`` represents an azimuth or a standard math angle.
-    direction_units : DirectionUnits
-        Whether the user-facing representation is in radians or degrees.
     line_color : str
         Hex colour string for the stroke.
     fill_color : str
@@ -49,9 +43,6 @@ class Tangent(GeoObject):
 
     circle_id: str
     point_id: str
-    direction: float
-    direction_mode: DirectionMode
-    direction_units: DirectionUnits
     line_color: str
     fill_color: str
     type: str = field(init=False, default="tangent")

@@ -80,3 +80,49 @@ class GeoObject:
                 "subclasses (Point, Line, Polygon, Ray, Vector, Circle, "
                 "Tangent)."
             )
+
+
+@dataclass
+class DirectedObject(GeoObject):
+    """Abstract intermediate base for the four direction-bearing geometry types.
+
+    ``DirectedObject`` is not instantiable on its own — like ``GeoObject``,
+    it is an abstract base whose only purpose is to share the three
+    direction-metadata fields (``direction``, ``direction_mode``,
+    ``direction_units``) across the four concrete subclasses ``Line``,
+    ``Ray``, ``Vector``, and ``Tangent``. ``Point``, ``Polygon``, and
+    ``Circle`` continue to extend ``GeoObject`` directly because they have
+    no direction. The ``__post_init__`` guard below enforces this so
+    service code cannot accidentally produce a base ``DirectedObject`` with
+    a bogus ``type`` string.
+
+    ``direction`` is always stored internally in radians; ``direction_mode``
+    and ``direction_units`` record how the user originally expressed the
+    direction so the UI can round-trip the value without silent unit
+    conversion.
+
+    Fields
+    ------
+    direction : float
+        Direction in radians (internal storage only).
+    direction_mode : DirectionMode
+        Whether ``direction`` represents an azimuth (CW from North) or a
+        standard math angle (CCW from East).
+    direction_units : DirectionUnits
+        Whether the user-facing representation is in radians or degrees.
+    """
+
+    direction: float
+    direction_mode: DirectionMode
+    direction_units: DirectionUnits
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        # `isinstance` would be True for every concrete subclass too,
+        # defeating the guard — exact-type identity is the correct check.
+        if type(self) is DirectedObject:  # pylint: disable=unidiomatic-typecheck
+            raise TypeError(
+                "DirectedObject is an abstract base class and must not be "
+                "instantiated directly; use one of the four concrete "
+                "subclasses (Line, Ray, Vector, Tangent)."
+            )

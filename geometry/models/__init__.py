@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from geometry.models.circle import Circle
-from geometry.models.common import DirectionMode, DirectionUnits, GeoObject
+from geometry.models.common import DirectedObject, DirectionMode, DirectionUnits, GeoObject
 from geometry.models.line import Line
 from geometry.models.point import Point
 from geometry.models.polygon import Polygon
@@ -23,6 +23,7 @@ from geometry.models.vector import Vector
 
 __all__ = [
     "GeoObject",
+    "DirectedObject",
     "DirectionMode",
     "DirectionUnits",
     "Point",
