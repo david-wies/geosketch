@@ -12,30 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pylint: disable=duplicate-code
 from dataclasses import dataclass, field
 
-from geometry.models.common import DirectionMode, DirectionUnits, GeoObject
+from geometry.models.common import DirectedObject
 
 
 @dataclass
-class Ray(GeoObject):
+class Ray(DirectedObject):
     """A ray originating from a point and extending infinitely in one direction.
 
-    The direction is always stored internally in radians regardless of
-    ``direction_units``.  ``fill_color`` is stored for schema consistency
-    but is not rendered for this 1-D object.
+    Inherits ``direction``, ``direction_mode``, and ``direction_units`` from
+    ``DirectedObject``.  ``fill_color`` is stored for schema consistency but
+    is not rendered for this 1-D object.
 
     Fields
     ------
     origin_id : str
         ID of the origin point.
-    direction : float
-        Direction in radians (internal storage only).
-    direction_mode : DirectionMode
-        Whether ``direction`` represents an azimuth or a standard math angle.
-    direction_units : DirectionUnits
-        Whether the user-facing representation is in radians or degrees.
     line_color : str
         Hex colour string for the stroke.
     fill_color : str
@@ -43,9 +36,6 @@ class Ray(GeoObject):
     """
 
     origin_id: str
-    direction: float
-    direction_mode: DirectionMode
-    direction_units: DirectionUnits
     line_color: str
     fill_color: str
     type: str = field(init=False, default="ray")

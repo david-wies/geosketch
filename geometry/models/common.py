@@ -80,3 +80,32 @@ class GeoObject:
                 "subclasses (Point, Line, Polygon, Ray, Vector, Circle, "
                 "Tangent)."
             )
+
+
+@dataclass
+class DirectedObject(GeoObject):
+    """Intermediate base for the four direction-bearing geometry types.
+
+    ``Line``, ``Ray``, ``Vector``, and ``Tangent`` each need the same three
+    direction-metadata fields.  This class holds them in one place to avoid
+    duplication across the four concrete modules.
+
+    ``direction`` is always stored internally in radians; ``direction_mode``
+    and ``direction_units`` record how the user originally expressed the
+    direction so the UI can round-trip the value without silent unit
+    conversion.
+
+    Fields
+    ------
+    direction : float
+        Direction in radians (internal storage only).
+    direction_mode : DirectionMode
+        Whether ``direction`` represents an azimuth (CW from North) or a
+        standard math angle (CCW from East).
+    direction_units : DirectionUnits
+        Whether the user-facing representation is in radians or degrees.
+    """
+
+    direction: float
+    direction_mode: DirectionMode
+    direction_units: DirectionUnits

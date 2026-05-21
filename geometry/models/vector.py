@@ -12,15 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pylint: disable=duplicate-code
 from dataclasses import dataclass, field
 
-from geometry.models.common import DirectionMode, DirectionUnits, GeoObject
+from geometry.models.common import DirectedObject
 
 
 @dataclass
-class Vector(GeoObject):
+class Vector(DirectedObject):
     """A vector with a fixed origin, direction, and length.
+
+    Inherits ``direction``, ``direction_mode``, and ``direction_units`` from
+    ``DirectedObject``.
 
     Endpoint formula (azimuth convention):
         endpoint = (origin_e + length * sin(az), origin_n + length * cos(az))
@@ -36,12 +38,6 @@ class Vector(GeoObject):
     ------
     origin_id : str
         ID of the origin point.
-    direction : float
-        Direction in radians (internal storage only).
-    direction_mode : DirectionMode
-        Whether ``direction`` represents an azimuth or a standard math angle.
-    direction_units : DirectionUnits
-        Whether the user-facing representation is in radians or degrees.
     length : float
         Magnitude of the vector in metres.
     endpoint_id : str | None
@@ -53,9 +49,6 @@ class Vector(GeoObject):
     """
 
     origin_id: str
-    direction: float
-    direction_mode: DirectionMode
-    direction_units: DirectionUnits
     length: float
     endpoint_id: str | None
     line_color: str
