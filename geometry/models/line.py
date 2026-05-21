@@ -35,6 +35,11 @@ class Line(DirectedObject):
         Hex colour string for the stroke.
     fill_color : str
         Hex colour string for fill (stored but not rendered for lines).
+
+    See Also
+    --------
+    geometry.models.common.GeoObject : Shared envelope fields (``id``, ``name``,
+        ``type``, ``alpha``, ``visibility``) inherited by every concrete model.
     """
 
     point_a_id: str

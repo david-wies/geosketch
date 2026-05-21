@@ -46,6 +46,11 @@ class Vector(DirectedObject):
         Hex colour string for the stroke.
     fill_color : str
         Hex colour string for fill (stored but not rendered for vectors).
+
+    See Also
+    --------
+    geometry.models.common.GeoObject : Shared envelope fields (``id``, ``name``,
+        ``type``, ``alpha``, ``visibility``) inherited by every concrete model.
     """
 
     origin_id: str

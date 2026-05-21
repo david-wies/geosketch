@@ -44,6 +44,11 @@ class Polygon(GeoObject):
         Hex colour string for the outline stroke.
     fill_color : str
         Hex colour string for the interior fill.
+
+    See Also
+    --------
+    geometry.models.common.GeoObject : Shared envelope fields (``id``, ``name``,
+        ``type``, ``alpha``, ``visibility``) inherited by every concrete model.
     """
 
     point_ids: list[str]
