@@ -28,7 +28,7 @@ class Polygon(GeoObject):
     method) on creation and after any modification.
 
     The ``point_ids`` list is **defensively copied** in ``__post_init__`` so
-    that two Polygons constructed from the same source iterable do not share
+    that two Polygons constructed from the same source list do not share
     the same list object — without this, mutating one polygon's vertex list
     via ``ModifyPolygonVerticesCommand`` would silently alter every polygon
     that aliased it.
@@ -36,9 +36,10 @@ class Polygon(GeoObject):
     Fields
     ------
     point_ids : list[str]
-        Ordered point IDs in CCW winding order. The constructor accepts any
-        iterable; the result is always a fresh list owned by this polygon.
-        Must only be modified by ``ModifyPolygonVerticesCommand`` — see Notes.
+        Ordered point IDs in CCW winding order. The constructor defensively
+        copies the supplied list so the polygon always owns a fresh list
+        independent of the caller's reference (see Notes).  Must only be
+        modified by ``ModifyPolygonVerticesCommand``.
     is_convex : bool
         True if the polygon is convex; cached by the services layer.
         Must only be updated by ``PolygonService.create()`` and by

@@ -297,7 +297,7 @@ def test_no_forbidden_imports():
     }
     models_dir = pathlib.Path(__file__).parent.parent / "geometry" / "models"
 
-    for py_file in models_dir.glob("*.py"):
+    for py_file in models_dir.rglob("*.py"):
         tree = ast.parse(py_file.read_text())
         for node in ast.walk(tree):
             modules: list[str] = []
