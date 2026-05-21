@@ -211,6 +211,8 @@ class GeoObject:
 
 Point extends GeoObject with `color`. All other types extend GeoObject with `line_color` + `fill_color`.
 
+`GeoObject` is treated as abstract: its `__post_init__` raises `TypeError` if `type(self) is GeoObject`, so callers cannot construct a base object with an arbitrary `type` string. Every concrete subclass pins `type` to its canonical literal via `field(init=False, default="<type>")`.
+
 ### Enumerations
 
 ```python
@@ -242,6 +244,14 @@ Direction metadata = `direction: float` (radians) + `direction_mode: DirectionMo
 ### Immutability convention
 
 Model objects are mutable dataclasses (allows in-place undo). Commands snapshot the before-state when constructed so they can restore it on `undo()`. Do not mutate model objects outside of command `do()` / `undo()`.
+
+In particular, `Polygon.point_ids` is a plain mutable `list[str]`. It must only be modified by `ModifyPolygonVerticesCommand`; nothing else should append, remove, or reorder elements directly. The `Polygon` constructor defensively copies the supplied list (`self.point_ids = list(self.point_ids)`), so two polygons constructed from the same source list never share storage — undo snapshots and command-time mutations therefore cannot leak across polygons.
+
+`dataclasses.replace()` caveat for command authors: `replace(some_point, easting=5.0)` works as expected, but `replace(some_point, type="other")` raises `TypeError` because every concrete subclass declares `type` as `init=False`. This is correct behaviour — `type` is a *construction-time* invariant, pinned by each subclass's `field(init=False, default=...)`. Note that the dataclass is not frozen, so a raw `obj.type = "other"` assignment is still legal at the Python level; nothing in the runtime guards against it. Treat `type` as read-only by convention (the command layer never writes to it), and prefer subclass identity (`isinstance(obj, Point)`) over `obj.type` when the difference matters in code that has to defend itself.
+
+`Line.direction` is authoritative only for UI round-trip (preserving the user's authoring convention). The geometric direction of a `Line` segment is fully determined by `point_a_id` and `point_b_id` coordinates and must be (re)computed from them — moving either endpoint via `MovePointCommand` would otherwise leave the stored `direction` stale. The cascading-update rule (point-move-recompute via `dep_graph`) is responsible for re-recording `Line.direction` whenever an endpoint moves; `Ray`, `Vector`, and `Tangent` do not have this concern because their `direction` is a primary input, not a derived value.
+
+`Polygon.is_convex` follows the same single-writer convention as `point_ids`: it must only be updated by the services layer (specifically `PolygonService.create()` and `ModifyPolygonVerticesCommand.do()`/`undo()`). Nothing else should write to it directly — UI code and other commands must treat it as read-only and let the services layer re-cache it after any vertex change.
 
 ---
 
