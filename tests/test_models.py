@@ -300,12 +300,12 @@ def test_no_forbidden_imports():
     for py_file in models_dir.glob("*.py"):
         tree = ast.parse(py_file.read_text())
         for node in ast.walk(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                module = ""
-                if isinstance(node, ast.ImportFrom) and node.module:
-                    module = node.module
-                elif isinstance(node, ast.Import):
-                    module = node.names[0].name
+            modules: list[str] = []
+            if isinstance(node, ast.ImportFrom) and node.module:
+                modules.append(node.module)
+            elif isinstance(node, ast.Import):
+                modules.extend(alias.name for alias in node.names)
+            for module in modules:
                 for bad in forbidden:
                     assert not module.startswith(bad), (
                         f"{py_file.name} imports from forbidden layer: {module}"

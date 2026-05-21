@@ -43,6 +43,17 @@ class Line(DirectedObject):
     geometry.models.common.DirectedObject : Direction metadata (``direction``,
         ``direction_mode``, ``direction_units``) inherited by all four
         direction-bearing types (Line, Ray, Vector, Tangent).
+
+    Notes
+    -----
+    ``direction`` is authoritative **only for UI round-trip** — it preserves the
+    convention (azimuth/angle, radians/degrees) the user originally entered.
+    The geometric direction of the segment must always be (re)computed from
+    ``point_a_id`` and ``point_b_id`` coordinates, because moving either
+    endpoint via a ``ModifyPointCommand`` would otherwise leave the stored
+    ``direction`` stale.  The services-layer cascading-update rule is
+    responsible for re-recording ``direction`` after any endpoint move so the
+    two stay in sync.
     """
 
     point_a_id: str

@@ -249,6 +249,10 @@ In particular, `Polygon.point_ids` is a plain mutable `list[str]`. It must only 
 
 `dataclasses.replace()` caveat for command authors: `replace(some_point, easting=5.0)` works as expected, but `replace(some_point, type="other")` raises `TypeError` because every concrete subclass declares `type` as `init=False`. This is correct behaviour — `type` is a *construction-time* invariant, pinned by each subclass's `field(init=False, default=...)`. Note that the dataclass is not frozen, so a raw `obj.type = "other"` assignment is still legal at the Python level; nothing in the runtime guards against it. Treat `type` as read-only by convention (the command layer never writes to it), and prefer subclass identity (`isinstance(obj, Point)`) over `obj.type` when the difference matters in code that has to defend itself.
 
+`Line.direction` is authoritative only for UI round-trip (preserving the user's authoring convention). The geometric direction of a `Line` segment is fully determined by `point_a_id` and `point_b_id` coordinates and must be (re)computed from them — moving either endpoint via `MovePointCommand` would otherwise leave the stored `direction` stale. The cascading-update rule (point-move-recompute via `dep_graph`) is responsible for re-recording `Line.direction` whenever an endpoint moves; `Ray`, `Vector`, and `Tangent` do not have this concern because their `direction` is a primary input, not a derived value.
+
+`Polygon.is_convex` follows the same single-writer convention as `point_ids`: it must only be updated by the services layer (specifically `PolygonService.create()` and `ModifyPolygonVerticesCommand.do()`/`undo()`). Nothing else should write to it directly — UI code and other commands must treat it as read-only and let the services layer re-cache it after any vertex change.
+
 ---
 
 ## Geometry Services (`services/geometry.py`)

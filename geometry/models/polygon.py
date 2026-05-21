@@ -38,8 +38,12 @@ class Polygon(GeoObject):
     point_ids : list[str]
         Ordered point IDs in CCW winding order. The constructor accepts any
         iterable; the result is always a fresh list owned by this polygon.
+        Must only be modified by ``ModifyPolygonVerticesCommand`` — see Notes.
     is_convex : bool
         True if the polygon is convex; cached by the services layer.
+        Must only be updated by ``PolygonService.create()`` and by
+        ``ModifyPolygonVerticesCommand.do()``/``undo()``.  Treat as read-only
+        from UI code and other commands — see Notes.
     line_color : str
         Hex colour string for the outline stroke.
     fill_color : str
@@ -49,6 +53,14 @@ class Polygon(GeoObject):
     --------
     geometry.models.common.GeoObject : Shared envelope fields (``id``, ``name``,
         ``type``, ``alpha``, ``visibility``) inherited by every concrete model.
+
+    Notes
+    -----
+    Both ``point_ids`` and ``is_convex`` follow a single-writer convention:
+    ``ModifyPolygonVerticesCommand`` is the only mutator for both, and
+    ``PolygonService.create()`` is the only initial setter for ``is_convex``.
+    The two fields must stay coherent (``is_convex`` always reflects the
+    current ``point_ids``), so they are co-owned by the same command path.
     """
 
     point_ids: list[str]
