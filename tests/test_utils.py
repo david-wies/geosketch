@@ -380,7 +380,7 @@ def test_unsubscribe_removes_handler():
     bus.subscribe(OBJECT_CREATED, handler)
     bus.unsubscribe(OBJECT_CREATED, handler)
     bus.fire(OBJECT_CREATED, obj_id="pt_001")
-    assert received == []
+    assert not received
 
 
 def test_unsubscribe_unknown_handler_is_noop():

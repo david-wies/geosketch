@@ -42,6 +42,9 @@ from geometry.utils.events import (
 )
 from geometry.utils.id_factory import IDFactory
 
+# pylint: disable=duplicate-code
+# R0801 fires because this re-export list necessarily mirrors the submodule's
+# own __all__. Both lists are intentional public surface declarations.
 __all__ = [
     # constants
     "EPS_ANGLE",
