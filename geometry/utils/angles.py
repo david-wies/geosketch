@@ -161,11 +161,19 @@ def to_radians(value: float, units: DirectionUnits) -> np.float64:
     -------
     numpy.float64
         ``value`` expressed in radians.
+
+    Raises
+    ------
+    TypeError
+        If ``units`` is not a :class:`DirectionUnits` member. A raw string
+        is rejected here rather than silently treated as degrees.
     """
     val = np.float64(value)
     if units is DirectionUnits.RADIANS:
         return val
-    return np.deg2rad(val)
+    if units is DirectionUnits.DEGREES:
+        return np.deg2rad(val)
+    raise TypeError(f"units must be a DirectionUnits member, got {type(units).__name__}")
 
 
 def to_degrees(rad: float) -> np.float64:

@@ -133,6 +133,13 @@ def test_to_radians_accepts_enum_coerced_from_string():
     assert to_radians(1.0, DirectionUnits("radians")) == np.float64(1.0)
 
 
+def test_to_radians_rejects_raw_string():
+    # A raw string must not be silently treated as degrees; it is rejected
+    # so the enum boundary stays at the persistence layer.
+    with pytest.raises(TypeError):
+        to_radians(1.0, "radians")
+
+
 def test_to_degrees_returns_float64():
     out = to_degrees(math.pi)
     assert isinstance(out, np.float64)
