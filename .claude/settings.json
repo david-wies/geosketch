@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pylint *)",
+      "Bash(.venv/bin/pytest *)",
+      "Bash(pytest *)",
+      "Bash(.venv/bin/pylint *)"
+    ]
+  }
+}
