@@ -45,10 +45,13 @@ from __future__ import annotations
 import re
 
 # Match a single ID literal. ``<prefix>`` is one or more lowercase ASCII
-# letters; ``<n>`` is one or more decimal digits with no sign. The regex
-# is anchored so trailing garbage is rejected rather than silently
+# letters; ``<n>`` is one or more ASCII decimal digits with no sign. The
+# digit class is spelled ``[0-9]`` rather than ``\d`` so that non-ASCII
+# Unicode digits (which ``\d`` matches) are rejected — keeping reseed's
+# accepted format identical to the ASCII-strict ``next_id`` path. The
+# regex is anchored so trailing garbage is rejected rather than silently
 # accepted.
-_ID_RE: re.Pattern[str] = re.compile(r"^([a-z]+)_(\d+)$")
+_ID_RE: re.Pattern[str] = re.compile(r"^([a-z]+)_([0-9]+)$")
 
 # The minimum width to zero-pad the integer suffix to. Pure cosmetic —
 # the persistence regex accepts any positive integer width, but matching

@@ -164,6 +164,25 @@ def test_normalize_to_2pi(value: float, expected: float):
     assert 0.0 <= float(out) < 2 * math.pi or math.isclose(float(out), 0.0, abs_tol=1e-12)
 
 
+@pytest.mark.parametrize("value", [-1e-20, -1e-18, -1e-16, -1e-9])
+def test_normalize_to_2pi_tiny_negative_stays_half_open(value: float):
+    """Tiny negative inputs must not round up to exactly 2π.
+
+    Float modulo computes ``2π - ε`` which rounds to exactly ``2π`` for
+    very small ``ε``; the helper snaps that back to 0.0 so the result
+    stays strictly within the documented ``[0, 2π)`` interval.
+    """
+    out = normalize_to_2pi(value)
+    assert isinstance(out, np.float64)
+    assert 0.0 <= float(out) < 2 * math.pi
+
+
+def test_azimuth_to_angle_just_past_half_pi_stays_half_open():
+    """``azimuth_to_angle(π/2 + ε)`` reduces ``-ε`` and must stay < 2π."""
+    out = azimuth_to_angle(math.pi / 2 + 1e-20)
+    assert 0.0 <= float(out) < 2 * math.pi
+
+
 def test_all_angle_helpers_return_float64():
     # Reference precision is NumPy float64 per spec/MVP.md.
     assert isinstance(azimuth_to_angle(1.0), np.float64)
@@ -268,6 +287,18 @@ def test_reseed_rejects_malformed_ids():
     for bad in ("pt001", "PT_001", "pt_", "pt_-1", "pt_001a", "_001", "pt 001", ""):
         with pytest.raises(ValueError):
             factory.reseed([bad])
+
+
+def test_reseed_rejects_non_ascii_unicode_digits():
+    """Suffix must be ASCII digits; ``\\d`` would wrongly accept these.
+
+    The canonical ID format is ASCII ``<prefix>_<positive int>``, and the
+    ``next_id`` path is ASCII-strict — reseed must match it rather than
+    accept Unicode digit forms like Arabic-Indic ``٠١٢``.
+    """
+    factory = IDFactory()
+    with pytest.raises(ValueError):
+        factory.reseed(["pt_٠١٢"])  # Arabic-Indic 012
 
 
 def test_reseed_rejects_zero_suffix():

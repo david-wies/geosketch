@@ -71,6 +71,12 @@ def normalize_to_2pi(rad: float) -> np.float64:
     ``2π - 0.5`` as desired. The reduction is performed in ``float64``
     to match the project's reference precision.
 
+    One float-modulo wrinkle is handled explicitly: for a tiny negative
+    input (e.g. ``-1e-20``) the mathematically-correct result ``2π - ε``
+    rounds *up* to exactly ``_TWO_PI`` in ``float64``, which would break
+    the half-open contract. Such results are snapped back to ``0.0`` so
+    the return value is always strictly ``< 2π``.
+
     Parameters
     ----------
     rad : float
@@ -81,7 +87,13 @@ def normalize_to_2pi(rad: float) -> np.float64:
     numpy.float64
         The reduced value in ``[0, 2π)``.
     """
-    return np.float64(rad) % _TWO_PI
+    reduced = np.float64(rad) % _TWO_PI
+    # Guard the upper boundary: float rounding can make ``2π - ε`` land
+    # exactly on ``_TWO_PI`` for tiny negative inputs. Snap to 0.0 so the
+    # interval stays half-open as documented.
+    if reduced >= _TWO_PI:
+        return np.float64(0.0)
+    return reduced
 
 
 def azimuth_to_angle(rad: float) -> np.float64:
