@@ -101,6 +101,36 @@ def _cross2d(u: np.ndarray, v: np.ndarray) -> np.float64:
     return np.float64(u[0] * v[1] - u[1] * v[0])
 
 
+def _unit(v: np.ndarray) -> np.ndarray | None:
+    """Return ``v`` scaled to unit length, or ``None`` if it is ~zero-length.
+
+    A vector shorter than :data:`EPS_DISTANCE` has no well-defined direction
+    (e.g. a duplicated vertex producing a zero-length edge), so callers treat
+    ``None`` as "no direction".
+    """
+    norm = float(np.hypot(v[0], v[1]))
+    if norm < EPS_DISTANCE:
+        return None
+    return v / norm
+
+
+def _are_parallel(u: np.ndarray, v: np.ndarray) -> bool:
+    """Whether directions ``u`` and ``v`` are parallel within :data:`EPS_ANGLE`.
+
+    The test is performed on the **unit** directions, so ``|cross(û, v̂)| =
+    |sin θ|`` and :data:`EPS_ANGLE` is a genuine angular tolerance rather than
+    one that silently scales with the input vectors' magnitudes. A vector with
+    no defined direction (``_unit`` returns ``None``) is treated as parallel to
+    everything, which collapses degenerate inputs to the "no unique
+    intersection" branch its callers already handle.
+    """
+    u_hat = _unit(u)
+    v_hat = _unit(v)
+    if u_hat is None or v_hat is None:
+        return True
+    return abs(_cross2d(u_hat, v_hat)) < EPS_ANGLE
+
+
 def _polygon_coords(polygon: Polygon, points: Mapping[str, Point]) -> np.ndarray:
     """Resolve a polygon's vertices to an ``(N, 2)`` ``float64`` array."""
     return np.array(
@@ -182,10 +212,13 @@ def is_convex(polygon: Polygon, points: Mapping[str, Point]) -> bool:
     """Return ``True`` if ``polygon`` is convex.
 
     Walks the consecutive edge pairs and takes the 2-D cross product of each
-    pair. A polygon is convex iff every turn has the same orientation (all
-    cross products non-negative or all non-positive); collinear triplets
-    (cross ≈ 0 within :data:`EPS_ANGLE`) are ignored so that redundant
-    boundary vertices do not flip the result.
+    pair of **unit** edge directions (so the comparison is ``sin θ`` and
+    :data:`EPS_ANGLE` is a true angular tolerance regardless of edge length).
+    A polygon is convex iff every turn has the same orientation (all cross
+    products non-negative or all non-positive); near-collinear triplets
+    (``|sin θ| < EPS_ANGLE``) are ignored so that redundant boundary vertices
+    do not flip the result. Zero-length edges from duplicated vertices have no
+    direction and are skipped.
 
     Returns
     -------
@@ -196,11 +229,15 @@ def is_convex(polygon: Polygon, points: Mapping[str, Point]) -> bool:
     if len(coords) < 3:
         return False
     edges = np.roll(coords, -1, axis=0) - coords  # edge[i] = V[i+1] - V[i]
-    n_edges = len(edges)
+    units = [_unit(edge) for edge in edges]
+    n_edges = len(units)
     saw_positive = False
     saw_negative = False
-    for i, edge in enumerate(edges):
-        cross = _cross2d(edge, edges[(i + 1) % n_edges])
+    for i, u in enumerate(units):
+        v = units[(i + 1) % n_edges]
+        if u is None or v is None:
+            continue  # zero-length edge (duplicate vertex) — no turn to classify
+        cross = _cross2d(u, v)
         if cross > EPS_ANGLE:
             saw_positive = True
         elif cross < -EPS_ANGLE:
@@ -235,6 +272,17 @@ def convex_hull(polygon: Polygon, points: Mapping[str, Point], new_id: str) -> P
     Polygon
         A new convex polygon over the subset of original vertices that lie on
         the hull, with ``is_convex=True``.
+
+    Raises
+    ------
+    scipy.spatial.QhullError
+        If the input is degenerate for hull construction (fewer than three
+        vertices, or all vertices collinear). Unlike the intersection/distance
+        functions — which degrade to ``None``/``inf``/``[]`` — this propagates
+        the error, because a hull over a degenerate polygon is undefined. The
+        polygon-creation path already rejects degenerate polygons
+        (``|signed_area| < EPS_AREA``), so a well-formed source polygon never
+        triggers this.
     """
     coords = _polygon_coords(polygon, points)
     hull = ConvexHull(coords)
@@ -302,7 +350,7 @@ def line_intersection(line_a: Line, line_b: Line, points: Mapping[str, Point]) -
     a2, b2 = _line_endpoints(line_b, points)
     d1 = b1 - a1
     d2 = b2 - a2
-    if abs(_cross2d(d1, d2)) < EPS_ANGLE:
+    if _are_parallel(d1, d2):
         return None
     # Columns: [d1, -d2] · [t, s]^T = a2 - a1
     matrix = np.array([[d1[0], -d2[0]], [d1[1], -d2[1]]], dtype=np.float64)
@@ -313,7 +361,7 @@ def line_intersection(line_a: Line, line_b: Line, points: Mapping[str, Point]) -
 
 def _line_span(coords: np.ndarray, *extra: np.ndarray) -> float:
     """A length comfortably larger than the bounding box of all given coords."""
-    stacked = np.vstack([coords, *([e.reshape(1, 2) for e in extra] or [])])
+    stacked = np.vstack([coords, *(e.reshape(1, 2) for e in extra)])
     mins = stacked.min(axis=0)
     maxs = stacked.max(axis=0)
     diag = float(np.hypot(maxs[0] - mins[0], maxs[1] - mins[1]))
@@ -432,7 +480,7 @@ def _ray_edge_t(origin: np.ndarray, unit: np.ndarray, a: np.ndarray, b: np.ndarr
     the origin (``t < -EPS_PARAM``), or it falls outside the edge span.
     """
     edge = b - a
-    if abs(_cross2d(unit, edge)) < EPS_ANGLE:
+    if _are_parallel(unit, edge):
         return None  # ray parallel to this edge
     # Solve origin + t*unit = a + s*edge  ->  [unit, -edge] · [t, s] = a - origin
     matrix = np.array([[unit[0], -edge[0]], [unit[1], -edge[1]]], dtype=np.float64)
@@ -484,6 +532,12 @@ def point_polygon_distance(
     numpy.float64
         ``0`` when the point is inside the polygon, otherwise the minimum
         distance to its boundary.
+
+    Notes
+    -----
+    Assumes ``polygon`` is a valid (simple, closed) ring; results are
+    undefined for self-intersecting boundaries. Simplicity is enforced
+    upstream at polygon-creation time, so this function does not re-validate.
     """
     sp_poly = _shapely_polygon(polygon, points)
     sp_point = shapely.Point(point.easting, point.northing)
@@ -502,6 +556,12 @@ def polygon_polygon_distance(
     numpy.float64
         ``0`` when the polygons intersect or touch, otherwise the minimum
         edge-to-edge distance.
+
+    Notes
+    -----
+    Assumes both polygons are valid (simple, closed) rings; results are
+    undefined for self-intersecting boundaries. Simplicity is enforced
+    upstream at polygon-creation time, so this function does not re-validate.
     """
     sp_a = _shapely_polygon(poly_a, points)
     sp_b = _shapely_polygon(poly_b, points)

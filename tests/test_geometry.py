@@ -228,6 +228,27 @@ def test_line_intersection_crossing():
     assert result[1] == pytest.approx(0.0)
 
 
+def test_line_intersection_small_scale_not_falsely_parallel():
+    # Genuinely perpendicular lines at sub-millimetre scale. The raw
+    # (non-normalized) cross product is |d1||d2|·sin θ, so the tiny |d|
+    # factors drag it below EPS_ANGLE and the lines were wrongly judged
+    # parallel. Normalizing the directions first makes EPS_ANGLE a true
+    # angular tolerance, so a real 90° crossing is always detected.
+    s = 2e-5
+    pts = {
+        "a0": _pt("a0", 0, 0),
+        "a1": _pt("a1", s, 0),  # horizontal
+        "b0": _pt("b0", 0, -s),
+        "b1": _pt("b1", 0, s),  # vertical
+    }
+    la = _line("ln_a", "a0", "a1")
+    lb = _line("ln_b", "b0", "b1")
+    result = geo.line_intersection(la, lb, pts)
+    assert result is not None
+    assert result[0] == pytest.approx(0.0)
+    assert result[1] == pytest.approx(0.0)
+
+
 def test_line_intersection_parallel_returns_none():
     pts = {
         "a0": _pt("a0", 0, 0),
