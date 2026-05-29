@@ -52,7 +52,7 @@ from collections.abc import Mapping, Sequence
 
 import numpy as np
 import shapely
-from scipy.spatial import ConvexHull
+from scipy.spatial import ConvexHull  # pylint: disable=no-name-in-module
 
 from geometry.models.common import DirectedObject, DirectionMode
 from geometry.models.line import Line
@@ -196,10 +196,11 @@ def is_convex(polygon: Polygon, points: Mapping[str, Point]) -> bool:
     if len(coords) < 3:
         return False
     edges = np.roll(coords, -1, axis=0) - coords  # edge[i] = V[i+1] - V[i]
+    n_edges = len(edges)
     saw_positive = False
     saw_negative = False
-    for i in range(len(edges)):
-        cross = _cross2d(edges[i], edges[(i + 1) % len(edges)])
+    for i, edge in enumerate(edges):
+        cross = _cross2d(edge, edges[(i + 1) % n_edges])
         if cross > EPS_ANGLE:
             saw_positive = True
         elif cross < -EPS_ANGLE:
@@ -353,6 +354,24 @@ def _dedup(pts: Sequence[np.ndarray]) -> list[np.ndarray]:
     return unique
 
 
+def _extended_line(
+    a: np.ndarray, b: np.ndarray, unit: np.ndarray, coords: np.ndarray
+) -> shapely.LineString:
+    """Stretch the segment ``a``→``b`` past ``coords`` to stand in for an infinite line."""
+    span = _line_span(coords, a, b)
+    return shapely.LineString([a - unit * span, b + unit * span])
+
+
+def _edge_crossings(long_line: shapely.LineString, coords: np.ndarray) -> list[np.ndarray]:
+    """Collect every point where ``long_line`` meets a polygon edge of ``coords``."""
+    hits: list[np.ndarray] = []
+    n = len(coords)
+    for i, vertex in enumerate(coords):
+        edge = shapely.LineString([vertex, coords[(i + 1) % n]])
+        hits.extend(_collect_points(shapely.intersection(long_line, edge)))
+    return hits
+
+
 def line_polygon_intersections(
     line: Line, polygon: Polygon, points: Mapping[str, Point]
 ) -> list[np.ndarray]:
@@ -377,18 +396,8 @@ def line_polygon_intersections(
         return []
     unit = direction / norm
     coords = _polygon_coords(polygon, points)
-    span = _line_span(coords, a, b)
-    far_a = a - unit * span
-    far_b = b + unit * span
-    long_line = shapely.LineString([far_a, far_b])
-
-    hits: list[np.ndarray] = []
-    n = len(coords)
-    for i in range(n):
-        edge = shapely.LineString([coords[i], coords[(i + 1) % n]])
-        hits.extend(_collect_points(shapely.intersection(long_line, edge)))
-
-    unique = _dedup(hits)
+    long_line = _extended_line(a, b, unit, coords)
+    unique = _dedup(_edge_crossings(long_line, coords))
     unique.sort(key=lambda p: float(np.dot(p - a, unit)))
     return unique
 
@@ -416,6 +425,23 @@ def polygon_polygon_intersections(
     return unique
 
 
+def _ray_edge_t(origin: np.ndarray, unit: np.ndarray, a: np.ndarray, b: np.ndarray) -> float | None:
+    """Forward distance ``t`` where ray ``origin + t·unit`` meets segment ``a``→``b``.
+
+    Returns ``None`` when the ray is parallel to the edge, the hit is behind
+    the origin (``t < -EPS_PARAM``), or it falls outside the edge span.
+    """
+    edge = b - a
+    if abs(_cross2d(unit, edge)) < EPS_ANGLE:
+        return None  # ray parallel to this edge
+    # Solve origin + t*unit = a + s*edge  ->  [unit, -edge] · [t, s] = a - origin
+    matrix = np.array([[unit[0], -edge[0]], [unit[1], -edge[1]]], dtype=np.float64)
+    t, s = np.linalg.solve(matrix, a - origin)
+    if t >= -EPS_PARAM and -EPS_PARAM <= s <= 1.0 + EPS_PARAM:
+        return float(t)
+    return None
+
+
 def ray_polygon_distance(ray: Ray, polygon: Polygon, points: Mapping[str, Point]) -> np.float64:
     """Distance from a ray's origin to the nearest polygon-boundary hit.
 
@@ -436,17 +462,10 @@ def ray_polygon_distance(ray: Ray, polygon: Polygon, points: Mapping[str, Point]
     coords = _polygon_coords(polygon, points)
     n = len(coords)
     best = math.inf
-    for i in range(n):
-        a = coords[i]
-        b = coords[(i + 1) % n]
-        edge = b - a
-        # Solve origin + t*unit = a + s*edge  ->  [unit, -edge] · [t, s] = a - origin
-        matrix = np.array([[unit[0], -edge[0]], [unit[1], -edge[1]]], dtype=np.float64)
-        if abs(_cross2d(unit, edge)) < EPS_ANGLE:
-            continue  # ray parallel to this edge
-        t, s = np.linalg.solve(matrix, a - origin)
-        if t >= -EPS_PARAM and -EPS_PARAM <= s <= 1.0 + EPS_PARAM:
-            best = min(best, float(t))
+    for i, vertex in enumerate(coords):
+        t = _ray_edge_t(origin, unit, vertex, coords[(i + 1) % n])
+        if t is not None:
+            best = min(best, t)
     return np.float64(best)
 
 

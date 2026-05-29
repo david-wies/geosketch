@@ -67,35 +67,25 @@ def _poly(pid: str, point_ids: list[str], name: str = "poly") -> Polygon:
     )
 
 
+def _directed_kwargs(direction: float = 0.0) -> dict:
+    """Common envelope + direction kwargs shared by the directed-object builders."""
+    return {
+        "alpha": 1.0,
+        "visibility": True,
+        "direction": float(direction),
+        "direction_mode": DirectionMode.AZIMUTH,
+        "direction_units": DirectionUnits.RADIANS,
+        "line_color": "#000000",
+        "fill_color": "#cccccc",
+    }
+
+
 def _line(pid: str, a_id: str, b_id: str) -> Line:
-    return Line(
-        id=pid,
-        name=pid,
-        alpha=1.0,
-        visibility=True,
-        direction=0.0,
-        direction_mode=DirectionMode.AZIMUTH,
-        direction_units=DirectionUnits.RADIANS,
-        point_a_id=a_id,
-        point_b_id=b_id,
-        line_color="#000000",
-        fill_color="#cccccc",
-    )
+    return Line(id=pid, name=pid, point_a_id=a_id, point_b_id=b_id, **_directed_kwargs())
 
 
 def _ray(pid: str, origin_id: str, azimuth: float) -> Ray:
-    return Ray(
-        id=pid,
-        name=pid,
-        alpha=1.0,
-        visibility=True,
-        direction=float(azimuth),
-        direction_mode=DirectionMode.AZIMUTH,
-        direction_units=DirectionUnits.RADIANS,
-        origin_id=origin_id,
-        line_color="#000000",
-        fill_color="#cccccc",
-    )
+    return Ray(id=pid, name=pid, origin_id=origin_id, **_directed_kwargs(azimuth))
 
 
 def _unit_square(prefix: str = "s") -> tuple[dict[str, Point], Polygon]:
@@ -276,7 +266,7 @@ def test_line_polygon_no_intersection():
     pts["l0"] = _pt("l0", -1, 5)
     pts["l1"] = _pt("l1", 3, 5)  # y=5, well above the square
     line = _line("ln", "l0", "l1")
-    assert geo.line_polygon_intersections(line, poly, pts) == []
+    assert not geo.line_polygon_intersections(line, poly, pts)
 
 
 # ---------------------------------------------------------------------------
