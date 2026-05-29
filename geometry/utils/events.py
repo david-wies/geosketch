@@ -129,6 +129,13 @@ class EventBus:
         the handler is registered exactly once. This avoids the
         repeated-handler bug that plagues UI rebuild paths.
 
+        De-duplication uses ``handler ==`` (i.e. list membership), which
+        works for bound methods (same instance + same function compare
+        equal) but **not** for ``lambda`` expressions: every lambda
+        literal is a fresh object, so two ``lambda`` subscriptions are
+        treated as distinct handlers and will both fire. Use a bound
+        method or a named function when you need dedup.
+
         Parameters
         ----------
         event : str
@@ -146,9 +153,10 @@ class EventBus:
 
         Unsubscribing a handler that was never registered (or that has
         already been removed) is a no-op, mirroring the idempotent
-        behaviour of :meth:`subscribe`. The empty-list entry is left
-        in place to keep the implementation simple; it does not affect
-        :meth:`fire` semantics.
+        behaviour of :meth:`subscribe`. When the last subscriber for an
+        event is removed the event's dict entry is also deleted, so
+        ``_subscribers`` does not grow unbounded across long-running
+        sessions with churning subscriptions.
 
         Parameters
         ----------
@@ -166,7 +174,9 @@ class EventBus:
         except ValueError:
             # Handler was not subscribed; treat as a no-op rather than
             # raising — symmetric with subscribe's idempotency.
-            pass
+            return
+        if not handlers:
+            del self._subscribers[event]
 
     def fire(self, event: str, **payload: Any) -> None:
         """Synchronously dispatch ``event`` to every subscribed handler.

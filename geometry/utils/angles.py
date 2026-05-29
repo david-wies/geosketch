@@ -40,9 +40,10 @@ azimuth_to_angle(rad)
 angle_to_azimuth(rad)
     Inverse of ``azimuth_to_angle``.
 to_radians(value, units)
-    Convert a user-facing direction value to radians, accepting either
-    ``"radians"``/``"degrees"`` as a (case-insensitive) string or a
-    :class:`DirectionUnits` enum member.
+    Convert a user-facing direction value to radians. ``units`` must be
+    a :class:`DirectionUnits` enum member; callers loading strings from
+    the JSON wire format are expected to coerce via
+    ``DirectionUnits(value.lower())`` first.
 to_degrees(rad)
     Convert radians to degrees.
 normalize_to_2pi(rad)
@@ -123,37 +124,34 @@ def angle_to_azimuth(rad: float) -> np.float64:
     return normalize_to_2pi(_HALF_PI - np.float64(rad))
 
 
-def to_radians(value: float, units: DirectionUnits | str) -> np.float64:
+def to_radians(value: float, units: DirectionUnits) -> np.float64:
     """Convert a user-facing direction value to radians.
 
     The MVP spec stores ``direction`` internally in radians but allows
     the UI to capture it in either radians or degrees. This helper
-    normalises that input. It accepts either a :class:`DirectionUnits`
-    enum member (in-memory form) or a string (case-insensitive
-    deserialization form), matching the spec's "deserialisation MUST be
-    case-insensitive" rule.
+    normalises that input.
+
+    The API is deliberately enum-only: persistence-layer callers reading
+    the JSON wire format should coerce the on-disk string to the enum
+    via ``DirectionUnits(value.lower())`` (case-insensitive coercion is
+    a property of the enum, not of this helper). Keeping the boundary at
+    the deserializer prevents string identifiers from leaking into the
+    service layer.
 
     Parameters
     ----------
     value : float
         Direction in the requested units.
-    units : DirectionUnits or str
-        ``DirectionUnits.RADIANS``/``DirectionUnits.DEGREES`` or the
-        string ``"radians"``/``"degrees"`` (case-insensitive).
+    units : DirectionUnits
+        ``DirectionUnits.RADIANS`` or ``DirectionUnits.DEGREES``.
 
     Returns
     -------
     numpy.float64
         ``value`` expressed in radians.
-
-    Raises
-    ------
-    ValueError
-        If ``units`` is a string that does not name a known unit.
     """
-    resolved = _resolve_units(units)
     val = np.float64(value)
-    if resolved is DirectionUnits.RADIANS:
+    if units is DirectionUnits.RADIANS:
         return val
     return np.deg2rad(val)
 
@@ -172,27 +170,6 @@ def to_degrees(rad: float) -> np.float64:
         Angle in degrees.
     """
     return np.rad2deg(np.float64(rad))
-
-
-def _resolve_units(units: DirectionUnits | str) -> DirectionUnits:
-    """Coerce a units identifier into the canonical enum member.
-
-    Accepts either a :class:`DirectionUnits` instance (passed through)
-    or a case-insensitive string matching one of the enum values
-    (``"radians"`` / ``"degrees"``). Centralised here so call sites need
-    not duplicate the case-folding logic.
-    """
-    if isinstance(units, DirectionUnits):
-        return units
-    if isinstance(units, str):
-        normalised = units.strip().lower()
-        for member in DirectionUnits:
-            if member.value == normalised:
-                return member
-    raise ValueError(
-        f"Unknown direction units {units!r}; expected one of "
-        f"{[m.value for m in DirectionUnits]} or a DirectionUnits member."
-    )
 
 
 __all__ = [

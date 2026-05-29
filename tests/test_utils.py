@@ -19,7 +19,8 @@ Covers the four modules required by issue #11:
 * ``constants`` — the four EPS tolerance values match the spec.
 * ``angles`` — radians/degrees and azimuth/angle round-trip cleanly,
   ``normalize_to_2pi`` handles negatives, and ``to_radians`` accepts
-  both the enum and the case-insensitive string form.
+  the :class:`DirectionUnits` enum (the persistence layer is expected
+  to coerce on-disk strings into the enum at its own boundary).
 * ``id_factory`` — :class:`IDFactory.next_id` zero-pads to three digits,
   per-prefix counters are independent, and :meth:`reseed` sets the
   counter above the maximum integer suffix in the input.
@@ -122,22 +123,14 @@ def test_to_radians_degrees_conversion():
     assert math.isclose(float(to_radians(90.0, DirectionUnits.DEGREES)), math.pi / 2, abs_tol=1e-12)
 
 
-def test_to_radians_accepts_lowercase_string():
-    assert math.isclose(float(to_radians(180.0, "degrees")), math.pi, abs_tol=1e-12)
-    assert to_radians(1.0, "radians") == np.float64(1.0)
-
-
-def test_to_radians_string_is_case_insensitive():
-    # The spec mandates case-insensitive deserialisation of enum strings.
-    assert math.isclose(float(to_radians(180.0, "DEGREES")), math.pi, abs_tol=1e-12)
-    assert math.isclose(float(to_radians(180.0, "Degrees")), math.pi, abs_tol=1e-12)
-
-
-def test_to_radians_rejects_unknown_units():
-    with pytest.raises(ValueError, match="Unknown direction units"):
-        to_radians(1.0, "grads")
-    with pytest.raises(ValueError, match="Unknown direction units"):
-        to_radians(1.0, 42)  # type: ignore[arg-type]
+def test_to_radians_accepts_enum_coerced_from_string():
+    # Persistence-layer pattern: deserializers coerce the on-disk string
+    # to the enum via ``DirectionUnits(value.lower())`` and pass the enum
+    # to ``to_radians``. Case-insensitivity is a property of the enum,
+    # not of this helper.
+    units = DirectionUnits("degrees")
+    assert math.isclose(float(to_radians(180.0, units)), math.pi, abs_tol=1e-12)
+    assert to_radians(1.0, DirectionUnits("radians")) == np.float64(1.0)
 
 
 def test_to_degrees_returns_float64():
@@ -175,7 +168,7 @@ def test_all_angle_helpers_return_float64():
     # Reference precision is NumPy float64 per spec/MVP.md.
     assert isinstance(azimuth_to_angle(1.0), np.float64)
     assert isinstance(angle_to_azimuth(1.0), np.float64)
-    assert isinstance(to_radians(1.0, "radians"), np.float64)
+    assert isinstance(to_radians(1.0, DirectionUnits.RADIANS), np.float64)
     assert isinstance(to_degrees(1.0), np.float64)
     assert isinstance(normalize_to_2pi(1.0), np.float64)
 
@@ -391,6 +384,26 @@ def test_unsubscribe_unknown_handler_is_noop():
 
     # Neither subscribed event nor known handler → must not raise.
     bus.unsubscribe(CANVAS_STALE, handler)
+
+
+def test_unsubscribe_last_handler_removes_event_entry():
+    """The dict entry is cleaned up when the last handler is removed.
+
+    Without this, a long-running session that churns subscriptions would
+    accumulate empty handler lists across event names.
+    """
+    bus = EventBus()
+
+    def handler() -> None:
+        pass
+
+    bus.subscribe(CANVAS_STALE, handler)
+    bus.unsubscribe(CANVAS_STALE, handler)
+    # Access the private attribute by name — this is a behavioural
+    # contract documented in unsubscribe's docstring.
+    assert CANVAS_STALE not in bus._subscribers  # pylint: disable=protected-access
+    # And fire() still works with the entry gone.
+    bus.fire(CANVAS_STALE)
 
 
 def test_subscribers_invoked_in_subscription_order():
