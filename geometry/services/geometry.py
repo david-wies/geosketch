@@ -43,6 +43,21 @@ Notes
 NumPy 2.x deprecated ``np.cross`` on 2-D vectors, so the 2-D cross product is
 computed explicitly via :func:`_cross2d` (``ux*vy - uy*vx``). The result is
 mathematically identical to the deprecated call but emits no warning.
+
+Failure contracts are **not uniform**. The intersection and distance
+functions degrade gracefully — they return ``None`` (no unique line-line
+intersection), ``[]`` (no boundary crossings), or ``numpy.float64(inf)`` (a
+ray that misses) rather than raising. :func:`convex_hull` is the deliberate
+exception: it *propagates* :class:`scipy.spatial.QhullError` on degenerate
+input (collinear or too-few vertices), because a hull over a degenerate
+polygon is undefined. Do not assume every function here degrades silently.
+
+Referenced IDs are resolved via ``points[pid]`` and are **fail-loud**: a
+function handed a polygon/line/ray that references a missing point ID raises
+``KeyError`` rather than guessing or skipping. This is intentional — upstream
+referential integrity (cascading delete, validation) is assumed to guarantee
+that every referenced ID is present, so a ``KeyError`` here signals a bug in
+that invariant, not a recoverable condition.
 """
 
 from __future__ import annotations
@@ -90,6 +105,19 @@ _HALF_PI = math.pi / 2.0
 def _xy(point: Point) -> np.ndarray:
     """Return ``point`` as a ``float64`` ``(easting, northing)`` array."""
     return np.array([point.easting, point.northing], dtype=np.float64)
+
+
+def _delta(a: Point, b: Point) -> tuple[np.float64, np.float64]:
+    """Return ``(Δeasting, Δnorthing)`` from ``a`` to ``b`` as ``float64``.
+
+    Centralises the ``b - a`` component subtraction shared by :func:`azimuth`,
+    :func:`distance`, and :func:`tangent_direction` so the easting-first
+    convention lives in exactly one place.
+    """
+    return (
+        np.float64(b.easting) - np.float64(a.easting),
+        np.float64(b.northing) - np.float64(a.northing),
+    )
 
 
 def _cross2d(u: np.ndarray, v: np.ndarray) -> np.float64:
@@ -171,15 +199,13 @@ def azimuth(pt_a: Point, pt_b: Point) -> np.float64:
     numpy.float64
         Azimuth in radians in ``[0, 2π)``.
     """
-    d_e = np.float64(pt_b.easting) - np.float64(pt_a.easting)
-    d_n = np.float64(pt_b.northing) - np.float64(pt_a.northing)
+    d_e, d_n = _delta(pt_a, pt_b)
     return normalize_to_2pi(np.arctan2(d_e, d_n))
 
 
 def distance(pt_a: Point, pt_b: Point) -> np.float64:
     """Euclidean distance between two points via ``np.hypot`` (float64)."""
-    d_e = np.float64(pt_b.easting) - np.float64(pt_a.easting)
-    d_n = np.float64(pt_b.northing) - np.float64(pt_a.northing)
+    d_e, d_n = _delta(pt_a, pt_b)
     return np.hypot(d_e, d_n)
 
 
@@ -336,9 +362,13 @@ def line_intersection(line_a: Line, line_b: Line, points: Mapping[str, Point]) -
 
     Each line is treated as the infinite line through its two defining points.
     The intersection is found by the parametric solve
-    ``A1 + t·d1 == A2 + s·d2`` via :func:`numpy.linalg.solve`. Parallel lines
-    (cross product of the direction vectors below :data:`EPS_ANGLE`) have no
-    unique solution and return ``None``.
+    ``A1 + t·d1 == A2 + s·d2`` via :func:`numpy.linalg.solve`. Parallelism is
+    tested by :func:`_are_parallel`, which normalises both directions to
+    **unit** vectors before taking the cross product, so the comparison is
+    ``|sin θ|`` against :data:`EPS_ANGLE` — a genuine angular tolerance that
+    does not scale with the input magnitudes, consistent with
+    :func:`_are_parallel` and :func:`is_convex`. Parallel lines have no unique
+    solution and return ``None``.
 
     Returns
     -------
@@ -390,7 +420,7 @@ def _collect_points(geom) -> list[np.ndarray]:
         for g in geom.geoms:
             out.extend(_collect_points(g))
         return out
-    return []
+    raise ValueError(f"unexpected intersection geometry: {gtype}")
 
 
 def _dedup(pts: Sequence[np.ndarray]) -> list[np.ndarray]:
@@ -430,7 +460,9 @@ def line_polygon_intersections(
     (a line passing exactly through a vertex hits two edges) and ordered by
     their projection parameter along the line's direction, so the returned
     list reads in travel order from the line's first defining point toward the
-    second.
+    second. Note the ordering rule differs from
+    :func:`polygon_polygon_intersections`, which orders lexicographically by
+    ``(easting, northing)`` rather than along a travel direction.
 
     Returns
     -------
@@ -457,7 +489,10 @@ def polygon_polygon_intersections(
 
     Intersects the two boundary geometries via :func:`shapely.intersection`,
     de-duplicates, and returns the crossings ordered lexicographically by
-    ``(easting, northing)`` for deterministic output.
+    ``(easting, northing)`` for deterministic output. Note the ordering rule
+    differs from :func:`line_polygon_intersections`, which orders along the
+    line's travel direction; a caller expecting entry/exit pairing from this
+    result should not assume that ordering here.
 
     Returns
     -------
@@ -476,8 +511,13 @@ def polygon_polygon_intersections(
 def _ray_edge_t(origin: np.ndarray, unit: np.ndarray, a: np.ndarray, b: np.ndarray) -> float | None:
     """Forward distance ``t`` where ray ``origin + t·unit`` meets segment ``a``→``b``.
 
+    Because ``unit`` is a unit vector, ``t`` is a metric distance in metres,
+    so the forward-hit gate uses :data:`EPS_DISTANCE` (the metric tolerance).
+    The edge-span parameter ``s`` is dimensionless (``s ∈ [0, 1]`` spans the
+    edge), so its clip uses the dimensionless :data:`EPS_PARAM`.
+
     Returns ``None`` when the ray is parallel to the edge, the hit is behind
-    the origin (``t < -EPS_PARAM``), or it falls outside the edge span.
+    the origin (``t < -EPS_DISTANCE``), or it falls outside the edge span.
     """
     edge = b - a
     if _are_parallel(unit, edge):
@@ -485,7 +525,7 @@ def _ray_edge_t(origin: np.ndarray, unit: np.ndarray, a: np.ndarray, b: np.ndarr
     # Solve origin + t*unit = a + s*edge  ->  [unit, -edge] · [t, s] = a - origin
     matrix = np.array([[unit[0], -edge[0]], [unit[1], -edge[1]]], dtype=np.float64)
     t, s = np.linalg.solve(matrix, a - origin)
-    if t >= -EPS_PARAM and -EPS_PARAM <= s <= 1.0 + EPS_PARAM:
+    if t >= -EPS_DISTANCE and -EPS_PARAM <= s <= 1.0 + EPS_PARAM:
         return float(t)
     return None
 
@@ -494,9 +534,10 @@ def ray_polygon_distance(ray: Ray, polygon: Polygon, points: Mapping[str, Point]
     """Distance from a ray's origin to the nearest polygon-boundary hit.
 
     The ray is ``origin + t · direction`` with ``t ≥ 0`` and a unit direction
-    vector, so ``t`` is the distance. Each polygon edge is solved
-    parametrically against the ray; only forward hits (``t ≥ -EPS_PARAM``)
-    that land within the edge (``s ∈ [-EPS_PARAM, 1 + EPS_PARAM]``) count. The
+    vector, so ``t`` is the distance in metres. Each polygon edge is solved
+    parametrically against the ray; only forward hits (``t ≥ -EPS_DISTANCE``,
+    a metric tolerance because ``t`` is a distance) that land within the edge
+    (the dimensionless span ``s ∈ [-EPS_PARAM, 1 + EPS_PARAM]``) count. The
     smallest such ``t`` is the answer; a ray that never meets the polygon
     returns ``+∞``.
 
@@ -541,6 +582,7 @@ def point_polygon_distance(
     """
     sp_poly = _shapely_polygon(polygon, points)
     sp_point = shapely.Point(point.easting, point.northing)
+    # explicit: shapely.distance already returns 0 here; kept to document intent.
     if shapely.contains(sp_poly, sp_point):
         return np.float64(0.0)
     return np.float64(shapely.distance(sp_poly, sp_point))
@@ -565,6 +607,7 @@ def polygon_polygon_distance(
     """
     sp_a = _shapely_polygon(poly_a, points)
     sp_b = _shapely_polygon(poly_b, points)
+    # explicit: shapely.distance already returns 0 here; kept to document intent.
     if shapely.intersects(sp_a, sp_b):
         return np.float64(0.0)
     return np.float64(shapely.distance(sp_a, sp_b))
@@ -579,20 +622,18 @@ def tangent_direction(center: Point, point: Point) -> np.float64:
     """Azimuth of the tangent to a circle at ``point`` on its circumference.
 
     The tangent is perpendicular to the radius, so its azimuth is the radius
-    azimuth plus ``π/2`` (mod ``2π``), where the radius azimuth is
-    ``atan2(Δe, Δn)`` from ``center`` to ``point``. The opposite-facing
-    direction (``+π``) is geometrically equivalent; this returns the canonical
-    one per the spec.
+    azimuth plus ``π/2`` (mod ``2π``). The radius azimuth is obtained from
+    :func:`azimuth` (``center`` → ``point``), which already normalises into
+    ``[0, 2π)``; adding ``π/2`` and re-normalising is idempotent. The
+    opposite-facing direction (``+π``) is geometrically equivalent; this
+    returns the canonical one per the spec.
 
     Returns
     -------
     numpy.float64
         Tangent azimuth in radians in ``[0, 2π)``.
     """
-    d_e = np.float64(point.easting) - np.float64(center.easting)
-    d_n = np.float64(point.northing) - np.float64(center.northing)
-    radius_azimuth = np.arctan2(d_e, d_n)
-    return normalize_to_2pi(radius_azimuth + _HALF_PI)
+    return normalize_to_2pi(azimuth(center, point) + _HALF_PI)
 
 
 def vector_endpoint(origin: Point, length: float, az: float) -> np.ndarray:
@@ -616,6 +657,17 @@ def vector_endpoint(origin: Point, length: float, az: float) -> np.ndarray:
     -------
     numpy.ndarray
         The ``(easting, northing)`` endpoint, shape ``(2,)``.
+
+    Notes
+    -----
+    ``az`` is **azimuth-only**. Unlike :func:`direction_unit_vector` — which is
+    mode-aware and resolves ``direction_mode`` — this function does *not* look
+    at ``direction_mode`` and always interprets ``az`` as an azimuth. For a
+    :class:`~geometry.models.common.DirectedObject` whose ``direction_mode`` is
+    :attr:`DirectionMode.ANGLE`, callers must convert ``direction`` to an
+    azimuth first (e.g. via :func:`~geometry.utils.angles.angle_to_azimuth`) or
+    use :func:`direction_unit_vector` instead; passing a raw ANGLE-mode
+    ``direction`` here yields a wrong endpoint.
     """
     length = np.float64(length)
     az = np.float64(az)

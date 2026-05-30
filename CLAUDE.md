@@ -104,7 +104,7 @@ Inline comments follow the normal rule: only when the WHY is non-obvious.
 
 ## Environment + common commands
 
-The project has a Python 3.14 virtualenv at `.venv/` (gitignored). Dependencies are pinned in `requirements.txt` (runtime) and `requirements-dev.txt` (adds `ruff`, `pytest`, `pylint`, `flake8`). Activate it before running anything:
+The project has a Python 3.14 virtualenv at `.venv/` (gitignored). Dependencies are pinned in `requirements.txt` (runtime) and `requirements-dev.txt` (adds `ruff`, `pytest`, `pylint`, and `flake8`). Note that `flake8` is installed/available but is **not** one of the four CI gate checks described below — the gate runs `ruff check`, `ruff format --check`, `pylint`, and `pytest` only (see "CI runs four checks"). Activate it before running anything:
 
 ```bash
 source .venv/bin/activate          # or: .venv/bin/python <cmd>

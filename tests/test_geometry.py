@@ -29,6 +29,7 @@ import math
 
 import numpy as np
 import pytest
+from scipy.spatial import QhullError  # pylint: disable=no-name-in-module
 
 from geometry.models.common import DirectionMode, DirectionUnits
 from geometry.models.line import Line
@@ -67,13 +68,13 @@ def _poly(pid: str, point_ids: list[str], name: str = "poly") -> Polygon:
     )
 
 
-def _directed_kwargs(direction: float = 0.0) -> dict:
+def _directed_kwargs(direction: float = 0.0, mode: DirectionMode = DirectionMode.AZIMUTH) -> dict:
     """Common envelope + direction kwargs shared by the directed-object builders."""
     return {
         "alpha": 1.0,
         "visibility": True,
         "direction": float(direction),
-        "direction_mode": DirectionMode.AZIMUTH,
+        "direction_mode": mode,
         "direction_units": DirectionUnits.RADIANS,
         "line_color": "#000000",
         "fill_color": "#cccccc",
@@ -84,8 +85,13 @@ def _line(pid: str, a_id: str, b_id: str) -> Line:
     return Line(id=pid, name=pid, point_a_id=a_id, point_b_id=b_id, **_directed_kwargs())
 
 
-def _ray(pid: str, origin_id: str, azimuth: float) -> Ray:
-    return Ray(id=pid, name=pid, origin_id=origin_id, **_directed_kwargs(azimuth))
+def _ray(
+    pid: str,
+    origin_id: str,
+    direction: float,
+    mode: DirectionMode = DirectionMode.AZIMUTH,
+) -> Ray:
+    return Ray(id=pid, name=pid, origin_id=origin_id, **_directed_kwargs(direction, mode))
 
 
 def _unit_square(prefix: str = "s") -> tuple[dict[str, Point], Polygon]:
@@ -139,6 +145,37 @@ def test_distance_zero_for_coincident_points():
 
 
 # ---------------------------------------------------------------------------
+# direction unit vector (both modes)
+# ---------------------------------------------------------------------------
+
+
+def test_direction_unit_vector_azimuth_east():
+    # Azimuth pi/2 is due East => unit vector (1, 0) in (easting, northing).
+    ray = _ray("ry", "o", math.pi / 2, DirectionMode.AZIMUTH)
+    vec = geo.direction_unit_vector(ray)
+    assert vec.shape == (2,)
+    assert vec.dtype == np.float64
+    assert vec[0] == pytest.approx(1.0)
+    assert vec[1] == pytest.approx(0.0)
+
+
+def test_direction_unit_vector_angle_east():
+    # Math angle 0 is due East => (cos 0, sin 0) = (1, 0).
+    ray = _ray("ry", "o", 0.0, DirectionMode.ANGLE)
+    vec = geo.direction_unit_vector(ray)
+    assert vec[0] == pytest.approx(1.0)
+    assert vec[1] == pytest.approx(0.0)
+
+
+def test_direction_unit_vector_angle_north():
+    # Math angle pi/2 is due North => (cos, sin) = (0, 1).
+    ray = _ray("ry", "o", math.pi / 2, DirectionMode.ANGLE)
+    vec = geo.direction_unit_vector(ray)
+    assert vec[0] == pytest.approx(0.0)
+    assert vec[1] == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
 # signed area
 # ---------------------------------------------------------------------------
 
@@ -179,6 +216,22 @@ def test_is_convex_false_for_concave_arrow():
     assert geo.is_convex(poly, pts) is False
 
 
+def test_is_convex_false_for_cw_wound_concave():
+    # Same arrowhead, but wound clockwise (reversed order). The sign of the
+    # turns flips wholesale, yet a reflex vertex still produces a mixed sign,
+    # so it must remain concave. Guards the CW branch the creation path can
+    # transiently see before signed-area reversal.
+    pts = {
+        "c0": _pt("c0", 0, 0),
+        "c1": _pt("c1", 4, 0),
+        "c2": _pt("c2", 2, 2),  # reflex notch
+        "c3": _pt("c3", 4, 4),
+        "c4": _pt("c4", 0, 4),
+    }
+    poly = _poly("pg_c", list(reversed(["c0", "c1", "c2", "c3", "c4"])))
+    assert geo.is_convex(poly, pts) is False
+
+
 # ---------------------------------------------------------------------------
 # convex hull
 # ---------------------------------------------------------------------------
@@ -206,6 +259,19 @@ def test_convex_hull_is_ccw():
     hull = geo.convex_hull(poly, pts, "pg_999")
     # CCW winding => positive signed area.
     assert geo.signed_area(hull, pts) > 0
+
+
+def test_convex_hull_raises_on_collinear():
+    # Three collinear points are degenerate for hull construction. Unlike the
+    # intersection/distance helpers, convex_hull propagates QhullError.
+    pts = {
+        "k0": _pt("k0", 0, 0),
+        "k1": _pt("k1", 1, 1),
+        "k2": _pt("k2", 2, 2),
+    }
+    poly = _poly("pg_k", ["k0", "k1", "k2"])
+    with pytest.raises(QhullError):
+        geo.convex_hull(poly, pts, "pg_999")
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +327,20 @@ def test_line_intersection_parallel_returns_none():
     assert geo.line_intersection(la, lb, pts) is None
 
 
+def test_line_intersection_collinear_returns_none():
+    # Two lines on the same infinite line y=0 are collinear: no unique
+    # intersection, so the parallel branch returns None.
+    pts = {
+        "a0": _pt("a0", 0, 0),
+        "a1": _pt("a1", 2, 0),
+        "b0": _pt("b0", 3, 0),
+        "b1": _pt("b1", 5, 0),
+    }
+    la = _line("ln_a", "a0", "a1")
+    lb = _line("ln_b", "b0", "b1")
+    assert geo.line_intersection(la, lb, pts) is None
+
+
 # ---------------------------------------------------------------------------
 # line-polygon intersection
 # ---------------------------------------------------------------------------
@@ -290,6 +370,48 @@ def test_line_polygon_no_intersection():
     assert not geo.line_polygon_intersections(line, poly, pts)
 
 
+def test_line_polygon_through_vertices_dedups_to_two():
+    # Diagonal through the square's opposite corners (0,0) and (2,2). Each
+    # corner lies on two adjacent edges, so the raw crossings are 4; dedup
+    # must collapse them to exactly the 2 corner points.
+    pts, poly = _unit_square()
+    pts["d0"] = _pt("d0", 0, 0)
+    pts["d1"] = _pt("d1", 2, 2)
+    line = _line("ln", "d0", "d1")
+
+    result = geo.line_polygon_intersections(line, poly, pts)
+    assert len(result) == 2
+    # Ordered along the line (0,0) -> (2,2).
+    assert result[0][0] == pytest.approx(0.0)
+    assert result[0][1] == pytest.approx(0.0)
+    assert result[1][0] == pytest.approx(2.0)
+    assert result[1][1] == pytest.approx(2.0)
+
+
+def test_line_polygon_collinear_with_edge_returns_overlap_endpoints():
+    # Line collinear with the bottom edge y=0 of the square. The extended line
+    # overlaps that edge, so shapely returns a LineString; _collect_points must
+    # keep the shared edge endpoints (0,0) and (2,0), deduped.
+    pts, poly = _unit_square()
+    pts["e0"] = _pt("e0", -1, 0)
+    pts["e1"] = _pt("e1", 3, 0)
+    line = _line("ln", "e0", "e1")
+
+    result = geo.line_polygon_intersections(line, poly, pts)
+    coords = sorted((round(float(p[0]), 6), round(float(p[1]), 6)) for p in result)
+    assert coords == [(0.0, 0.0), (2.0, 0.0)]
+
+
+def test_line_polygon_zero_length_line_returns_empty():
+    # Coincident endpoints give a zero-length direction; the _unit/norm guard
+    # short-circuits to an empty result rather than dividing by zero.
+    pts, poly = _unit_square()
+    pts["z0"] = _pt("z0", 1, 1)
+    pts["z1"] = _pt("z1", 1, 1)
+    line = _line("ln", "z0", "z1")
+    assert not geo.line_polygon_intersections(line, poly, pts)
+
+
 # ---------------------------------------------------------------------------
 # polygon-polygon intersection
 # ---------------------------------------------------------------------------
@@ -307,8 +429,25 @@ def test_polygon_polygon_intersections():
     pts = {**pts_a, **pts_b}
 
     result = geo.polygon_polygon_intersections(poly_a, poly_b, pts)
-    coords = sorted((round(float(p[0]), 6), round(float(p[1]), 6)) for p in result)
+    # The function already returns lexicographic (easting, northing) order;
+    # assert against the result directly (no re-sort) so the ordering contract
+    # is actually exercised.
+    coords = [(round(float(p[0]), 6), round(float(p[1]), 6)) for p in result]
     assert coords == [(1.0, 2.0), (2.0, 1.0)]
+
+
+def test_polygon_polygon_intersections_nested_returns_empty():
+    # poly_b strictly inside poly_a with no boundary crossing => no points.
+    pts_a, poly_a = _unit_square("a")  # (0,0)-(2,2)
+    pts_b = {
+        "b0": _pt("b0", 0.5, 0.5),
+        "b1": _pt("b1", 1.5, 0.5),
+        "b2": _pt("b2", 1.5, 1.5),
+        "b3": _pt("b3", 0.5, 1.5),
+    }
+    poly_b = _poly("pg_b", ["b0", "b1", "b2", "b3"])
+    pts = {**pts_a, **pts_b}
+    assert not geo.polygon_polygon_intersections(poly_a, poly_b, pts)
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +468,15 @@ def test_ray_polygon_distance_misses_is_infinity():
     pts["o"] = _pt("o", -1, 1)
     ray = _ray("ry", "o", 3 * math.pi / 2)  # azimuth West => away from square
     assert math.isinf(geo.ray_polygon_distance(ray, poly, pts))
+
+
+def test_ray_polygon_distance_origin_inside():
+    # Origin at the square's center (1,1) firing East. The nearest forward exit
+    # edge is x=2, so the distance is 1.0.
+    pts, poly = _unit_square()
+    pts["o"] = _pt("o", 1, 1)
+    ray = _ray("ry", "o", math.pi / 2)  # azimuth East
+    assert geo.ray_polygon_distance(ray, poly, pts) == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +544,14 @@ def test_tangent_direction_east_point():
     # Point due East: radius azimuth pi/2 => tangent azimuth pi.
     result = geo.tangent_direction(_pt("c", 0, 0), _pt("p", 1, 0))
     assert result == pytest.approx(math.pi)
+
+
+def test_tangent_direction_normalizes_negative_wrap():
+    # Point SW of center: radius azimuth atan2(-1,-1) = -3pi/4, +pi/2 = -pi/4,
+    # which must normalize into [0, 2pi) as 7pi/4. Guards the negative wrap.
+    result = geo.tangent_direction(_pt("c", 0, 0), _pt("p", -1, -1))
+    assert result == pytest.approx(7 * math.pi / 4)
+    assert 0.0 <= result < 2 * math.pi
 
 
 # ---------------------------------------------------------------------------
