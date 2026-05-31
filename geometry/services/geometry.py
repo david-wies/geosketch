@@ -417,7 +417,19 @@ def _line_span(coords: np.ndarray, *extra: np.ndarray) -> float:
 
 
 def _collect_points(geom) -> list[np.ndarray]:
-    """Flatten a shapely intersection result into a list of coordinate arrays."""
+    """Flatten a shapely intersection result into a list of coordinate arrays.
+
+    Handles the geometry types that intersecting **1-D** geometries can yield:
+    ``Point``/``MultiPoint`` (transversal crossings), ``LineString``/
+    ``MultiLineString`` (collinear overlaps, whose endpoints are kept), and
+    ``GeometryCollection`` (a mix of the above, flattened recursively). The two
+    callers only ever feed it such results — ``_edge_crossings`` intersects a
+    LineString with a LineString, and :func:`polygon_polygon_intersections`
+    intersects two ring *boundaries* (1-D), never the filled polygons — so an
+    areal ``Polygon``/``MultiPolygon`` cannot arise here. Any other type is
+    therefore an unexpected-input bug and raises ``ValueError`` rather than
+    being silently dropped.
+    """
     if geom.is_empty:
         return []
     gtype = geom.geom_type
@@ -704,6 +716,15 @@ def vector_endpoint(origin: Point, length: float, az: float) -> np.ndarray:
     azimuth first (e.g. via :func:`~geometry.utils.angles.angle_to_azimuth`) or
     use :func:`direction_unit_vector` instead; passing a raw ANGLE-mode
     ``direction`` here yields a wrong endpoint.
+
+    ``az`` and ``length`` are assumed **finite**. This function intentionally
+    carries no ``math.isfinite`` guard — unlike :func:`direction_unit_vector`,
+    which validates because it resolves a stored ``direction`` that may have
+    been corrupted on deserialisation. ``vector_endpoint`` takes plain scalar
+    arguments that the command layer computes locally, so the validation
+    responsibility sits with the caller. A non-finite ``az`` or ``length``
+    propagates silently into a ``nan``/``inf`` endpoint array; callers passing
+    values from an untrusted source must check them before calling.
     """
     length = np.float64(length)
     az = np.float64(az)

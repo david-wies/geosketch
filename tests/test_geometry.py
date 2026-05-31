@@ -337,6 +337,22 @@ def test_line_intersection_parallel_returns_none():
     assert geo.line_intersection(la, lb, pts) is None
 
 
+def test_line_intersection_zero_length_line_returns_none():
+    # One "line" has coincident defining points, so its direction is zero-length.
+    # _unit returns None for it, _are_parallel treats it as parallel to
+    # everything, and the function degrades to None rather than dividing by a
+    # singular matrix.
+    pts = {
+        "a0": _pt("a0", 1, 1),
+        "a1": _pt("a1", 1, 1),  # coincident => zero-length direction
+        "b0": _pt("b0", 0, 0),
+        "b1": _pt("b1", 2, 0),
+    }
+    la = _line("ln_a", "a0", "a1")
+    lb = _line("ln_b", "b0", "b1")
+    assert geo.line_intersection(la, lb, pts) is None
+
+
 def test_line_intersection_collinear_returns_none():
     # Two lines on the same infinite line y=0 are collinear: no unique
     # intersection, so the parallel branch returns None.
