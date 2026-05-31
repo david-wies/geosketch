@@ -60,7 +60,8 @@ geometry/           ← main package
   ui/               ← tkinter widgets (main_window, dialogs, properties_panel, cards)
   persistence/      ← JSON save/load (serializer, schema/version checking)
   utils/            ← constants (EPS_*), angle conversions, id_factory, event bus
-tests/              ← pytest suite (empty)
+tests/              ← pytest suite (models, utils, geometry service)
+scripts/            ← dev helpers; `check.sh` runs the full CI gate locally
 main.py             ← thin shim: `from geometry.__main__ import main; main()`
 pyproject.toml      ← packaging config
 spec/               ← product spec and UI/UX design (source of truth)
@@ -103,17 +104,22 @@ Inline comments follow the normal rule: only when the WHY is non-obvious.
 
 ## Environment + common commands
 
-The project has a Python 3.14 virtualenv at `.venv/` (gitignored). Dependencies are pinned in `requirements.txt` (runtime) and `requirements-dev.txt` (adds `ruff`, `pytest`). Activate it before running anything:
+The project has a Python 3.14 virtualenv at `.venv/` (gitignored). Dependencies are pinned in `requirements.txt` (runtime) and `requirements-dev.txt` (adds `ruff`, `pytest`, `pylint`, and `flake8`). Note that `flake8` is installed/available but is **not** one of the four CI gate checks described below — the gate runs `ruff check`, `ruff format --check`, `pylint`, and `pytest` only (see "CI runs four checks"). Activate it before running anything:
 
 ```bash
 source .venv/bin/activate          # or: .venv/bin/python <cmd>
 ```
 
+- **`./scripts/check.sh` — run the full CI gate locally. Run this before every commit/push.** It mirrors the `lint-and-test` job in `.github/workflows/ci.yml` step-for-step and in order. Keep the script and `ci.yml` in lockstep — if one changes, change the other.
 - `python3 -m venv .venv && .venv/bin/python -m pip install -r requirements-dev.txt` — recreate the venv from scratch (e.g. on a fresh clone). Use the **venv's own pip** (`.venv/bin/python -m pip`), not the system pip — system pip on Debian redirects `--prefix` installs to a `local/` subdirectory and skips entry-point script creation.
 - `.venv/bin/python spec/design/_generate_drawio.py` — regenerate `spec/design/geometry-app-ui-ux.drawio` from the Python source. Run this whenever you change the generator; never hand-edit the drawio XML.
-- `.venv/bin/ruff format .` — format. Run this **before** `ruff check`; CI runs both and will fail if either is skipped.
-- `.venv/bin/ruff check .` — lint.
-- `.venv/bin/pytest` — run tests.
+
+CI runs **four** checks, all of which must pass (any one failing fails the build). `scripts/check.sh` runs them in this exact order:
+
+1. `.venv/bin/ruff check .` — lint.
+2. `.venv/bin/ruff format --check .` — formatting is verified, not applied. Run `.venv/bin/ruff format .` first to apply it.
+3. `.venv/bin/pylint $(git ls-files '*.py')` — runs over **every tracked `.py` file** with no `--fail-under`, so *any* message (including refactor/convention messages like `duplicate-code` across test files) fails CI. Lint config lives under `[tool.pylint.*]` in `pyproject.toml`.
+4. `.venv/bin/pytest` — run tests.
 
 The target stack:
 
