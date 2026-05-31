@@ -16,8 +16,10 @@
 
 This module is the single home for every numeric geometry operation in the
 app: direction (azimuth), Euclidean distance, polygon signed area and
-convexity, convex hull, the four intersection types, the polygon distances,
-the tangent direction, and the vector endpoint. It depends only on the model
+convexity, convex hull, the direction unit vector, three intersection
+functions (line–line, line–polygon, polygon–polygon), the ray-polygon
+distance, the point/polygon and polygon/polygon distances, the tangent
+direction, and the vector endpoint. It depends only on the model
 dataclasses (:mod:`geometry.models`) and the math utilities
 (:mod:`geometry.utils`); it imports neither ``tkinter`` nor ``matplotlib``.
 
@@ -110,8 +112,9 @@ def _xy(point: Point) -> np.ndarray:
 def _delta(a: Point, b: Point) -> tuple[np.float64, np.float64]:
     """Return ``(Δeasting, Δnorthing)`` from ``a`` to ``b`` as ``float64``.
 
-    Centralises the ``b - a`` component subtraction shared by :func:`azimuth`,
-    :func:`distance`, and :func:`tangent_direction` so the easting-first
+    Centralises the ``b - a`` component subtraction used directly by
+    :func:`azimuth` and :func:`distance` (and indirectly by
+    :func:`tangent_direction` via :func:`azimuth`) so the easting-first
     convention lives in exactly one place.
     """
     return (
@@ -344,7 +347,22 @@ def direction_unit_vector(obj: DirectedObject) -> np.ndarray:
     -------
     numpy.ndarray
         Unit direction vector, shape ``(2,)``.
+
+    Raises
+    ------
+    ValueError
+        If ``obj.direction`` is not finite (``nan``/``inf``). Without this
+        guard ``np.cos``/``np.sin`` would propagate ``nan`` into a
+        ``[nan, nan]`` vector that silently poisons downstream callers (e.g.
+        :func:`ray_polygon_distance` would return ``+∞``, indistinguishable
+        from a legitimate miss). Failing loud here pins the corruption — most
+        plausibly a malformed JSON deserialisation — to the right callsite.
     """
+    if not math.isfinite(obj.direction):
+        raise ValueError(
+            f"direction_unit_vector: obj.direction is {obj.direction!r}; "
+            "expected a finite radian value"
+        )
     if obj.direction_mode is DirectionMode.AZIMUTH:
         angle = azimuth_to_angle(obj.direction)
     else:
@@ -517,7 +535,11 @@ def _ray_edge_t(origin: np.ndarray, unit: np.ndarray, a: np.ndarray, b: np.ndarr
     edge), so its clip uses the dimensionless :data:`EPS_PARAM`.
 
     Returns ``None`` when the ray is parallel to the edge, the hit is behind
-    the origin (``t < -EPS_DISTANCE``), or it falls outside the edge span.
+    the origin (``t < -EPS_DISTANCE``), or it falls outside the edge span. A
+    hit in the snap zone ``t ∈ [-EPS_DISTANCE, 0)`` — an origin sitting a
+    sub-tolerance step outside the boundary — is clamped to ``0.0`` so the
+    returned value is never negative, preserving the caller's "distance or
+    ``+∞``" (non-negative) contract.
     """
     edge = b - a
     if _are_parallel(unit, edge):
@@ -526,7 +548,7 @@ def _ray_edge_t(origin: np.ndarray, unit: np.ndarray, a: np.ndarray, b: np.ndarr
     matrix = np.array([[unit[0], -edge[0]], [unit[1], -edge[1]]], dtype=np.float64)
     t, s = np.linalg.solve(matrix, a - origin)
     if t >= -EPS_DISTANCE and -EPS_PARAM <= s <= 1.0 + EPS_PARAM:
-        return float(t)
+        return max(0.0, float(t))
     return None
 
 
@@ -624,15 +646,29 @@ def tangent_direction(center: Point, point: Point) -> np.float64:
     The tangent is perpendicular to the radius, so its azimuth is the radius
     azimuth plus ``π/2`` (mod ``2π``). The radius azimuth is obtained from
     :func:`azimuth` (``center`` → ``point``), which already normalises into
-    ``[0, 2π)``; adding ``π/2`` and re-normalising is idempotent. The
-    opposite-facing direction (``+π``) is geometrically equivalent; this
-    returns the canonical one per the spec.
+    ``[0, 2π)``; adding ``π/2`` and re-normalising is always valid since the
+    result is brought back into ``[0, 2π)``. The opposite-facing direction
+    (``+π``) is geometrically equivalent; this returns the canonical one per
+    the spec.
 
     Returns
     -------
     numpy.float64
         Tangent azimuth in radians in ``[0, 2π)``.
+
+    Raises
+    ------
+    ValueError
+        If ``center`` and ``point`` are coincident within
+        :data:`EPS_DISTANCE` (a zero-radius circle). The radius then has no
+        direction — :func:`azimuth` would return ``atan2(0, 0) == 0`` — so the
+        tangent is undefined and reporting ``π/2`` would be a silent fiction.
     """
+    if distance(center, point) < EPS_DISTANCE:
+        raise ValueError(
+            "tangent_direction: center and circumference point are coincident; "
+            "a zero-radius circle has no tangent"
+        )
     return normalize_to_2pi(azimuth(center, point) + _HALF_PI)
 
 
