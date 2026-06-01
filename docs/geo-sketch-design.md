@@ -2,7 +2,7 @@
 
 ## Overview
 
-GeoSketch is a Python desktop geometry application for creating, visualizing, and analyzing 2D geometric objects in UTM coordinates. It is a data-driven CAD-like tool with strong geometric correctness, a render-on-demand canvas model, and a UI guided by `spec/design/geometry-app-ui-ux.md`.
+GeoSketch is a Python desktop geometry application for creating, visualizing, and analyzing geometric objects in UTM coordinates. Points carry an optional altitude (Z) value (defaulting to 0), enabling a 3D view tab and a general-plane Slice view tab alongside the primary 2D flat view. It is a data-driven CAD-like tool with strong geometric correctness, a render-on-demand canvas model, and a UI guided by `spec/design/geometry-app-ui-ux.md`.
 
 This design targets an Apache 2.0-compatible Python stack. All libraries are permissively licensed and selected for correctness, performance, and low maintenance cost at expected scene sizes (tens to low hundreds of objects).
 
@@ -54,25 +54,34 @@ geometry/               ← main package
     polygon.py
     ray.py
     vector.py
-    circle.py
+    circle.py           ← 2D flat circle (always horizontal)
+    ball.py             ← 3D sphere
+    cylinder.py         ← 3D cylinder with axis orientation
+    solid.py            ← 3D layered solid; references ordered list of Polygon/Point IDs
     tangent.py
+    slice_plane.py      ← SlicePlane dataclass (ephemeral view state; not a GeoObject, not persisted)
 
   services/             ← all business logic; zero tkinter/matplotlib imports
     __init__.py
-    geometry.py         ← direction, distance, intersection, area, perimeter
+    geometry.py         ← direction, distance, intersection, area, perimeter, convex skull
     validation.py       ← polygon simplicity, tangent membership, tolerance checks
     commands.py         ← undoable command classes and the 100-slot ring-buffer history
     render.py           ← produces RenderInstruction lists from model objects (no matplotlib)
     dep_graph.py        ← reverse-reference graph for O(1) cascade delete/recompute
+    slice.py            ← slice-plane geometry: plane definition, point membership, segment intersection
 
   canvas/               ← matplotlib integration
     __init__.py
-    canvas_view.py      ← FigureCanvasTkAgg embed, blit strategy, stale indicator
-    interaction.py      ← click-capture state machine
+    canvas_view.py      ← CanvasView base: 2D flat tab — FigureCanvasTkAgg, blit strategy, stale tracking
+    canvas_view_3d.py   ← CanvasView3D: 3D tab (Axes3D, full-redraw on selection — no blit)
+    canvas_view_slice.py ← CanvasViewSlice: Slice tab canvas — exposes apply_plane(SlicePlane); knows nothing about SliceControlsFrame
+    interaction.py      ← click-capture state machine (routes to active tab's CanvasView)
 
   ui/                   ← tkinter widgets; calls services, never calls geometry directly
     __init__.py
     main_window.py      ← three-column layout, menu, toolbar, status bar
+    canvas_tabs.py      ← CanvasTabController (ttk.Notebook): owns 3 CanvasView instances + SliceControlsFrame; wires Apply button → CanvasViewSlice.apply_plane(); tab-switch stale logic
+    slice_controls.py   ← SliceControlsFrame: Z-level entry + slider + plane-mode radios + Apply
     dialogs.py          ← create/edit dialogs for all 7 types, import dialogs
     properties_panel.py ← right-panel selection details
     cards.py            ← left-panel collapsible cards
@@ -84,7 +93,7 @@ geometry/               ← main package
 
   utils/                ← shared utilities; no geometry logic, no tkinter
     __init__.py
-    constants.py        ← EPS_DISTANCE, EPS_ANGLE, EPS_AREA, EPS_PARAM
+    constants.py        ← EPS_DISTANCE, EPS_ANGLE, EPS_AREA, EPS_PARAM, EPS_ALTITUDE
     angles.py           ← azimuth ↔ angle ↔ radians ↔ degrees conversions
     id_factory.py       ← per-type counter, ID generation, counter reseeding on load
     events.py           ← lightweight synchronous event bus
@@ -119,6 +128,7 @@ requirements-dev.txt    ← adds ruff, pytest, flake8, pylint
 ```
 
 - `ui/` and `canvas/` may import from `services/`, `models/`, `utils/`, and `project.py`.
+- **`canvas/` must NOT import from `ui/`** — `ui/` already imports `canvas/`, so the reverse creates a cycle. Coordination between canvas views and UI controls is done via callbacks wired in `ui/canvas_tabs.py`.
 - `services/` may import `models/` and `utils/` only.
 - `persistence/` imports `models/` and `utils/` only.
 - Nothing below `project.py` imports `tkinter` or `matplotlib`.
@@ -162,7 +172,10 @@ Dependency edges by type:
 - Ray → {origin_id}
 - Vector → {origin_id} ∪ ({endpoint_id} if set)
 - Circle → {center_id}
-- Tangent → {circle_id, point_id}
+- Ball → {center_id}
+- Cylinder → {base_center_id}
+- Solid → set(layers)  (all referenced Polygon and Point IDs)
+- Tangent → {shape_id, point_id}
 - Intersection-derived Point → the two parent object IDs that generated it
 
 ---
@@ -231,13 +244,16 @@ In-memory: `DirectionMode.AZIMUTH`. JSON wire: `"azimuth"`. Serialization lowerc
 
 | Type | Key fields |
 |------|-----------|
-| Point | `easting: float`, `northing: float`, `color: str` |
-| Line | `point_a_id`, `point_b_id`, direction metadata |
-| Polygon | `point_ids: list[str]` (CCW), `is_convex: bool` (cached) |
-| Ray | `origin_id`, direction metadata |
-| Vector | `origin_id`, `length: float`, `endpoint_id: str \| None`, direction metadata |
-| Circle | `center_id`, `radius: float` |
-| Tangent | `circle_id`, `point_id`, direction metadata |
+| Point | `easting: float`, `northing: float`, `altitude: float` (default 0.0), `color: str` |
+| Line | `point_a_id`, `point_b_id`, direction + elevation metadata |
+| Polygon | `point_ids: list[str]` (CCW by 2D projection), `is_convex: bool` (cached) |
+| Ray | `origin_id`, direction + elevation metadata |
+| Vector | `origin_id`, `length: float`, `endpoint_id: str \| None`, direction + elevation metadata |
+| Circle | `center_id`, `radius: float` — 2D flat, always horizontal |
+| Ball | `center_id`, `radius: float` — 3D sphere |
+| Cylinder | `base_center_id`, `radius: float`, `height: float`, `axis_mode`, `axis_azimuth`, `axis_elevation`, direction metadata |
+| Solid | `layers: list[str]` (ordered Polygon/Point IDs, bottom→top; ≥ 2 entries; ≤ 1 Point) |
+| Tangent | `shape_id` (Circle or Ball), `shape_type`, `point_id`, direction + elevation metadata |
 
 Direction metadata = `direction: float` (radians) + `direction_mode: DirectionMode` + `direction_units: DirectionUnits`.
 
@@ -267,7 +283,11 @@ In particular, `Polygon.point_ids` is a plain mutable `list[str]`. It must only 
 | Polygon simplicity | `shapely.is_simple` | GEOS Bentley-Ottmann; O(n log n) |
 | Polygon signed area | Shoelace via `np.dot` | Vectorized; also provides CCW sign |
 | Convexity | Cross-product on consecutive triplets via `np.cross` | Vectorized over vertex array |
-| Convex hull | `scipy.spatial.ConvexHull` | Returns indices → preserves Point IDs |
+| 2D convex hull | `scipy.spatial.ConvexHull` on (E, N) | Returns vertex indices → hull polygon reuses existing Point IDs. Quickhull, Barber et al. 1996. |
+| 3D convex hull | `scipy.spatial.ConvexHull` on (E, N, Z) | Returns triangular facets → hull stored as a Solid. Same Quickhull implementation. CudaHull (Stein et al. 2012) noted for GPU-scale future use. |
+| 2D convex skull | O(n^7) exact for n ≤ 12; approximation for larger | Chang & Yap 1986. **2D planar polygons only.** 3D skull: open problem, to be added. |
+| Cylinder volume | `π r² h` | Exact for any axis orientation |
+| Solid volume + centroid | Mirtich (1996) O(n) polyhedral mass algorithm | Layer stack → closed B-rep (polygon caps + triangulated lateral faces) → divergence theorem reduction. Cross-check: Vol = ⅓ Σₖ Ar(Γₖ)·r_⊥ₖ (Wuttke 2021, Eq. 22). For two congruent parallel layers the volume simplifies to base_area × height (Wuttke 2021, §3.5). |
 | Line-line intersection | Parametric solve with `np.linalg.solve` | Returns None for parallel |
 | Line-polygon intersections | `shapely.intersection` on each edge | GEOS handles all edge cases |
 | Polygon-polygon intersections | `shapely.intersection` on boundary geometries | GEOS |
@@ -275,7 +295,8 @@ In particular, `Polygon.point_ids` is a plain mutable `list[str]`. It must only 
 | Point-polygon distance | `0 if shapely.contains else shapely.distance` | GEOS distance is exact |
 | Polygon-polygon distance | `0 if shapely.intersects else shapely.distance` | GEOS distance |
 | Tangent direction | `(atan2(Δe, Δn) + π/2) mod 2π` | Custom per spec formula |
-| Vector endpoint | `(e + L·sin(az), n + L·cos(az))` | sin/cos swap is intentional; do not change |
+| Vector endpoint | `(origin_e + L·sin(az)·cos(el), origin_n + L·cos(az)·cos(el), origin_z + L·sin(el))` | sin/cos swap is the azimuth convention; do not change |
+| Three-point azimuth/elevation (angle at vertex B) | azimuth `= normalize_2π(atan2(C−B) − atan2(A−B))` on (E,N); elevation `= elev(B→C) − elev(B→A)` | Custom; ordered triple A,B,C, so `ABC ≠ CBA`. Azimuth ignores altitude; arms are B→A and B→C |
 
 ### Shapely integration pattern
 
@@ -295,10 +316,13 @@ def polygon_contains_point(pg: Polygon, pt: Point, points: dict[str, Point]) -> 
 | Rule | Method | Threshold |
 |------|--------|-----------|
 | Tangent point on circle | `abs(dist(pt, center) - radius) < EPS_DISTANCE` | `1e-6` m |
+| Ball tangent point on sphere | `abs(distance_3d(pt, center) - radius) < EPS_DISTANCE` | `1e-6` m |
+| Ball tangent perpendicular to radius | `abs(np.dot(dir_unit, rad_unit)) < EPS_ANGLE` | `1e-9` rad |
 | Lines parallel | `abs(np.cross(d1, d2)) < EPS_ANGLE` | `1e-9` rad |
 | Polygon non-degenerate | `abs(signed_area) >= EPS_AREA` | `1e-9` m² |
 | Polygon simple | `shapely.is_simple(shapely.Polygon(coords))` | GEOS |
 | Parametric clipping | segment `t ∈ [EPS_PARAM, 1 - EPS_PARAM]` | `1e-9` |
+| Cylinder axis elevation | `axis_elevation > 0` (0 = degenerate flat disk, rejected) | strict |
 
 All tolerance constants are imported from `utils/constants.py`; no bare literals in service code.
 
@@ -306,13 +330,25 @@ All tolerance constants are imported from `utils/constants.py`; no bare literals
 
 ## Canvas Design (`canvas/`)
 
-### Render-on-demand with blitting
+### Three-tab architecture
+
+The center column hosts a `CanvasTabController` (`ui/canvas_tabs.py`, a `ttk.Notebook` subclass) that owns three independent canvas views. Each view has its own `matplotlib.figure.Figure`, `FigureCanvasTkAgg`, and `NavigationToolbar2Tk`. Only the active tab renders; inactive tabs are marked stale and redraw on activation.
+
+| Tab | Class | Axes type | Blit support |
+|---|---|---|---|
+| 2D flat | `CanvasView` | `matplotlib.axes.Axes` | Yes — full blit strategy |
+| 3D | `CanvasView3D` | `mpl_toolkits.mplot3d.Axes3D` | No — full redraw always |
+| Slice | `CanvasViewSlice` | `matplotlib.axes.Axes` | Yes — same blit path as 2D |
+
+`CanvasTabController` receives all event-bus events (`canvas_stale`, `project_loaded`, etc.) and marks all three tabs stale. It forwards selection events only to the active tab.
+
+### Render-on-demand with blitting (2D flat and Slice tabs)
 
 The full redraw path and the selection-highlight path are distinct:
 
-**Full redraw** (trigger: Refresh button, pan/zoom, project load, window resize):
+**Full redraw** (trigger: Refresh button, pan/zoom, project load, window resize, tab activation when stale):
 1. Clear the axes.
-2. Fetch `RenderInstruction` list from `services/render.py`.
+2. Fetch `RenderInstruction` list from `services/render.py` (2D or slice builder).
 3. Draw all visible objects (respecting `visibility`, `alpha`, colors).
 4. Save the background buffer: `bg = canvas.copy_from_bbox(ax.bbox)`.
 5. Draw selection highlight if any.
@@ -327,20 +363,37 @@ The full redraw path and the selection-highlight path are distinct:
 
 This keeps selection latency under 10 ms regardless of scene complexity.
 
+### 3D tab rendering (`canvas/canvas_view_3d.py`)
+
+`CanvasView3D` uses `Axes3D` and cannot use blitting (`Axes3D` does not implement `copy_from_bbox`). Both full redraws and selection changes trigger `canvas.draw()`. Default view: elevation 30°, azimuth 225°; preserved across redraws. Per-object rendering: Points → `ax.scatter`, line objects → `ax.plot([e1,e2],[n1,n2],[z1,z2])`, polygons → `Poly3DCollection`, vectors → `ax.quiver`, circles/tangents → parametric horizontal ring at center altitude. Axes labeled `Easting (m)`, `Northing (m)`, `Altitude (m)`.
+
+### Slice tab controls (`ui/slice_controls.py`)
+
+`SliceControlsFrame` is a `ttk.Frame` docked above the slice canvas. It exposes:
+- **Plane mode** radio group: `Horizontal (Z=c)` / `Easting (E=c)` / `Northing (N=c)` / `Custom (aE+bN+cZ=d)`
+- **Offset** numeric entry (the constant `c` or `d`) + slider auto-ranged to scene extents along that axis
+- **Slab thickness** numeric entry (default 0 — exact plane)
+- **Apply** button — builds a `SlicePlane` and calls `CanvasViewSlice.apply_plane(plane)` via a callback wired by `CanvasTabController`. `SliceControlsFrame` holds no reference to `CanvasViewSlice`; the wiring is entirely in `canvas_tabs.py`.
+
+`SlicePlane` (in `models/slice_plane.py`) is a plain dataclass, not a `GeoObject`. It is ephemeral — never persisted.
+
 ### Render instructions (`services/render.py`)
 
-`render.py` translates model objects into `RenderInstruction` dataclasses (matplotlib artist kwargs + geometry primitives). It has no matplotlib imports and no tkinter imports — pure data transformation that can be unit-tested without a display.
+`render.py` translates model objects into `RenderInstruction` dataclasses. No matplotlib or tkinter imports — pure data transformation, fully testable without a display.
 
 ```python
 @dataclass
 class RenderInstruction:
     kind: str              # "point", "line", "polygon", "arc", "arrow"
-    coords: np.ndarray     # shape (N, 2) in (easting, northing)
+    coords: np.ndarray     # shape (N, 2) for 2D/slice; (N, 3) for 3D
     style: dict            # matplotlib artist kwargs
     obj_id: str
+    is_3d: bool = False    # True → coords is (N, 3); consumer uses Axes3D calls
 ```
 
-`canvas_view.py` consumes instructions and calls the appropriate matplotlib `plot` / `fill` / `Circle` / `FancyArrow` constructors.
+Three builder functions: `build_2d_instructions(objects, points)`, `build_3d_instructions(objects, points)`, `build_slice_instructions(slice_geoms)`. The slice builder consumes output from `services/slice.py`.
+
+`services/slice.py` handles the plane geometry: `SliceGeometry` dataclass, `point_on_plane()`, `segment_plane_intersection()`, `slice_objects()`. No matplotlib or tkinter imports.
 
 ### Click interaction state machine (`canvas/interaction.py`)
 
@@ -455,22 +508,23 @@ Three-column layout with PanedWindow or grid weights:
 
 ```
 ┌──────────────┬─────────────────────────┬──────────────┐
-│  Left panel  │     Canvas (center)     │ Right panel  │
-│  (240px)     │  FigureCanvasTkAgg      │  (260px)     │
-│              │  + NavigationToolbar    │              │
-│  Cards:      │                         │  Properties  │
-│  • Create    │                         │  panel for   │
+│  Left panel  │  [2D] [3D] [Slice]      │ Right panel  │
+│  (280px)     │  ─────────────────────  │  (320px)     │
+│              │  CanvasTabController    │              │
+│  Cards:      │  (active tab's Figure   │  Properties  │
+│  • Create    │   + NavigationToolbar)  │  panel for   │
 │  • Import    │                         │  selection   │
-│  • Calculate │                         │              │
-│  • Measure   │                         │              │
+│  • Calculate │  Slice tab also has     │              │
+│  • Measure   │  SliceControlsFrame     │              │
+│              │  above the canvas       │              │
 └──────────────┴─────────────────────────┴──────────────┘
-│  Status bar: filename | dirty | cursor (E, N) | stale  │
-└─────────────────────────────────────────────────────────┘
+│  Status bar: filename | dirty | cursor (E, N[, Z]) | stale  │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ### Dialog pattern
 
-All 7 object-type dialogs share a common `ObjectFormDialog` base that provides:
+All 10 object-type dialogs share a common `ObjectFormDialog` base that provides:
 - `Name` entry (full width, row 0)
 - Color + alpha row(s) — Point gets one color picker; all others get `line_color` + `fill_color`
 - Validation loop: validate-on-keystroke, inline error labels, Submit disabled until valid
@@ -541,13 +595,12 @@ The cascading delete and point-move-recompute logic involves the same reverse-re
 
 ## Next Steps
 
-1. Add `shapely>=2.0` and `scipy>=1.13` to `requirements.txt` and `pyproject.toml`.
-2. Create `geometry/services/` package with stub modules (`geometry.py`, `validation.py`, `commands.py`, `render.py`, `dep_graph.py`).
-3. Create `geometry/utils/constants.py`, `angles.py`, `id_factory.py`, `events.py` stubs.
-4. Create `geometry/project.py` stub.
-5. Create `geometry/__main__.py` (the real entry point) and make `main.py` a thin shim.
-6. Implement `models/` data classes and `utils/` helpers first — these have no dependencies.
-7. Implement `services/geometry.py` and `services/validation.py` with tests before touching UI.
-8. Implement `services/dep_graph.py` and `services/commands.py` with tests.
-9. Implement `persistence/` with round-trip tests.
-10. Scaffold `canvas/` and `ui/` to match the wireframe, wiring to services and event bus.
+The package structure, stubs, entry point, and CI gate are in place. Active work proceeds in this order:
+
+1. Complete `services/geometry.py` — remaining operations: convex hull (2D + 3D), convex skull, polygon/polygon intersection, distance variants (point↔polygon, ray↔polygon, polygon↔polygon), Ball/Cylinder/Solid geometry.
+2. Complete `services/validation.py` — Ball tangent perpendicularity, sphere-surface membership, Cylinder axis-elevation guard, Solid layer-count compatibility check.
+3. Implement `services/dep_graph.py` with tests — reverse-reference graph, cascade delete and point-move-recompute traversals.
+4. Implement `services/commands.py` with tests — command protocol, ring-buffer history, all six undoable command classes.
+5. Implement `persistence/` with round-trip tests — serializer, version policy (1.1), unknown-type passthrough.
+6. Implement `canvas/` (CanvasView 2D blit, CanvasView3D, CanvasViewSlice) and wire to services + event bus.
+7. Scaffold `ui/` main window, cards, and dialogs for all 10 object types per the wireframe.
