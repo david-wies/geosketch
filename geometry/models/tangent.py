@@ -14,27 +14,32 @@
 
 from dataclasses import dataclass, field
 
-from geometry.models.common import DirectedObject
+from geometry.models.common import ElevatedObject
 
 
 @dataclass
-class Tangent(DirectedObject):
-    """A tangent line at a point on a circle's circumference, perpendicular to the radius.
+class Tangent(ElevatedObject):
+    """A tangent to a Circle or Ball at a point on its surface.
 
-    Inherits ``direction``, ``direction_mode``, and ``direction_units`` from
-    ``DirectedObject``.  ``fill_color`` is stored for schema consistency but
-    is not rendered for this 1-D object.
+    Inherits ``direction``, ``elevation``, ``direction_mode``, and
+    ``direction_units`` from ``ElevatedObject``.  ``fill_color`` is stored
+    for schema consistency but is not rendered for this 1-D object.
 
     The canonical direction formula relating ``direction`` to the underlying
-    circle/point geometry lives in ``services/geometry.py``; the model layer
+    shape/point geometry lives in ``services/geometry.py``; the model layer
     just stores whatever radians value it is given.
+
+    ``shape_type`` drives dispatch: Circle tangents are always horizontal
+    (``elevation = 0.0``); Ball tangents are 3-D and user-supplied.
 
     Fields
     ------
-    circle_id : str
-        ID of the target circle.
+    shape_id : str
+        ID of the target Circle or Ball.
+    shape_type : str
+        ``"circle"`` or ``"ball"``. Identifies which object ``shape_id`` refers to.
     point_id : str
-        ID of the point on the circumference where the tangent is drawn.
+        ID of the surface point where the tangent is drawn.
     line_color : str
         Hex colour string for the stroke.
     fill_color : str
@@ -44,12 +49,13 @@ class Tangent(DirectedObject):
     --------
     geometry.models.common.GeoObject : Shared envelope fields (``id``, ``name``,
         ``type``, ``alpha``, ``visibility``) inherited by every concrete model.
-    geometry.models.common.DirectedObject : Direction metadata (``direction``,
-        ``direction_mode``, ``direction_units``) inherited by all four
-        direction-bearing types (Line, Ray, Vector, Tangent).
+    geometry.models.common.ElevatedObject : Direction and elevation metadata
+        (``direction``, ``elevation``, ``direction_mode``, ``direction_units``)
+        inherited by all four direction-bearing types (Line, Ray, Vector, Tangent).
     """
 
-    circle_id: str
+    shape_id: str
+    shape_type: str
     point_id: str
     line_color: str
     fill_color: str

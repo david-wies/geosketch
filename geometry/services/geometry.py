@@ -71,7 +71,7 @@ import numpy as np
 import shapely
 from scipy.spatial import ConvexHull  # pylint: disable=no-name-in-module
 
-from geometry.models.common import DirectedObject, DirectionMode
+from geometry.models.common import ElevatedObject, DirectionMode
 from geometry.models.line import Line
 from geometry.models.point import Point
 from geometry.models.polygon import Polygon
@@ -333,7 +333,7 @@ def convex_hull(polygon: Polygon, points: Mapping[str, Point], new_id: str) -> P
 # ---------------------------------------------------------------------------
 
 
-def direction_unit_vector(obj: DirectedObject) -> np.ndarray:
+def direction_unit_vector(obj: ElevatedObject) -> np.ndarray:
     """Unit ``(easting, northing)`` vector for a direction-bearing object.
 
     ``obj.direction`` is stored in radians but means either an azimuth
@@ -711,7 +711,7 @@ def vector_endpoint(origin: Point, length: float, az: float) -> np.ndarray:
     ``az`` is **azimuth-only**. Unlike :func:`direction_unit_vector` — which is
     mode-aware and resolves ``direction_mode`` — this function does *not* look
     at ``direction_mode`` and always interprets ``az`` as an azimuth. For a
-    :class:`~geometry.models.common.DirectedObject` whose ``direction_mode`` is
+    :class:`~geometry.models.common.ElevatedObject` whose ``direction_mode`` is
     :attr:`DirectionMode.ANGLE`, callers must convert ``direction`` to an
     azimuth first (e.g. via :func:`~geometry.utils.angles.angle_to_azimuth`) or
     use :func:`direction_unit_vector` instead; passing a raw ANGLE-mode

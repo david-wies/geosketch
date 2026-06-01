@@ -14,36 +14,39 @@
 
 from dataclasses import dataclass, field
 
-from geometry.models.common import ElevatedObject
+from geometry.models.common import GeoObject
 
 
 @dataclass
-class Ray(ElevatedObject):
-    """A ray originating from a point and extending infinitely in one direction.
+class Solid(GeoObject):
+    """A 3D solid defined by an ordered stack of cross-section layers.
 
-    Inherits ``direction``, ``elevation``, ``direction_mode``, and
-    ``direction_units`` from ``ElevatedObject``.  ``fill_color`` is stored
-    for schema consistency but is not rendered for this 1-D object.
+    Each layer is a Polygon ID or a Point ID (apex/nadir). Layers are ordered
+    bottom-to-top by user declaration — not derived from altitude. The closed
+    shell is formed by connecting adjacent layers; the volume is computed by
+    the Mirtich (1996) polyhedral mass algorithm.
 
     Fields
     ------
-    origin_id : str
-        ID of the origin point.
+    layers : list[str]
+        Ordered references to existing Polygon or Point IDs. At least 2
+        entries. At most one entry may be a Point ID; it must be first or last.
     line_color : str
-        Hex colour string for the stroke.
+        Edge/stroke color.
     fill_color : str
-        Hex colour string for fill (stored but not rendered for rays).
+        Face fill color (rendered in 3D and Slice views).
 
     See Also
     --------
     geometry.models.common.GeoObject : Shared envelope fields (``id``, ``name``,
         ``type``, ``alpha``, ``visibility``) inherited by every concrete model.
-    geometry.models.common.ElevatedObject : Direction and elevation metadata
-        (``direction``, ``elevation``, ``direction_mode``, ``direction_units``)
-        inherited by all four direction-bearing types (Line, Ray, Vector, Tangent).
     """
 
-    origin_id: str
+    layers: list[str]
     line_color: str
     fill_color: str
-    type: str = field(init=False, default="ray")
+    type: str = field(init=False, default="solid")
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.layers = list(self.layers)

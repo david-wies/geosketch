@@ -33,14 +33,14 @@ class DirectionUnits(enum.Enum):
 
 @dataclass
 class GeoObject:
-    """Base data class shared by all seven geometry object types.
+    """Base data class shared by all ten geometry object types.
 
     ``GeoObject`` is not instantiable on its own — every concrete object must
-    be one of the seven subclasses (Point, Line, Polygon, Ray, Vector, Circle,
-    Tangent), each of which pins ``type`` to a canonical literal via
-    ``field(init=False, default=...)``. The ``__post_init__`` guard below
-    enforces this so service code cannot accidentally produce a base object
-    with a bogus ``type`` string.
+    be one of the ten subclasses (Point, Line, Polygon, Ray, Vector, Circle,
+    Ball, Cylinder, Solid, Tangent), each of which pins ``type`` to a
+    canonical literal via ``field(init=False, default=...)``. The
+    ``__post_init__`` guard below enforces this so service code cannot
+    accidentally produce a base object with a bogus ``type`` string.
 
     Fields
     ------
@@ -51,7 +51,8 @@ class GeoObject:
         User-visible label.
     type : str
         Lowercase canonical type name (e.g. ``"point"``, ``"line"``,
-        ``"polygon"``, ``"ray"``, ``"vector"``, ``"circle"``, ``"tangent"``).
+        ``"polygon"``, ``"ray"``, ``"vector"``, ``"circle"``, ``"ball"``,
+        ``"cylinder"``, ``"solid"``, ``"tangent"``).
         Distinct from the 2-letter ID prefix used in ``id`` (``pt`` for a
         Point, ``ln`` for a Line, etc.). Pinned at construction time via
         ``field(init=False, default=...)`` on every concrete subclass; treat
@@ -76,25 +77,25 @@ class GeoObject:
         if type(self) is GeoObject:  # pylint: disable=unidiomatic-typecheck
             raise TypeError(
                 "GeoObject is an abstract base class and must not be "
-                "instantiated directly; use one of the seven concrete "
+                "instantiated directly; use one of the ten concrete "
                 "subclasses (Point, Line, Polygon, Ray, Vector, Circle, "
-                "Tangent)."
+                "Ball, Cylinder, Solid, Tangent)."
             )
 
 
 @dataclass
-class DirectedObject(GeoObject):
+class ElevatedObject(GeoObject):
     """Abstract intermediate base for the four direction-bearing geometry types.
 
-    ``DirectedObject`` is not instantiable on its own — like ``GeoObject``,
-    it is an abstract base whose only purpose is to share the three
-    direction-metadata fields (``direction``, ``direction_mode``,
-    ``direction_units``) across the four concrete subclasses ``Line``,
-    ``Ray``, ``Vector``, and ``Tangent``. ``Point``, ``Polygon``, and
-    ``Circle`` continue to extend ``GeoObject`` directly because they have
-    no direction. The ``__post_init__`` guard below enforces this so
-    service code cannot accidentally produce a base ``DirectedObject`` with
-    a bogus ``type`` string.
+    ``ElevatedObject`` is not instantiable on its own — like ``GeoObject``,
+    it is an abstract base whose only purpose is to share the four
+    direction-metadata fields (``direction``, ``elevation``,
+    ``direction_mode``, ``direction_units``) across the four concrete
+    subclasses ``Line``, ``Ray``, ``Vector``, and ``Tangent``. ``Point``,
+    ``Polygon``, ``Circle``, ``Ball``, ``Cylinder``, and ``Solid`` extend
+    ``GeoObject`` directly because they have no generic direction bearing.
+    The ``__post_init__`` guard below enforces this so service code cannot
+    accidentally produce a bare ``ElevatedObject`` with a bogus ``type``.
 
     ``direction`` is always stored internally in radians; ``direction_mode``
     and ``direction_units`` record how the user originally expressed the
@@ -104,15 +105,20 @@ class DirectedObject(GeoObject):
     Fields
     ------
     direction : float
-        Direction in radians (internal storage only).
+        Horizontal bearing in radians (internal storage).
+    elevation : float
+        Angle above the horizontal plane in radians, range ``[-π/2, π/2]``;
+        0.0 = horizontal. Required at construction (forms/loader supply 0.0).
     direction_mode : DirectionMode
         Whether ``direction`` represents an azimuth (CW from North) or a
         standard math angle (CCW from East).
     direction_units : DirectionUnits
         Whether the user-facing representation is in radians or degrees.
+        Applies to both ``direction`` and ``elevation`` display.
     """
 
     direction: float
+    elevation: float
     direction_mode: DirectionMode
     direction_units: DirectionUnits
 
@@ -120,9 +126,9 @@ class DirectedObject(GeoObject):
         super().__post_init__()
         # `isinstance` would be True for every concrete subclass too,
         # defeating the guard — exact-type identity is the correct check.
-        if type(self) is DirectedObject:  # pylint: disable=unidiomatic-typecheck
+        if type(self) is ElevatedObject:  # pylint: disable=unidiomatic-typecheck
             raise TypeError(
-                "DirectedObject is an abstract base class and must not be "
+                "ElevatedObject is an abstract base class and must not be "
                 "instantiated directly; use one of the four concrete "
                 "subclasses (Line, Ray, Vector, Tangent)."
             )

@@ -18,24 +18,20 @@ from geometry.models.common import GeoObject
 
 
 @dataclass
-class Point(GeoObject):
-    """A UTM point with easting, northing, and altitude coordinates.
-
-    Coordinates are in meters. Easting comes first in tuples (UTM convention).
-    ``altitude`` defaults to 0.0 when absent from JSON (the loader injects 0.0
-    before construction); the UI form pre-fills 0.0. The serializer always
-    writes ``altitude`` explicitly.
+class Ball(GeoObject):
+    """A 3D sphere defined by a center Point and radius.
 
     Fields
     ------
-    easting : float
-        UTM easting in metres.
-    northing : float
-        UTM northing in metres.
-    altitude : float
-        Elevation above datum in metres. 0.0 for 2-D-only use.
-    color : str
-        Hex colour string for the marker (e.g. ``"#FF0000"``).
+    center_id : str
+        ID of the Point at the geometric center of the sphere.
+    radius : float
+        Radius in metres; must be > 0.
+    line_color : str
+        Wireframe/stroke color.
+    fill_color : str
+        Interior fill color (rendered in 3D and Slice views; projected circle
+        in 2D flat view).
 
     See Also
     --------
@@ -43,8 +39,8 @@ class Point(GeoObject):
         ``type``, ``alpha``, ``visibility``) inherited by every concrete model.
     """
 
-    easting: float
-    northing: float
-    altitude: float
-    color: str
-    type: str = field(init=False, default="point")
+    center_id: str
+    radius: float
+    line_color: str
+    fill_color: str
+    type: str = field(init=False, default="ball")

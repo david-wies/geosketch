@@ -16,13 +16,16 @@
 
 import ast
 import dataclasses
+import math
 import pathlib
 
 import pytest
 
 from geometry.models import (
+    Ball,
     Circle,
-    DirectedObject,
+    Cylinder,
+    ElevatedObject,
     DirectionMode,
     DirectionUnits,
     GeoObject,
@@ -30,6 +33,8 @@ from geometry.models import (
     Point,
     Polygon,
     Ray,
+    SlicePlane,
+    Solid,
     Tangent,
     Vector,
 )
@@ -41,6 +46,9 @@ SUBCLASS_TYPES = [
     (Ray, "ray"),
     (Vector, "vector"),
     (Circle, "circle"),
+    (Ball, "ball"),
+    (Cylinder, "cylinder"),
+    (Solid, "solid"),
     (Tangent, "tangent"),
 ]
 
@@ -83,11 +91,13 @@ def test_point_instantiation():
         visibility=True,
         easting=100.0,
         northing=200.0,
+        altitude=50.0,
         color="#ff0000",
     )
     assert pt.type == "point"
     assert pt.easting == 100.0
     assert pt.northing == 200.0
+    assert pt.altitude == 50.0
     assert pt.color == "#ff0000"
 
 
@@ -109,15 +119,16 @@ def test_geo_object_direct_instantiation_rejected():
         GeoObject(id="x_001", name="X", type="bogus", alpha=1.0, visibility=True)
 
 
-def test_directed_object_direct_instantiation_rejected():
+def test_elevated_object_direct_instantiation_rejected():
     with pytest.raises(TypeError, match="abstract base class"):
-        DirectedObject(
+        ElevatedObject(
             id="x_001",
             name="X",
             type="bogus",
             alpha=1.0,
             visibility=True,
             direction=0.0,
+            elevation=0.0,
             direction_mode=DirectionMode.AZIMUTH,
             direction_units=DirectionUnits.RADIANS,
         )
@@ -131,6 +142,7 @@ def test_point_isinstance_geo_object():
         visibility=True,
         easting=0.0,
         northing=0.0,
+        altitude=0.0,
         color="#000000",
     )
     assert isinstance(pt, GeoObject)
@@ -163,6 +175,7 @@ def test_line_instantiation():
         point_a_id="pt_001",
         point_b_id="pt_002",
         direction=0.785,
+        elevation=0.0,
         direction_mode=DirectionMode.AZIMUTH,
         direction_units=DirectionUnits.RADIANS,
         line_color="#0000ff",
@@ -170,6 +183,7 @@ def test_line_instantiation():
     )
     assert ln.type == "line"
     assert ln.point_a_id == "pt_001"
+    assert ln.elevation == 0.0
 
 
 def test_polygon_instantiation():
@@ -196,6 +210,7 @@ def test_ray_instantiation():
         visibility=True,
         origin_id="pt_001",
         direction=1.571,
+        elevation=0.0,
         direction_mode=DirectionMode.AZIMUTH,
         direction_units=DirectionUnits.RADIANS,
         line_color="#ff00ff",
@@ -203,6 +218,7 @@ def test_ray_instantiation():
     )
     assert ry.type == "ray"
     assert ry.origin_id == "pt_001"
+    assert ry.elevation == 0.0
 
 
 def test_vector_instantiation_length_direction():
@@ -213,6 +229,7 @@ def test_vector_instantiation_length_direction():
         visibility=True,
         origin_id="pt_001",
         direction=0.785,
+        elevation=0.0,
         direction_mode=DirectionMode.AZIMUTH,
         direction_units=DirectionUnits.RADIANS,
         length=100.0,
@@ -223,6 +240,7 @@ def test_vector_instantiation_length_direction():
     assert vc.type == "vector"
     assert vc.endpoint_id is None
     assert vc.length == 100.0
+    assert vc.elevation == 0.0
 
 
 def test_vector_instantiation_origin_endpoint():
@@ -233,6 +251,7 @@ def test_vector_instantiation_origin_endpoint():
         visibility=True,
         origin_id="pt_001",
         direction=0.785,
+        elevation=0.3,
         direction_mode=DirectionMode.AZIMUTH,
         direction_units=DirectionUnits.RADIANS,
         length=50.0,
@@ -241,6 +260,7 @@ def test_vector_instantiation_origin_endpoint():
         fill_color="#00ffff",
     )
     assert vc.endpoint_id == "pt_002"
+    assert vc.elevation == 0.3
 
 
 def test_circle_instantiation():
@@ -258,23 +278,188 @@ def test_circle_instantiation():
     assert ci.radius == 50.0
 
 
-def test_tangent_instantiation():
+def test_tangent_instantiation_circle():
     tg = Tangent(
         id="tg_001",
         name="T",
         alpha=1.0,
         visibility=True,
-        circle_id="ci_001",
+        shape_id="ci_001",
+        shape_type="circle",
         point_id="pt_004",
         direction=2.356,
+        elevation=0.0,
         direction_mode=DirectionMode.AZIMUTH,
         direction_units=DirectionUnits.RADIANS,
         line_color="#00ff66",
         fill_color="#00ff66",
     )
     assert tg.type == "tangent"
-    assert tg.circle_id == "ci_001"
+    assert tg.shape_id == "ci_001"
+    assert tg.shape_type == "circle"
     assert tg.point_id == "pt_004"
+    assert tg.elevation == 0.0
+
+
+def test_tangent_instantiation_ball():
+    tg = Tangent(
+        id="tg_002",
+        name="T2",
+        alpha=1.0,
+        visibility=True,
+        shape_id="ba_001",
+        shape_type="ball",
+        point_id="pt_005",
+        direction=1.0,
+        elevation=0.5,
+        direction_mode=DirectionMode.AZIMUTH,
+        direction_units=DirectionUnits.RADIANS,
+        line_color="#00ff66",
+        fill_color="#00ff66",
+    )
+    assert tg.type == "tangent"
+    assert tg.shape_id == "ba_001"
+    assert tg.shape_type == "ball"
+    assert tg.elevation == 0.5
+
+
+# ---------------------------------------------------------------------------
+# New 3D types: Ball, Cylinder, Solid
+# ---------------------------------------------------------------------------
+
+
+def test_ball_instantiation():
+    ba = Ball(
+        id="ba_001",
+        name="B",
+        alpha=1.0,
+        visibility=True,
+        center_id="pt_001",
+        radius=25.0,
+        line_color="#ff6600",
+        fill_color="#ffd699",
+    )
+    assert ba.type == "ball"
+    assert ba.center_id == "pt_001"
+    assert ba.radius == 25.0
+
+
+def test_cylinder_instantiation():
+    cy = Cylinder(
+        id="cy_001",
+        name="C",
+        alpha=1.0,
+        visibility=True,
+        base_center_id="pt_001",
+        radius=10.0,
+        height=50.0,
+        axis_mode="vertical",
+        axis_azimuth=0.0,
+        axis_elevation=math.pi / 2,
+        direction_mode=DirectionMode.AZIMUTH,
+        direction_units=DirectionUnits.RADIANS,
+        line_color="#336699",
+        fill_color="#99bbdd",
+    )
+    assert cy.type == "cylinder"
+    assert cy.base_center_id == "pt_001"
+    assert cy.axis_mode == "vertical"
+    assert cy.axis_elevation == math.pi / 2
+
+
+def test_cylinder_inclined():
+    cy = Cylinder(
+        id="cy_002",
+        name="CI",
+        alpha=0.8,
+        visibility=True,
+        base_center_id="pt_002",
+        radius=5.0,
+        height=20.0,
+        axis_mode="inclined",
+        axis_azimuth=0.785,
+        axis_elevation=0.3,
+        direction_mode=DirectionMode.AZIMUTH,
+        direction_units=DirectionUnits.RADIANS,
+        line_color="#336699",
+        fill_color="#99bbdd",
+    )
+    assert cy.type == "cylinder"
+    assert cy.axis_mode == "inclined"
+    assert cy.axis_azimuth == 0.785
+
+
+def test_solid_instantiation():
+    so = Solid(
+        id="so_001",
+        name="S",
+        alpha=0.9,
+        visibility=True,
+        layers=["pg_001", "pg_002", "pg_003"],
+        line_color="#993300",
+        fill_color="#cc9966",
+    )
+    assert so.type == "solid"
+    assert so.layers == ["pg_001", "pg_002", "pg_003"]
+
+
+def test_solid_layers_defensively_copied():
+    shared = ["pg_001", "pg_002"]
+    so = Solid(
+        id="so_002",
+        name="S2",
+        alpha=1.0,
+        visibility=True,
+        layers=shared,
+        line_color="#000000",
+        fill_color="#ffffff",
+    )
+    assert so.layers == shared
+    assert so.layers is not shared
+    shared.append("pg_999")
+    assert "pg_999" not in so.layers
+
+
+def test_solid_apex_layer():
+    so = Solid(
+        id="so_003",
+        name="Pyramid",
+        alpha=1.0,
+        visibility=True,
+        layers=["pg_001", "pt_010"],
+        line_color="#000000",
+        fill_color="#aaaaaa",
+    )
+    assert so.layers[-1] == "pt_010"
+
+
+# ---------------------------------------------------------------------------
+# SlicePlane (ephemeral, not a GeoObject)
+# ---------------------------------------------------------------------------
+
+
+def test_slice_plane_horizontal():
+    sp = SlicePlane(mode="horizontal", a=0.0, b=0.0, c=1.0, d=100.0)
+    assert sp.mode == "horizontal"
+    assert sp.c == 1.0
+    assert sp.d == 100.0
+    assert sp.thickness == 0.0
+
+
+def test_slice_plane_easting():
+    sp = SlicePlane(mode="easting", a=1.0, b=0.0, c=0.0, d=500000.0)
+    assert sp.a == 1.0
+    assert sp.thickness == 0.0
+
+
+def test_slice_plane_with_thickness():
+    sp = SlicePlane(mode="horizontal", a=0.0, b=0.0, c=1.0, d=50.0, thickness=2.5)
+    assert sp.thickness == 2.5
+
+
+def test_slice_plane_not_geo_object():
+    sp = SlicePlane(mode="northing", a=0.0, b=1.0, c=0.0, d=0.0)
+    assert not isinstance(sp, GeoObject)
 
 
 # ---------------------------------------------------------------------------

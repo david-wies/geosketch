@@ -38,16 +38,26 @@ EPS_AREA : float
 EPS_PARAM : float
     1e-9. Used for parametric ``t`` clipping on segment/line intersection
     where the parameter is dimensionless and lives roughly in [0, 1].
+EPS_ALTITUDE : float
+    1e-6 m. Slice-plane membership: ``|aE+bN+cZ−d| ≤ EPS_ALTITUDE + thickness``
+    when the plane normal is unit-length.
+EPS_VOLUME : float
+    1e-9 m³. Solid/Ball/Cylinder degeneracy: ``|volume| < EPS_VOLUME`` rejects,
+    analogous to EPS_AREA for 2-D polygons.
 """
 
 EPS_DISTANCE: float = 1e-6
 EPS_ANGLE: float = 1e-9
 EPS_AREA: float = 1e-9
 EPS_PARAM: float = 1e-9
+EPS_ALTITUDE: float = 1e-6
+EPS_VOLUME: float = 1e-9
 
 __all__ = [
     "EPS_DISTANCE",
     "EPS_ANGLE",
     "EPS_AREA",
     "EPS_PARAM",
+    "EPS_ALTITUDE",
+    "EPS_VOLUME",
 ]

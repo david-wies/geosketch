@@ -44,7 +44,7 @@ from geometry.utils.constants import EPS_DISTANCE
 # ---------------------------------------------------------------------------
 
 
-def _pt(pid: str, easting: float, northing: float) -> Point:
+def _pt(pid: str, easting: float, northing: float, altitude: float = 0.0) -> Point:
     return Point(
         id=pid,
         name=pid,
@@ -52,6 +52,7 @@ def _pt(pid: str, easting: float, northing: float) -> Point:
         visibility=True,
         easting=float(easting),
         northing=float(northing),
+        altitude=float(altitude),
         color="#000000",
     )
 
@@ -70,11 +71,12 @@ def _poly(pid: str, point_ids: list[str], name: str = "poly") -> Polygon:
 
 
 def _directed_kwargs(direction: float = 0.0, mode: DirectionMode = DirectionMode.AZIMUTH) -> dict:
-    """Common envelope + direction kwargs shared by the directed-object builders."""
+    """Common envelope + direction kwargs shared by the elevated-object builders."""
     return {
         "alpha": 1.0,
         "visibility": True,
         "direction": float(direction),
+        "elevation": 0.0,
         "direction_mode": mode,
         "direction_units": DirectionUnits.RADIANS,
         "line_color": "#000000",
