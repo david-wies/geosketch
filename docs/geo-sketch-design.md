@@ -63,7 +63,7 @@ geometry/               ← main package
 
   services/             ← all business logic; zero tkinter/matplotlib imports
     __init__.py
-    geometry.py         ← direction, distance, intersection, area, perimeter, convex skull
+    geometry.py         ← direction, distance, intersection, area, perimeter, convex hull, convex skull
     validation.py       ← polygon simplicity, tangent membership, tolerance checks
     commands.py         ← undoable command classes and the 100-slot ring-buffer history
     render.py           ← produces RenderInstruction lists from model objects (no matplotlib)
@@ -372,7 +372,7 @@ This keeps selection latency under 10 ms regardless of scene complexity.
 `SliceControlsFrame` is a `ttk.Frame` docked above the slice canvas. It exposes:
 - **Plane mode** radio group: `Horizontal (Z=c)` / `Easting (E=c)` / `Northing (N=c)` / `Custom (aE+bN+cZ=d)`
 - **Offset** numeric entry (the constant `c` or `d`) + slider auto-ranged to scene extents along that axis
-- **Slab thickness** numeric entry (default 0 — exact plane)
+- **Thickness** numeric entry (metres; default 0 = exact plane). Positive values include objects within ±thickness of the plane.
 - **Apply** button — builds a `SlicePlane` and calls `CanvasViewSlice.apply_plane(plane)` via a callback wired by `CanvasTabController`. `SliceControlsFrame` holds no reference to `CanvasViewSlice`; the wiring is entirely in `canvas_tabs.py`.
 
 `SlicePlane` (in `models/slice_plane.py`) is a plain dataclass, not a `GeoObject`. It is ephemeral — never persisted.

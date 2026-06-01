@@ -325,7 +325,8 @@ class SlicePlane:
     d : float
         Right-hand-side constant.
     thickness : float
-        Slab half-thickness in metres (default 0 = exact plane).
+        Half-thickness of the slab in metres (default 0 = exact plane).
+        Points within ±``thickness`` of the plane are included.
         Inclusion test: ``|a·E + b·N + c·Z - d| ≤ EPS_ALTITUDE + thickness``.
 
     Preset encodings
@@ -1835,7 +1836,7 @@ Implement in this order; each phase depends only on phases before it.
 
 ### Phase 2 — Models
 - [ ] `geometry/models/common.py` — rename `DirectedObject` → `ElevatedObject` (no alias); add `elevation` field
-- [ ] `geometry/models/point.py` — add `altitude` field with default 0.0
+- [ ] `geometry/models/point.py` — add required `altitude: float` field (no constructor default; loader injects 0.0)
 - [ ] `geometry/models/line.py` — replace base class reference
 - [ ] `geometry/models/ray.py` — replace base class reference
 - [ ] `geometry/models/vector.py` — replace base class reference
@@ -1923,8 +1924,7 @@ The `EventBus` holds subscribers strongly (confirmed by implementation). UI comp
 The existing test suite for `geometry.py` calls `distance()` on Points without altitude. After the change, those calls still pass because `altitude` defaults to `0.0` and `sqrt(Δe² + Δn² + 0²) == sqrt(Δe² + Δn²)`. No test changes are required for existing test cases, but new test cases must verify the 3D formula with non-zero altitudes.
 
 ### 13.12 `convex_hull_3d` allocates new Polygon IDs
-`convex_hull_3d()` needs pre-allocated IDs for each facet Polygon and for the Solid. The caller (a command) must allocate these via `project.next_id()` before constructing the command. The number of facets is not known until after QHull runs, so the command must run QHull once to count facets, allocate IDs, then pass them to `convex_hull_3d()`. Alternatively, `convex_hull_3d()` can accept the IDFactory directly. The cleaner design is: the command calls `convex_hull_3d()` which returns the count of new IDs needed, the command then allocates them and calls again. In practice, a simpler approach is to accept the `IDFactory` as a parameter and call `next_id()` inside — this is the one case where a service function is permitted to mint IDs. Document this as an exception to the rule that ID allocation lives in the command layer.
-```
+`convex_hull_3d()` accepts the `IDFactory` as a parameter and calls `next_id()` internally to mint the required Polygon and Solid IDs. This is the one permitted case where a service function mints IDs rather than the command layer. It is the correct choice here because the number of hull facets is not known until QHull runs; requiring the caller to pre-allocate would force either a double-QHull pass (count facets, allocate, compute) or a complicated count-then-allocate-then-pass protocol. `IDFactory` lives in `utils/`, so this injection is legal under the layer rules (services may import `utils/`). Callers (command layer) pass `project.id_factory` as the argument.
 
 ---
 
