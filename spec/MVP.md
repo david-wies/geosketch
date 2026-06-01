@@ -11,7 +11,7 @@
 
 ## Executive Summary
 
-GeoSketch is a desktop application that enables users to create, visualize, manipulate, and analyze geometric objects and their spatial relationships. Users construct geometric scenes by adding points, lines, rays, vectors, circles, polygons, and tangents, then perform calculations to determine directions, convexity, intersections, and distances between objects.
+GeoSketch is a desktop application that enables users to create, visualize, manipulate, and analyze geometric objects and their spatial relationships. Users construct geometric scenes by adding points, lines, rays, vectors, circles, polygons, balls, cylinders, solids, and tangents, then perform calculations to determine directions, convexity, intersections, and distances between objects.
 
 The application supports multiple input methods (clicking on canvas, form inputs, file imports), real-time visualization, and project persistence via JSON files.
 
@@ -23,13 +23,14 @@ The application supports multiple input methods (clicking on canvas, form inputs
 - **System**: Universal Transverse Mercator (UTM)
 - **Units**: Meters
 - **Notation**: All coordinates expressed as (Easting, Northing) pairs
+- **Altitude (Z)**: Every Point has an altitude (Z) value in meters above datum, defaulting to 0.0. Altitude enables the 3D view tab and the Slice view tab. The domain's 2D geometric calculations (direction, area, intersection, distance) always use only (Easting, Northing) and are unaffected by altitude.
 - **Azimuth Convention**: Measured clockwise from North, range [0, 2π) radians
 - **Angle Convention**: Standard mathematical angles, measured counter-clockwise from East, range [0, 2π) radians or [0°, 360°)
 
 ### Precision & Numeric Handling
 - The application uses NumPy float64 as the reference precision level for all geometry results, even though not every operation must be implemented with NumPy.
 - Calculations may use NumPy, Python math, or other numeric libraries, but outputs must be consistent with NumPy float64 semantics.
-- Distance calculations: Euclidean (√[(Δeast)² + (Δnorth)²])
+- Distance calculations: 3D Euclidean (√[(Δeast)² + (Δnorth)² + (Δaltitude)²])
 - Angle calculations: atan2-based with proper quadrant handling
 - Polygon vertex ordering: Counter-clockwise (CCW)
 
@@ -54,13 +55,27 @@ All comparisons that involve floating-point geometry use named tolerances, not b
 | `EPS_ANGLE` | `1e-9` rad | "are lines parallel", "is cross product zero" |
 | `EPS_AREA` | `1e-9` m² | signed-area sign check for CCW reorder |
 | `EPS_PARAM` | `1e-9` | parametric `t` clipping for segment/line intersection |
+| `EPS_ALTITUDE` | `1e-6` m | slice-plane membership test: `\|aE + bN + cZ − d\| / sqrt(a² + b² + c²) ≤ EPS_ALTITUDE + slab_thickness`. For the three axis-aligned presets the denominator equals 1. For Custom mode the UI must pre-normalize the coefficients so `sqrt(a² + b² + c²) = 1` before constructing `SlicePlane`; otherwise the effective tolerance widens by the normal's magnitude and points further from the plane than intended are silently included. |
 
 Validation that a tangent point lies on its circle uses `|distance(point, center) - radius| < EPS_DISTANCE`. Parallel-line detection uses `|cross(d1, d2)| < EPS_ANGLE`.
 
 ### Object Identity
-- Each object has a unique ID (string format: "type_NNN", e.g., "pt_001", "ln_001")
+- Each object has a unique ID (string format: "type_NNN")
 - IDs are immutable and persist across save/load cycles
 - References between objects use ID strings, not memory pointers
+
+| Object type | ID prefix | Example |
+|---|---|---|
+| Point | `pt` | `pt_001` |
+| Line | `ln` | `ln_001` |
+| Polygon | `pg` | `pg_001` |
+| Ray | `ry` | `ry_001` |
+| Vector | `vc` | `vc_001` |
+| Circle | `ci` | `ci_001` |
+| Ball | `ba` | `ba_001` |
+| Cylinder | `cy` | `cy_001` |
+| Solid | `so` | `so_001` |
+| Tangent | `tg` | `tg_001` |
 
 ---
 
@@ -75,13 +90,14 @@ Validation that a tangent point lies on its circle uses `|distance(point, center
 - `type`: "point"
 - `easting`: float (UTM easting coordinate)
 - `northing`: float (UTM northing coordinate)
+- `altitude`: float (UTM altitude in meters above datum; default 0.0 when absent or null in the JSON file)
 - `color`: hex color code (e.g. `#FF0000`)
 - `alpha`: float (transparency level, 0.0 to 1.0)
 - `visibility`: boolean
 
 **Creation Methods**:
 - **Click Mode**: User clicks on canvas; coordinates captured from click location
-- **Form Input**: User enters easting, northing, name, color in dialog
+- **Form Input**: User enters easting, northing, name, color, and optionally altitude (Z) in dialog. Leaving altitude blank defaults to 0.0.
 - **Relative Coordinates**: User selects reference point + delta easting/northing; absolute coordinates calculated as: `absolute = reference + delta`
 - **Text Import**: User provides text; regex extracts name, northing, easting. The import dialog includes a `Use reference point` checkbox; when checked, a combobox of existing points becomes enabled and the parsed `(northing, easting)` values are interpreted as **deltas** from the selected reference point (absolute = reference + delta). When unchecked, values are absolute UTM coordinates and the combobox is disabled.
 
@@ -93,7 +109,7 @@ Captures: [1] name, [2] northing, [3] easting
 ---
 
 ### 2. Line
-**Description**: An infinite line connecting two points.
+**Description**: An infinite line through two points in 3D space.
 
 **Properties**:
 - `name`: string
@@ -101,20 +117,22 @@ Captures: [1] name, [2] northing, [3] easting
 - `type`: "line"
 - `point_a_id`: string (reference to Point)
 - `point_b_id`: string (reference to Point)
-- `direction`: float (stored as radians, supports azimuth/angle and radians/degrees conversion)
+- `direction`: float (stored as radians — horizontal azimuth or angle depending on `direction_mode`)
+- `elevation`: float (stored as radians; angle of the line above the horizontal plane, range [-π/2, π/2]; 0 = horizontal; default 0.0)
 - `direction_mode`: string ("azimuth" or "angle")
-- `direction_units`: string ("radians" or "degrees")
+- `direction_units`: string ("radians" or "degrees") — applies to both `direction` and `elevation` display
 - `line_color`: hex color code (stroke color)
 - `fill_color`: hex color code (stored; not rendered — Line has no interior)
 - `alpha`: float (transparency level, 0.0 to 1.0)
 - `visibility`: boolean
 
 **Creation Methods**:
-- **Click Mode**: User selects 2 distinct points via clicks or dropdown
+- **Click Mode**: User selects 2 distinct points via clicks or dropdown; direction and elevation computed from their 3D coordinates
 - **Form Input**: User selects point A and point B from dropdowns
 
 **Automatic Calculations**:
-- Direction: `azimuth = atan2(Δeast, Δnorth)`, normalized to [0, 2π)
+- Direction (azimuth): `atan2(Δeast, Δnorth)`, normalized to [0, 2π)
+- Elevation: `atan2(Δaltitude, √(Δeast² + Δnorth²))`, range [-π/2, π/2]
 
 ---
 
@@ -161,41 +179,43 @@ Subsequent lines: easting northing (space-separated)
 ---
 
 ### 4. Ray
-**Description**: An infinite half-line with an origin point and direction.
+**Description**: An infinite half-line in 3D space with an origin point, horizontal direction, and elevation angle.
 
 **Properties**:
 - `name`: string
 - `id`: string
 - `type`: "ray"
 - `origin_id`: string (reference to Point)
-- `direction`: float (stored as radians, supports azimuth/angle and radians/degrees conversion)
+- `direction`: float (stored as radians — horizontal azimuth or angle depending on `direction_mode`)
+- `elevation`: float (stored as radians; angle above the horizontal plane, range [-π/2, π/2]; 0 = horizontal; default 0.0)
 - `direction_mode`: string ("azimuth" or "angle")
-- `direction_units`: string ("radians" or "degrees")
+- `direction_units`: string ("radians" or "degrees") — applies to both `direction` and `elevation`
 - `line_color`: hex color code (stroke color)
 - `fill_color`: hex color code (stored; not rendered — Ray has no interior)
 - `alpha`: float (transparency level, 0.0 to 1.0)
 - `visibility`: boolean
 
 **Creation Methods**:
-- **Click Mode**: User clicks origin point, then secondary point; direction determined from origin to secondary point
-- **Form Input**: User selects origin point and enters direction (azimuth or angle, radians or degrees)
+- **Click Mode**: User clicks origin point, then secondary point; direction and elevation computed from origin to secondary point using their 3D coordinates
+- **Form Input**: User selects origin point and enters direction (azimuth or angle, radians or degrees) and elevation angle
 
 ---
 
 ### 5. Vector
-**Description**: A directed line segment with origin, direction, and length.
+**Description**: A directed line segment in 3D space with origin, direction, elevation, and length.
 
 **Properties**:
 - `name`: string
 - `id`: string
 - `type`: "vector"
 - `origin_id`: string (reference to Point)
-- `direction`: float (stored as radians, supports azimuth/angle and radians/degrees conversion)
+- `direction`: float (stored as radians — horizontal azimuth or angle depending on `direction_mode`)
+- `elevation`: float (stored as radians; angle above the horizontal plane, range [-π/2, π/2]; 0 = horizontal; default 0.0)
 - `direction_mode`: string ("azimuth" or "angle")
-- `direction_units`: string ("radians" or "degrees")
-- `length`: float (distance in meters, must be > 0)
-- `endpoint`: computed as (easting, northing) = (origin_easting + length × sin(azimuth), origin_northing + length × cos(azimuth))
-- `endpoint_id`: string or null. Set to a Point ID **only** when the vector was created via the `Origin + Endpoint` tab (or click mode); in that case `length` and `direction` are derived from the two referenced points and are recomputed if either point is edited. Null when created via `Length + Direction` — the endpoint is a pure computed value and no Point object exists for it. Deleting the referenced endpoint Point cascades to delete this vector (same rule as origin).
+- `direction_units`: string ("radians" or "degrees") — applies to both `direction` and `elevation`
+- `length`: float (3D distance in meters, must be > 0)
+- `endpoint`: computed as `(origin_e + L·sin(az)·cos(el), origin_n + L·cos(az)·cos(el), origin_z + L·sin(el))` where `az` = azimuth, `el` = elevation, `L` = length
+- `endpoint_id`: string or null. Set to a Point ID **only** when the vector was created via the `Origin + Endpoint` tab (or click mode); in that case `length`, `direction`, and `elevation` are derived from the two referenced points' 3D coordinates and are recomputed if either point is edited. Null when created via `Length + Direction` — the endpoint is a pure computed value. Deleting the referenced endpoint Point cascades to delete this vector.
 - `line_color`: hex color code (stroke color, including arrowhead)
 - `fill_color`: hex color code (stored; not rendered — Vector has no interior)
 - `alpha`: float (transparency level, 0.0 to 1.0)
@@ -212,13 +232,14 @@ Subsequent lines: easting northing (space-separated)
 - **Angle Mode**: Standard math angle in radians or degrees, measured counter-clockwise from East
 
 **Automatic Calculations**:
-- Endpoint: calculated from origin, direction, and length
-- Direction conversion: bidirectional conversion between azimuth and angle modes
+- Endpoint 3D: `(origin_e + L·sin(az)·cos(el), origin_n + L·cos(az)·cos(el), origin_z + L·sin(el))`; the `sin(az)/cos(az)` swap is the azimuth convention — do not change
+- Horizontal distance (2D projected length): `L·cos(el)`
+- Direction and elevation conversion: bidirectional between azimuth/angle and radians/degrees
 
 ---
 
 ### 6. Circle
-**Description**: A circular shape with center point and radius.
+**Description**: A 2D flat circle (horizontal disk) with center point and radius. Always rendered in the horizontal plane at the center point's altitude. For a 3D sphere use Ball; for a cylindrical shape use Cylinder.
 
 **Properties**:
 - `name`: string
@@ -237,30 +258,141 @@ Subsequent lines: easting northing (space-separated)
 
 ---
 
-### 7. Tangent
-**Description**: A line perpendicular to a circle's radius at a point on the circumference.
+### 7. Ball
+**Description**: A 3D sphere defined by a center point and radius. In the 2D flat view it projects as a circle; in the 3D view it renders as a wireframe sphere; in the Slice view the cross-section is a circle whose radius depends on the plane's distance from the center.
+
+**Properties**:
+- `name`: string
+- `id`: string (format: `ba_NNN`)
+- `type`: "ball"
+- `center_id`: string (reference to Point; the 3D center of the sphere)
+- `radius`: float (distance in meters, must be > 0)
+- `line_color`: hex color code (stroke/wireframe color)
+- `fill_color`: hex color code (interior fill color)
+- `alpha`: float (transparency level, 0.0 to 1.0)
+- `visibility`: boolean
+
+**Creation Methods**:
+- **Click Mode**: User clicks center point, then secondary point; radius calculated as 3D Euclidean distance from center to secondary point
+- **Form Input**: User selects center point and enters radius value
+
+**Rendering**:
+- **2D flat**: circle at `(center.easting, center.northing)` with radius `r` (same appearance as Circle)
+- **3D**: wireframe sphere at the center's 3D position
+- **Slice**: if the cutting plane is within radius of the center, shows the circular cross-section of radius `√(r² − d²)` where `d` is the signed distance from the center to the plane; otherwise not shown
+
+---
+
+### 8. Cylinder
+**Description**: A 3D cylinder with a circular cross-section, defined by a base-center point, radius, height, and axis orientation. The axis can be vertical (pointing straight up) or inclined at any azimuth and elevation angle.
+
+**Properties**:
+- `name`: string
+- `id`: string (format: `cy_NNN`)
+- `type`: "cylinder"
+- `base_center_id`: string (reference to Point; center of the base circular face)
+- `radius`: float (distance in meters, must be > 0)
+- `height`: float (length of cylinder along its axis, must be > 0)
+- `axis_mode`: string (`"vertical"` or `"inclined"`)
+- `axis_azimuth`: float (stored as radians; azimuth of the axis projected onto the EN plane, clockwise from North; ignored when `axis_mode = "vertical"`)
+- `axis_elevation`: float (stored as radians; angle of the axis above the horizontal plane; range `(0, π/2]`; π/2 = vertical; must be > 0)
+- `direction_mode`: string (`"azimuth"` or `"angle"`) — applies to `axis_azimuth` display
+- `direction_units`: string (`"radians"` or `"degrees"`) — applies to both `axis_azimuth` and `axis_elevation` display
+- `line_color`: hex color code (stroke color)
+- `fill_color`: hex color code (fill color)
+- `alpha`: float (transparency level, 0.0 to 1.0)
+- `visibility`: boolean
+
+> **Note**: When `axis_mode = "vertical"`, `axis_azimuth` is stored as 0 and `axis_elevation` as π/2 but neither is shown in the form. The rendered cylinder is a right-circular cylinder pointing straight up from the base center.
+
+**Creation Methods**:
+- **Form Input**: User selects base center point; enters radius and height; chooses axis mode (`Vertical` / `Inclined`). In Inclined mode: enters azimuth (direction mode + units radios) and elevation angle (same units). No click mode — a cylinder requires multiple numeric parameters that cannot be captured by two canvas clicks.
+
+**Rendering**:
+- **2D flat**: base circle at `(base_center.easting, base_center.northing)` with radius `r`; a dashed line indicates the projected axis direction for inclined cylinders
+- **3D**: cylinder surface (base circle + top circle + lateral surface) positioned along the axis vector from the base center
+- **Slice**: cross-section shape depends on cutting angle relative to axis — a plane perpendicular to the axis gives a circle; oblique planes give an ellipse; a plane parallel to the axis gives a rectangle
+
+---
+
+### 9. Tangent
+**Description**: A line that is tangent (perpendicular to the radius) to a Circle or a Ball at a point on its surface.
+
+- **Circle tangent**: the tangent line lies in the horizontal plane of the circle. Its direction is uniquely determined by the point on the circumference — no extra input required.
+- **Ball tangent**: the tangent line lies in the plane tangent to the sphere at the given point. Any direction in that plane is valid; the user must supply both azimuth and elevation. Validation requires that the direction vector is perpendicular to the radius vector at that point (dot product < EPS_ANGLE).
 
 **Properties**:
 - `name`: string
 - `id`: string
 - `type`: "tangent"
-- `circle_id`: string (reference to Circle)
-- `point_id`: string (reference to Point on circumference)
-- `direction`: float (stored as radians, supports azimuth/angle and radians/degrees conversion)
+- `shape_id`: string (reference to a Circle **or** a Ball by ID)
+- `shape_type`: string (`"circle"` or `"ball"`) — identifies which type `shape_id` refers to
+- `point_id`: string (reference to Point on surface)
+- `direction`: float (stored as radians — horizontal azimuth or angle)
+- `elevation`: float (stored as radians; angle above horizontal; for Circle tangents always 0.0; for Ball tangents set by user)
 - `direction_mode`: string ("azimuth" or "angle")
-- `direction_units`: string ("radians" or "degrees")
+- `direction_units`: string ("radians" or "degrees") — applies to both `direction` and `elevation`
 - `line_color`: hex color code (stroke color)
 - `fill_color`: hex color code (stored; not rendered — Tangent has no interior)
 - `alpha`: float (transparency level, 0.0 to 1.0)
 - `visibility`: boolean
 
-**Creation Methods**:
-- **Click Mode**: User clicks a point on a circle's circumference; tangent line created perpendicular to radius at that point
+> ⚠️ **JSON migration note**: Files written before this schema change used `circle_id` instead of `shape_id` + `shape_type`. The loader treats a present `circle_id` key as `shape_id = circle_id, shape_type = "circle"` for backward compatibility.
 
-**Validation**: Point must be on circumference of circle (within numerical tolerance)
+**Creation Methods**:
+- **Click Mode**: User clicks a point on a circle's circumference; tangent direction is computed automatically. Click mode is available for Circle only — Ball tangents require an explicit direction and must use Form Input.
+- **Form Input**: User selects shape type (Circle / Ball radio), then selects the shape and a Point. For Circle the direction is computed automatically. For Ball the user also enters azimuth and elevation.
+
+**Validation**:
+- Circle: `|distance(point, center) − radius| < EPS_DISTANCE`
+- Ball: same distance check; additionally `|direction_vector · radius_unit_vector| < EPS_ANGLE` (perpendicularity)
 
 **Automatic Calculations**:
-- Direction: a tangent line has two opposite-facing directions 180° apart. Canonical stored direction is `tangent_azimuth = (radius_azimuth + π/2) mod 2π`, where `radius_azimuth = atan2(point_e − center_e, point_n − center_n)`. The opposite direction `(tangent_azimuth + π) mod 2π` is geometrically equivalent and may be exposed in the UI as a "Flip" action; the rendered line itself does not change.
+- **Circle tangent direction**: `tangent_azimuth = (radius_azimuth + π/2) mod 2π`, `elevation = 0`. The opposite direction `(tangent_azimuth + π) mod 2π` is geometrically equivalent and may be exposed via a "Flip" action.
+- **Ball tangent direction**: user-supplied; validated as perpendicular to radius; Flip action available.
+
+---
+
+### 10. Solid
+**Description**: A general 3D solid defined by an ordered stack of cross-section **layers**. Each layer is either a Polygon (a cross-section at some altitude) or a single Point (a pyramid apex/nadir). The solid's surface is the closed shell formed by connecting adjacent layers. This covers boxes (two rectangles), pyramids (polygon + apex point), frustums (two differently-sized polygons), lofted blades (any sequence of polygons), and more.
+
+**Properties**:
+- `name`: string
+- `id`: string (format: `so_NNN`)
+- `type`: "solid"
+- `layers`: list of strings — ordered references to existing **Polygon** or **Point** IDs, bottom to top. At least 2 entries. At most one entry may be a Point ID (the apex/nadir); it must be the first or last element.
+- `line_color`: hex color code (stroke/edge color)
+- `fill_color`: hex color code (face fill color)
+- `alpha`: float (transparency level, 0.0 to 1.0)
+- `visibility`: boolean
+
+**Layer rules**:
+- Adjacent Polygon layers should have the same vertex count so that corresponding vertices can be connected into quadrilateral lateral faces. If vertex counts differ, the solid uses triangulated fan faces between the layers (with a warning shown on creation).
+- A Point layer produces a triangulated fan from that apex point to all edges of the adjacent polygon.
+- Polygons do not need to be horizontally flat — each polygon's vertices carry their own 3D altitudes via the Point model. The layer order is the user's declared bottom-to-top sequence, not derived from altitude.
+
+**Cascade note**: Deleting any Polygon or Point that appears in a Solid's `layers` list cascades to delete the Solid.
+
+**Creation Methods**:
+- **Form Input**: User builds an ordered list of layers. Each row in the list specifies a shape type (`Polygon` / `Point`) and selects an existing object from a combobox. Rows can be reordered and added/removed. No click mode.
+
+> **Shape examples:**
+> - **Box**: two rectangular Polygons at different altitudes
+> - **Pyramid**: one base Polygon + one apex Point
+> - **Frustum**: two similar Polygons of different sizes
+> - **Loft**: three or more Polygons whose vertex positions change between layers
+> - **Wedge**: a triangle polygon + a line segment — use a degenerate 2-vertex "polygon" if needed, or place two vertices of the top layer at the same point
+
+**Rendering**:
+- **2D flat**: outline of the bottom-layer polygon projected to (E, N)
+- **3D**: wireframe shell — each polygon layer drawn, plus lateral edges connecting corresponding vertices of adjacent layers
+- **Slice**: the plane intersects each lateral face (a triangle or quad); collect all intersection line segments and render as a 2D polygon cross-section
+
+**Mass properties** (auto-shown in right panel when a Solid is selected):
+- **Volume**: exact, computed by [Mirtich (1996)](https://www.cs.uaf.edu/2015/spring/cs482/lecture/02_20_boundary/Fast%20and%20accurate%20computation%20of%20polyhedral%20mass%20properties.pdf) algorithm — the layer stack is converted to a closed B-rep (base face + top face + lateral triangulated faces) and the single O(n) traversal runs over all faces
+- **Centroid**: `(Tx/V, Ty/V, Tz/V)` from the same Mirtich pass; displayed as `(E, N, Z)` in meters. Cross-check: [Wuttke (2021)](https://journals.iucr.org/j/issues/2021/02/00/vg5135/vg5135.pdf) Eq. 22 — Vol = ⅓ Σₖ Ar(Γₖ)·r_⊥ₖ
+- **Lateral Surface Area**: sum of all lateral face areas (triangles and quads between layers)
+- **Total Surface Area**: lateral area + area of any polygon cap faces (first and last layers if they are polygons)
 
 ---
 
@@ -278,11 +410,26 @@ Subsequent lines: easting northing (space-separated)
 **Method**: Cross-product method for all consecutive vertex triplets  
 **Description**: Determines if all interior angles are less than 180°.
 
-### Convex Hull Calculation
+### Convex Hull Calculation — 2D
 **Input**: Polygon object  
-**Output**: New Polygon object (named "[original_name]_convex_hull")  
-**Method**: Graham scan or similar  
-**Description**: Creates smallest convex polygon containing all vertices of input polygon.
+**Output**: New Polygon object (named `"[original_name]_convex_hull"`)  
+**Method**: `scipy.spatial.ConvexHull` — the QHull implementation of the [Quickhull algorithm (Barber, Dobkin & Huhdanpaa 1996)](https://doi.org/10.1145/235815.235821). Returns vertex indices into the original point array; hull polygon reuses existing Point IDs without creating new points. O(n log r) for n input points, r hull vertices.  
+**Description**: Creates the smallest convex polygon containing all vertices of the input polygon. Operates on `(easting, northing)` only — altitude is ignored.
+
+### Convex Hull Calculation — 3D
+**Input**: Solid object (uses all 3D vertex positions across all layers) OR a user-selected set of 3 or more Points with non-trivial altitude variation  
+**Output**: New Solid object (named `"[original_name]_convex_hull_3d"`) whose faces are the triangulated facets of the convex hull  
+**Method**: `scipy.spatial.ConvexHull` in 3D — the same QHull/Quickhull algorithm ([Barber et al. 1996](https://doi.org/10.1145/235815.235821)) applied to `(easting, northing, altitude)` coordinates. Returns triangular facets and vertex indices. The output Solid stores these hull facets as triangulated layers. O(n log r) expected complexity.  
+**GPU note**: For very large point sets (millions of points) the CudaHull parallel algorithm ([Stein, Geva & El-Sana 2012](https://doi.org/10.1016/j.cag.2012.02.012)) achieves 30–40× speedup over CPU QHull. GeoSketch uses CPU QHull (via scipy) at typical scene sizes; CudaHull is noted for future large-scale applications.  
+**Description**: Creates the smallest convex polyhedron containing all 3D vertices of the input. The output hull reuses existing Point IDs where possible. If all input points are coplanar the result degenerates to a flat polygon and the 2D hull is returned instead.
+
+### Convex Skull Calculation (Potato Peeling) — 2D only
+**Scope**: Applies to **2D polygons** (planar point sets in (E, N)) only. See Future Enhancements for the 3D case.
+
+**Input**: Polygon object  
+**Output**: New Polygon object (named `"[original_name]_skull"`)  
+**Method**: Maximum inscribed convex polygon — also known as the *potato peeling problem* ([Goodman 1981](https://doi.org/10.1007/BF00183192)). [Chang and Yap (1986)](https://doi.org/10.1007/BF02187692) gave the best known exact algorithm in **O(n^7)** time; no better general bound is known (as of 2004 this remained an open question). Skull vertices are unconstrained: they may lie anywhere on the input boundary or interior, not only at the input's vertices. Implementation strategy: for convex polygons (detected via `is_convex`) return the polygon itself immediately. For concave polygons with small vertex counts (≤ 12) consider the O(n^7) exact algorithm; for larger polygons use a documented approximation (e.g. iterative half-plane refinement or vertex-subset DP) with a note in the result dialog that the answer is approximate.  
+**Description**: Computes the **convex skull** of the polygon: the largest-area convex polygon that lies entirely inside the input polygon. Contrasted with convex hull (smallest convex polygon *containing* the input), the convex skull is the largest convex polygon *contained within* the input. The exact solution is O(n^7) and practical only for small polygons; the implementation transparently flags whether the result is exact or approximate.
 
 ### Intersection Point (Line ↔ Line)
 **Input**: Two Line objects  
@@ -309,8 +456,8 @@ Subsequent lines: easting northing (space-separated)
 
 **Input**: Two Point objects  
 **Output**: Float (distance in meters)  
-**Formula**: `distance = √[(Δeast)² + (Δnorth)²]`  
-**Description**: Euclidean distance between two points.
+**Formula**: `distance = √[(Δeast)² + (Δnorth)² + (Δaltitude)²]`  
+**Description**: 3D Euclidean distance between two points. Matches the `length` property of a Vector defined by the same two points. When altitude is 0.0 for both points the result equals the 2D formula.
 
 ### Distance (Point ↔ Polygon)
 **Input**: Point object, Polygon object  
@@ -363,39 +510,151 @@ Measurement tools compute scalar properties of existing objects. They are read-o
 **Formula**: `circumference = 2 · π · r`  
 **Description**: Perimeter of the circle. Surfaced under the same "perimeter" mental model as polygons so a user looking at the Measurements card finds both in one place.
 
+### Polygon Prism Volume
+**Input**: Polygon object + height (meters, positive float)  
+**Output**: Float (cubic meters)  
+**Formula**: `volume = area · height`  
+**Description**: Volume of the vertical prism formed by extruding the polygon by the given height. "Area" is the 2D shoelace area computed from (Easting, Northing). Height is a user-supplied scalar (e.g. the elevation extent of the formation). This measurement does **not** require altitude to be set on the polygon's points — the height is entered independently.
+
+### Circle Cylinder Volume
+**Input**: Circle object + height (meters, positive float)  
+**Output**: Float (cubic meters)  
+**Formula**: `volume = π · r² · height`  
+**Description**: Volume of the vertical cylinder formed by extruding the circle by the given height. Height is a user-supplied scalar. Same independence from altitude as Polygon Prism Volume.
+
+### Ball Volume
+**Input**: Ball object  
+**Output**: Float (cubic meters)  
+**Formula**: `volume = (4/3) · π · r³`  
+**Description**: Volume of the sphere.
+
+### Ball Surface Area
+**Input**: Ball object  
+**Output**: Float (square meters)  
+**Formula**: `surface_area = 4 · π · r²`  
+**Description**: Total surface area of the sphere.
+
+### Cylinder Volume
+**Input**: Cylinder object  
+**Output**: Float (cubic meters)  
+**Formula**: `volume = π · r² · height`  
+**Description**: Volume of the cylinder (height is the stored axis length, not a user-supplied value).
+
+### Cylinder Lateral Surface Area
+**Input**: Cylinder object  
+**Output**: Float (square meters)  
+**Formula**: `lateral_area = 2 · π · r · height`  
+**Description**: Area of the curved lateral surface only (excluding the two circular base faces).
+
+### Cylinder Total Surface Area
+**Input**: Cylinder object  
+**Output**: Float (square meters)  
+**Formula**: `total_area = 2 · π · r · height + 2 · π · r²`  
+**Description**: Total surface area including both circular base faces.
+
+### Solid Volume
+**Input**: Solid object  
+**Output**: Float (cubic meters)  
+**Algorithm**: **[Mirtich (1996)](https://www.cs.uaf.edu/2015/spring/cs482/lecture/02_20_boundary/Fast%20and%20accurate%20computation%20of%20polyhedral%20mass%20properties.pdf)** — "Fast and Accurate Computation of Polyhedral Mass Properties". The prism is treated as a closed polyhedron (base face + top face + lateral faces). Volume integrals are reduced via the divergence theorem to surface integrals, then to line integrals via Green's theorem. The projection axis per face is chosen adaptively for numerical accuracy. This handles inclined prisms exactly; `base_area × height` is only valid for vertical prisms.
+
+**Cross-check formula** ([Wuttke 2021](https://journals.iucr.org/j/issues/2021/02/00/vg5135/vg5135.pdf), Eq. 22): Vol = ⅓ Σₖ Ar(Γₖ)·r_⊥ₖ where r_⊥ₖ is the signed distance from the coordinate origin to face k. This coordinate-free formula (from the divergence theorem) can serve as a fast cross-check. For a vertical prism it reduces to `base_area × height`.
+
+**Uniform-layer simplification** ([Wuttke 2021](https://journals.iucr.org/j/issues/2021/02/00/vg5135/vg5135.pdf), §3.5): For a two-layer solid where both layers are congruent and parallel (the classic prism case), the form factor separates as F(**q**, Π) = h·sinc(q_⊥·h/2)·f(**q**_∥, Γ). For general multi-layer solids the full polyhedral algorithm is required. This separability is a useful property if scattering analysis is ever added.
+
+**Description**: Exact volume for any solid layer configuration. Auto-shown in right panel.
+
+### Solid Centroid (Center of Mass)
+**Input**: Solid object (assumed uniform density)  
+**Output**: `(easting, northing, altitude)` triple — the centroid of the prism volume  
+**Algorithm**: [Mirtich (1996)](https://www.cs.uaf.edu/2015/spring/cs482/lecture/02_20_boundary/Fast%20and%20accurate%20computation%20of%20polyhedral%20mass%20properties.pdf) — the same single pass that computes volume also computes the three first-moment integrals `(Tx, Ty, Tz)`. Centroid = `(Tx/V, Ty/V, Tz/V)`.  
+**Description**: The 3D centroid of the solid. For a simple vertical solid with uniform layers, this approximates the midpoint between layers. For general multi-layer solids the Mirtich pass computes it exactly. Auto-shown in right panel.
+
+### Solid Lateral Surface Area
+**Input**: Solid object  
+**Output**: Float (square meters)  
+**Formula**: Sum of all lateral face areas. Each lateral face is a triangle (fan from apex) or a quadrilateral (corresponding edges of adjacent polygon layers); area computed via cross product.  
+**Description**: Area of all lateral faces, excluding any polygon cap faces (first/last layers). Auto-shown in right panel.
+
+### Solid Total Surface Area
+**Input**: Solid object  
+**Output**: Float (square meters)  
+**Formula**: lateral area + area of any polygon cap faces (first layer if it is a polygon + last layer if it is a polygon)  
+**Description**: All faces of the closed shell. Auto-shown in right panel.
+
 ### Segment / Vector Length
 **Input**: Vector object **or** two Points  
 **Output**: Float (meters)  
-**Formula**: Euclidean — `√[(Δe)² + (Δn)²]`  
+**Formula**: 3D Euclidean — `√[(Δe)² + (Δn)² + (Δz)²]`  
 **Description**: For a Vector this is exactly its `length` property (no recomputation needed); for two selected Points it is the same as `Distance(Point ↔ Point)`. Surfaced as a measurement so the user has a single discoverable entry point.
 
 ### Angle Between Directions
 **Input**: Two direction-bearing objects (any combination of Line, Ray, Vector, Tangent)  
-**Output**: Float, displayed in both radians and degrees, range `[0, π]` (unsigned angle between the lines they define)  
+**Output**: Float, displayed in both radians and degrees, range `[0, π/2]` (unsigned angle between the lines they define)  
 **Formula**: `θ = arccos(|cos(d₁ − d₂)|)` where `d₁`, `d₂` are the stored radian directions. Using the absolute value collapses the 180°-supplementary pair so a line and its 180°-flipped twin measure as 0, not π.  
 **Description**: The unsigned acute/obtuse angle between two oriented objects, treating each as the infinite line it lies on. Parallel directions return 0; perpendicular returns π/2. Both `direction_mode` settings are normalized to radians before comparison, so the result is convention-independent.
+
+### Angle at Vertex (Three-Point Azimuth & Elevation)
+**Input**: Three Point objects in fixed order — A, B, C. The vertex is B; the two arms are the segments B→A and B→C.  
+**Output**: Azimuth (float, radians normalized to `[0, 2π)`) **and** Elevation (float, radians, range `[−π, π]`), each displayed in the user's selected direction units (radians/degrees).  
+**Formulas**:  
+- **Azimuth** — the directed horizontal turn from arm BA to arm BC, *altitude ignored* (computed in the (Easting, Northing) plane):  
+  `az_BA = atan2(A.easting − B.easting, A.northing − B.northing)`  
+  `az_BC = atan2(C.easting − B.easting, C.northing − B.northing)`  
+  `azimuth = normalize_2pi(az_BC − az_BA)`  
+- **Elevation** — the difference between the two arms' elevation angles:  
+  `el_BA = atan2(A.altitude − B.altitude, √((A.easting − B.easting)² + (A.northing − B.northing)²))`  
+  `el_BC = atan2(C.altitude − B.altitude, √((C.easting − B.easting)² + (C.northing − B.northing)²))`  
+  `elevation = el_BC − el_BA`  
+**Order matters**: the triple is ordered — `ABC ≠ CBA`. Reversing to `C, B, A` yields the explementary azimuth (`2π − azimuth`) and the negated elevation (`−elevation`).  
+**Degenerate cases**: if either arm has zero 3D length (A coincides with B, or C coincides with B — distance `< EPS_DISTANCE`) the measurement is rejected. The azimuth term is undefined for a purely vertical arm (horizontal length `< EPS_DISTANCE`) and is reported as `undefined` while the elevation difference remains valid.  
+**Description**: Measures the angle subtended at B by the arms to A and C — the horizontal opening between them (altitude ignored) plus the vertical tilt difference between the two arms. Unlike *Angle Between Directions* (which compares two existing direction-bearing objects and returns a single unsigned angle), this takes three freely chosen points and returns a signed, order-dependent azimuth/elevation pair.
 
 ### Measurement UI
 - Measurements are invoked from a `Measurements` collapsible card in the left panel, alongside the existing creation/calculation cards.
 - Each measurement opens a small dialog with object pickers matching its input signature. The dialog has a `Compute` button; results render in the dialog and persist in the right panel under a `Last measurement` field until cleared or a new measurement is taken.
 - Polygon Area and Polygon Perimeter are *also* shown automatically in the right-panel properties whenever a Polygon is selected — these are cheap and free of ambiguity.
 - Circle Area and Circle Circumference are likewise shown automatically in the right-panel properties whenever a Circle is selected.
+- Polygon Prism Volume and Circle Cylinder Volume appear in the Measurements card but are **not** auto-shown in the right panel (they require a user-supplied height).
+- Ball Volume and Ball Surface Area are auto-shown in the right panel whenever a Ball is selected.
+- Cylinder Volume, Cylinder Lateral Surface Area, and Cylinder Total Surface Area are auto-shown in the right panel whenever a Cylinder is selected (height is already stored on the object).
+- Solid Volume, Solid Centroid, Solid Lateral Surface Area, and Solid Total Surface Area are auto-shown in the right panel whenever a Solid is selected.
+- Angle at Vertex (Three-Point Azimuth & Elevation) is invoked from the Measurements card with three ordered Point pickers (A = first arm, B = vertex, C = second arm); it is never auto-shown in the right panel because it requires a user-chosen ordered triple. The dialog notes that order is significant (`A-B-C ≠ C-B-A`).
 
 ---
 
 ## Visualization
 
 ### Canvas Display
-- **2D Rendering**: Cartesian coordinate system with UTM axes/grid displayed.
-- **Render on Demand**: the canvas does *not* redraw on every model mutation. A redraw is triggered by exactly these events:
-  1. User clicks the explicit `Refresh` / `Redraw` button.
-  2. User pans or zooms the canvas (matplotlib navigation toolbar action).
-  3. Selection changes (an object is clicked on the canvas or in a list; the selection highlight is the only thing redrawn — other geometry is not recomputed).
-  4. Project load / new project.
-  5. Window resize.
-  Property edits, object creations, and cascading deletes mark the canvas **stale** (shown via a subtle indicator near the Refresh button) but do not redraw until trigger #1 fires.
-- **Viewport clipping**: Lines and Rays are infinite in the model but finite on screen. At render time they are clipped to the current canvas viewport (Liang–Barsky or matplotlib's built-in clipping); when the user pans/zooms (trigger #2) they are re-clipped against the new viewport. A Line whose two defining points are both off-canvas still renders if it crosses the viewport.
-- **Coordinate Cursor**: Display cursor coordinates in UTM format (easting, northing) as mouse moves over canvas. The cursor read-out updates continuously and is exempt from render-on-demand (it is a text label, not a geometry redraw).
+
+#### Three-tab canvas
+
+The center panel hosts three independent view tabs. Only the active tab renders; inactive tabs are marked stale and redraw when the user switches to them. Each tab owns its own matplotlib `Figure`, `FigureCanvasTkAgg`, and `NavigationToolbar`.
+
+- **Tab 1 — 2D (flat)**: Cartesian 2D axes with UTM Easting × Northing grid. Altitude is ignored; all objects are rendered using only `(easting, northing)`. This is the primary working view and the default tab on project open.
+- **Tab 2 — 3D**: Full 3D axes (Easting × Northing × Altitude). Points with no altitude set render at Z = 0 (altitude defaults to 0). Lines, Rays, Vectors, and Polygon edges connect their constituent Point altitudes in 3D. Circles and Tangents render as horizontal disks/lines at their center Point's altitude. The 3D tab does not support blitting — selection changes trigger full redraws (`mpl_toolkits.mplot3d.Axes3D` does not implement `copy_from_bbox`). Default view angle: elevation 30°, azimuth 225°; the user may rotate freely.
+- **Tab 3 — Slice**: 2D cross-section through the scene defined by a user-chosen cutting plane. The plane is specified as a linear equation over any two of the three coordinates (Easting, Northing, Altitude): for example `Z = c` (horizontal slice), `E = c` (north-south vertical slice), `N = c` (east-west vertical slice), or the general form `aE + bN + cZ = d`. The in-plane view is a 2D projection onto the cutting plane's local axes. A control strip above the canvas exposes plane mode (preset or custom coefficients), the offset value, and an optional slab thickness (default 0) that widens the inclusion zone to ±thickness metres around the plane. Only objects that intersect the plane within the slab are shown. The slice plane is ephemeral UI state — it is never saved to the project file and resets to `Z = 0` on project open.
+
+#### Render on Demand
+
+The canvas does *not* redraw on every model mutation. Each tab tracks its own stale state. A redraw is triggered by exactly these events:
+
+1. User clicks the explicit `Refresh` / `Redraw` button (refreshes the active tab only).
+2. User pans or zooms the canvas (matplotlib navigation toolbar action — active tab only).
+3. Selection changes (active tab only; for the 2D and Slice tabs, the selection highlight is blitted without a full redraw; the 3D tab triggers a full redraw).
+4. Project load / new project (all three tabs marked stale; active tab redraws immediately).
+5. Window resize (active tab redraws).
+6. User clicks **Apply** in the Slice tab's control strip (Slice tab only).
+7. User switches to a tab that is stale (that tab redraws on activation).
+
+Property edits, object creations, and cascading deletes mark **all three tabs** stale (shown via a subtle indicator near the Refresh button) but do not redraw until one of the above triggers fires.
+
+#### Viewport clipping
+
+Lines and Rays are infinite in the model but finite on screen. In the 2D and Slice tabs they are clipped to the current canvas viewport at render time; when the user pans/zooms they are re-clipped against the new viewport. In the 3D tab, matplotlib's native 3D clipping handles this.
+
+#### Coordinate Cursor
+
+Displays cursor coordinates in UTM format as the mouse moves over the active canvas. In the 2D and Slice tabs: `E, N`. In the 3D tab: `E, N, Z` (reads the Z of the last clicked 3D artist or the scene floor). The read-out updates continuously and is exempt from render-on-demand.
 
 ### Object Rendering
 - **Point**: Marker/dot at (easting, northing)
@@ -403,12 +662,15 @@ Measurement tools compute scalar properties of existing objects. They are read-o
 - **Ray**: Line extending from origin through secondary point to canvas edge
 - **Polygon**: Filled or outlined shape with all vertices connected
 - **Vector**: Arrow from origin to endpoint, length represents magnitude
-- **Circle**: Circular outline with center and radius
+- **Circle**: Circular outline with center and radius (always horizontal)
+- **Ball**: Circle in 2D flat view; wireframe sphere in 3D; circular cross-section in Slice (if plane intersects)
+- **Cylinder**: Base circle in 2D flat view; 3D cylinder surface in 3D; circle/ellipse/rectangle cross-section in Slice
+- **Solid**: Bottom-layer polygon outline in 2D flat; wireframe shell (all layers + lateral edges) in 3D; polygon cross-section of lateral face intersections in Slice
 - **Tangent**: Line perpendicular to circle at point on circumference
 
 ### Visual Properties
 - **Point** rendered in its assigned `color` (marker color).
-- All other objects rendered using `line_color` for stroke/outline and `fill_color` for interior fill. Circle and Polygon use both; 1D objects (Line, Ray, Vector, Tangent) use only `line_color` at render time — `fill_color` is stored in the schema but ignored.
+- All other objects rendered using `line_color` for stroke/outline and `fill_color` for interior fill. Circle, Ball, Cylinder, Polygon, and Solid use both; 1D objects (Line, Ray, Vector, Tangent) use only `line_color` at render time — `fill_color` is stored in the schema but ignored.
 - Each object uses its assigned `alpha` transparency level (applies to both `line_color` and `fill_color`) so overlapping objects can be layered and visually distinguished
 - Objects with `visibility = false` are not rendered
 - Selected objects highlighted/emphasized on canvas
@@ -474,16 +736,17 @@ Measurement tools compute scalar properties of existing objects. They are read-o
 
 **Versioning policy**
 
-- The MVP writes `"version": "1.0"` and accepts only `"1.0"` on load.
+- The current schema version is `"1.1"`. This version added Ball, Cylinder, and Solid object types and changed the Tangent schema from `circle_id` to `shape_id` + `shape_type`.
 - The version field uses semantic-versioning major.minor. The loader rule:
   - **Same major, same-or-lower minor** → load directly.
   - **Same major, higher minor** → load with a warning that newer fields may be ignored. Unknown top-level keys and unknown object `properties` keys are preserved verbatim on re-save so a newer-app file round-trips through an older app without data loss.
   - **Different major** → reject with a clear error; conversion is the responsibility of a future migration tool.
 - Files missing the `version` field are rejected.
+- **Unknown object `type` values** (e.g. a type added in a future version) are preserved verbatim in the objects list on re-save and a warning is shown, but they are not rendered or available for selection — the loader treats them as opaque blobs.
 
 ```json
 {
-  "version": "1.0",
+  "version": "1.1",
   "metadata": {
     "created": "2026-05-16T10:30:00Z",
     "lastModified": "2026-05-16T10:45:00Z",
@@ -500,7 +763,8 @@ Measurement tools compute scalar properties of existing objects. They are read-o
       "visibility": true,
       "properties": {
         "easting": 123456.789,
-        "northing": 4567890.123
+        "northing": 4567890.123,
+        "altitude": 150.0
       }
     },
     {
@@ -527,6 +791,7 @@ Measurement tools compute scalar properties of existing objects. They are read-o
         "point_a_id": "pt_001",
         "point_b_id": "pt_002",
         "direction": 0.7854,
+        "elevation": 0.0,
         "direction_mode": "azimuth",
         "direction_units": "radians"
       }
@@ -570,6 +835,7 @@ Measurement tools compute scalar properties of existing objects. They are read-o
       "properties": {
         "origin_id": "pt_001",
         "direction": 0.7854,
+        "elevation": 0.0,
         "direction_mode": "azimuth",
         "direction_units": "radians",
         "length": 100.0,
@@ -598,9 +864,11 @@ Measurement tools compute scalar properties of existing objects. They are read-o
       "alpha": 1.0,
       "visibility": true,
       "properties": {
-        "circle_id": "ci_001",
+        "shape_id": "ci_001",
+        "shape_type": "circle",
         "point_id": "pt_004",
         "direction": 2.3562,
+        "elevation": 0.0,
         "direction_mode": "azimuth",
         "direction_units": "radians"
       }
@@ -742,8 +1010,12 @@ PointC 4567920.000 123450.000
 ### Deletion
 - User can delete any object.
 - **Cascading delete** follows the full reference DAG, not just point→dependents. Every object stores the IDs it depends on; deleting object `X` deletes every object whose dependency set contains `X`, recursively. Specifically:
-  - Delete a **Point** → deletes every Line / Ray / Vector / Circle that references it, every Polygon whose vertex list contains it, every Tangent whose `point_id` matches, and any intersection-derived Point that has it as a parent.
+  - Delete a **Point** → deletes every Line / Ray / Vector / Circle / Ball / Cylinder that references it, every Polygon whose vertex list contains it (which in turn cascades to any Solid referencing that Polygon), every Tangent whose `point_id` matches, and any intersection-derived Point that has it as a parent.
   - Delete a **Circle** → deletes every Tangent referencing it.
+  - Delete a **Ball** → cascades to delete every Tangent whose `shape_id` references it (same rule as Circle). After cascade, delete is immediate after confirmation.
+  - Delete a **Cylinder** → no dependents; delete is immediate after confirmation.
+  - Delete a **Polygon** → deletes every Solid whose `layers` list references it.
+  - Delete a **Solid** → no dependents; delete is immediate.
   - Delete a **Line / Polygon** → deletes any intersection-derived Point that was generated from it (if the implementation tags such points with parent IDs).
 - The user is shown a **confirmation dialog listing every object that will be removed by the cascade** before deletion proceeds. Cancelling aborts the entire delete.
 - Deletion triggers a refresh of the dependent-object list and (if visible) the right-panel properties.
@@ -802,11 +1074,14 @@ The cascade-delete **confirmation dialog from §Deletion is still required** eve
 | Input | Validation Rule |
 |-------|-----------------|
 | Coordinate (easting/northing) | Must be valid float; typically > 0 for UTM |
+| Altitude (Z) | Must be a finite float (no NaN, no ±Infinity); blank or absent defaults to 0.0 |
+| Height (volume measurements) | Must be a positive finite float > 0 |
 | Azimuth, `direction_units = radians` | `0 ≤ value < 2π` (with `2π − EPS_ANGLE` accepted as the upper bound) |
 | Azimuth, `direction_units = degrees` | `0 ≤ value < 360` |
 | Angle, `direction_units = radians` | `0 ≤ value < 2π` |
 | Angle, `direction_units = degrees` | `0 ≤ value < 360` |
-| Length/Radius | Must be positive float > 0 |
+| Length/Radius/Height | Must be positive float > 0 |
+| Axis elevation (Cylinder) | Must be in range `(0, π/2]` radians (or `(0°, 90°]`); 0 is rejected (degenerate flat disk) |
 | Color | Valid hex code (`#RRGGBB`) |
 | Name | Non-empty string, max 100 characters |
 | Point selection | Must select valid, existing point |
@@ -819,10 +1094,10 @@ The cascade-delete **confirmation dialog from §Deletion is still required** eve
 
 ## Success Criteria for MVP
 
-✅ User can create all 7 object types (points, lines, polygons, rays, vectors, circles, tangents)  
+✅ User can create all 10 object types (points, lines, polygons, rays, vectors, circles, balls, cylinders, solids, tangents)  
 ✅ User can input objects via clicking, forms, and file imports  
-✅ User can visualize all objects on 2D canvas  
-✅ All four calculation categories produce correct results: **(1) Direction**, **(2) Convexity & Convex Hull**, **(3) Intersection (line↔line, line↔polygon, ray↔polygon, polygon↔polygon)**, **(4) Distance (point↔point, point↔polygon, ray↔polygon, polygon↔polygon)**  
+✅ User can visualize all objects across three canvas tabs: 2D flat (altitude ignored), 3D (altitude-aware), and Slice (cross-section at a user-chosen cutting plane)  
+✅ All calculation categories produce correct results: **(1) Direction**, **(2) Convexity, 2D Convex Hull (polygon→polygon), 3D Convex Hull (solid/points→solid), Convex Skull 2D (potato peeling, polygon only)**, **(3) Intersection (line↔line, line↔polygon, ray↔polygon, polygon↔polygon)**, **(4) Distance (point↔point, point↔polygon, ray↔polygon, polygon↔polygon)**  
 ✅ Data persists correctly via JSON save/load  
 ✅ Application handles invalid input gracefully  
 ✅ Coordinate system displays correctly in UTM  
@@ -834,14 +1109,15 @@ The cascade-delete **confirmation dialog from §Deletion is still required** eve
 ✅ Distance calculations use proper Euclidean formula  
 ✅ Polygon-to-polygon distance calculation available and correct  
 ✅ Undo/redo reverses every mutating operation (create, delete-with-cascade, property edit, point move with auto-recompute, bulk imports), bounded to 100 commands  
-✅ Measurement tools available: polygon area (shoelace), polygon perimeter, circle area (πr²), circle circumference (2πr), segment/vector length, unsigned angle between two direction-bearing objects  
+✅ Measurement tools available: polygon area, polygon perimeter, circle area/circumference, polygon prism volume (area × h), circle cylinder volume (πr²h), ball volume (4/3πr³), ball surface area (4πr²), cylinder volume/lateral/total surface area, solid volume/centroid/lateral/total surface area (Mirtich 1996), segment/vector length, unsigned angle between direction-bearing objects  
 
 ---
 
 ## Future Enhancements (Out of MVP Scope)
 
 - **Merge / append project files** with collision-aware ID renumbering.
-- 3D geometry support
+- **3D Convex Skull** (potato peeling in 3D): largest convex polyhedron inscribed in a Solid. The 3D version is a harder open problem than the 2D case; approximate algorithms to be referenced in a future update.
+- **Form factor computation** for Solid, Ball, and Cylinder (Fourier transform of the shape's indicator function, useful for small-angle X-ray/neutron scattering analysis). The numerically stable algorithm is described in [Wuttke (2021)](https://journals.iucr.org/j/issues/2021/02/00/vg5135/vg5135.pdf) "Numerically stable form factor of any polygon and polyhedron", J. Appl. Cryst. 54, 580–587.
 - Real-time collaborative editing
 - Constraint-based geometry solver
 - Animation and simulation
@@ -865,6 +1141,11 @@ The cascade-delete **confirmation dialog from §Deletion is still required** eve
 | **Concave** | At least one interior angle > 180°; shape has "indentations" |
 | **Euclidean Distance** | Straight-line distance between two points |
 | **Tangent** | Line perpendicular to radius at a point on circle circumference |
+| **Ball** | 3D sphere defined by center Point and radius |
+| **Cylinder** | 3D cylinder defined by base center Point, radius, height, and axis orientation (vertical or inclined) |
+| **Solid** | General 3D solid defined by an ordered stack of Polygon/Point layers; the surface is the closed shell connecting adjacent layers |
+| **Layer** | One cross-section in a Solid — either a Polygon or a single Point (apex/nadir) |
+| **Axis elevation** | Angle of an axis above the horizontal plane; 0 = horizontal (degenerate for Cylinder, rejected), π/2 = vertical |
 | **Ray** | Infinite half-line with origin and direction |
 | **Convex Hull** | Smallest convex polygon containing all points |
 | **Simple Polygon** | Polygon whose edges do not cross each other and share endpoints only with their two neighbours |
