@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import enum
+import math
 from dataclasses import dataclass
 
 
@@ -131,4 +132,10 @@ class ElevatedObject(GeoObject):
                 "ElevatedObject is an abstract base class and must not be "
                 "instantiated directly; use one of the four concrete "
                 "subclasses (Line, Ray, Vector, Tangent)."
+            )
+        if not math.isfinite(self.elevation):
+            raise ValueError(f"ElevatedObject.elevation must be finite; got {self.elevation!r}")
+        if not -math.pi / 2 <= self.elevation <= math.pi / 2:
+            raise ValueError(
+                f"ElevatedObject.elevation must be in [-π/2, π/2]; got {self.elevation!r}"
             )

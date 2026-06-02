@@ -14,6 +14,8 @@
 
 from dataclasses import dataclass, field
 
+_VALID_MODES = frozenset({"horizontal", "easting", "northing", "custom"})
+
 
 @dataclass
 class SlicePlane:
@@ -59,3 +61,13 @@ class SlicePlane:
     c: float
     d: float
     thickness: float = field(default=0.0)
+
+    def __post_init__(self) -> None:
+        if self.mode not in _VALID_MODES:
+            raise ValueError(
+                f"SlicePlane.mode must be one of the four documented modes; got {self.mode!r}"
+            )
+        if self.thickness < 0:
+            raise ValueError(f"SlicePlane.thickness must be >= 0; got {self.thickness!r}")
+        if self.a**2 + self.b**2 + self.c**2 < 1e-24:
+            raise ValueError("SlicePlane normal (a, b, c) must not be the zero vector")

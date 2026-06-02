@@ -28,8 +28,10 @@ Conventions
 * Coordinates are UTM metres expressed as ``(easting, northing)`` — easting
   first. All coordinate arrays returned by this module follow that order.
 * Scalar results are returned as :class:`numpy.float64` so they drop straight
-  into further NumPy expressions without an implicit cast. Coordinate results
-  are returned as ``numpy.ndarray`` of shape ``(2,)``.
+  into further NumPy expressions without an implicit cast. 2-D coordinate
+  results (e.g. intersection points) are returned as ``numpy.ndarray`` of
+  shape ``(2,)``; 3-D coordinate results (e.g. :func:`vector_endpoint`) use
+  shape ``(3,)``.
 * Functions that consume polygons or direction-bearing objects take a
   ``points`` mapping (``id -> Point``) and resolve coordinates on demand. No
   function caches geometry — shapely objects are built at the call boundary
@@ -85,7 +87,7 @@ __all__ = [
     "signed_area",
     "is_convex",
     "convex_hull",
-    "direction_unit_vector",
+    "horizontal_unit_vector",
     "line_intersection",
     "line_polygon_intersections",
     "polygon_polygon_intersections",
@@ -207,9 +209,25 @@ def azimuth(pt_a: Point, pt_b: Point) -> np.float64:
 
 
 def distance(pt_a: Point, pt_b: Point) -> np.float64:
-    """Euclidean distance between two points via ``np.hypot`` (float64)."""
+    """3-D Euclidean distance between two points (float64).
+
+    Computes ``√[(Δe)²+(Δn)²+(Δz)²]`` per the domain rule that distance
+    between two Points is always 3-D. This matches the Vector ``length``
+    formula and the spec's point-import text format.
+
+    Parameters
+    ----------
+    pt_a, pt_b : Point
+        Start and end points, each with an ``altitude`` field.
+
+    Returns
+    -------
+    numpy.float64
+        3-D Euclidean distance in metres.
+    """
     d_e, d_n = _delta(pt_a, pt_b)
-    return np.hypot(d_e, d_n)
+    d_z = np.float64(pt_b.altitude) - np.float64(pt_a.altitude)
+    return np.float64(np.sqrt(d_e**2 + d_n**2 + d_z**2))
 
 
 # ---------------------------------------------------------------------------
@@ -333,8 +351,13 @@ def convex_hull(polygon: Polygon, points: Mapping[str, Point], new_id: str) -> P
 # ---------------------------------------------------------------------------
 
 
-def direction_unit_vector(obj: ElevatedObject) -> np.ndarray:
-    """Unit ``(easting, northing)`` vector for a direction-bearing object.
+def horizontal_unit_vector(obj: ElevatedObject) -> np.ndarray:
+    """Horizontal unit ``(easting, northing)`` vector for a direction-bearing object.
+
+    Computes a **2-D horizontal projection** of the bearing stored in
+    ``obj.direction``, deliberately ignoring ``obj.elevation``. This is the
+    correct input for 2-D geometry operations such as ray-polygon distance,
+    where the plane geometry is independent of the ray's vertical tilt.
 
     ``obj.direction`` is stored in radians but means either an azimuth
     (CW from North) or a math angle (CCW from East) depending on
@@ -346,7 +369,7 @@ def direction_unit_vector(obj: ElevatedObject) -> np.ndarray:
     Returns
     -------
     numpy.ndarray
-        Unit direction vector, shape ``(2,)``.
+        Horizontal unit direction vector, shape ``(2,)``.
 
     Raises
     ------
@@ -360,7 +383,7 @@ def direction_unit_vector(obj: ElevatedObject) -> np.ndarray:
     """
     if not math.isfinite(obj.direction):
         raise ValueError(
-            f"direction_unit_vector: obj.direction is {obj.direction!r}; "
+            f"horizontal_unit_vector: obj.direction is {obj.direction!r}; "
             "expected a finite radian value"
         )
     if obj.direction_mode is DirectionMode.AZIMUTH:
@@ -581,7 +604,7 @@ def ray_polygon_distance(ray: Ray, polygon: Polygon, points: Mapping[str, Point]
         Distance to the nearest intersection, or ``numpy.float64(inf)``.
     """
     origin = _xy(points[ray.origin_id])
-    unit = direction_unit_vector(ray)
+    unit = horizontal_unit_vector(ray)
     coords = _polygon_coords(polygon, points)
     n = len(coords)
     best = math.inf
@@ -672,11 +695,15 @@ def tangent_direction(center: Point, point: Point) -> np.float64:
     ------
     ValueError
         If ``center`` and ``point`` are coincident within
-        :data:`EPS_DISTANCE` (a zero-radius circle). The radius then has no
-        direction — :func:`azimuth` would return ``atan2(0, 0) == 0`` — so the
-        tangent is undefined and reporting ``π/2`` would be a silent fiction.
+        :data:`EPS_DISTANCE` in the **horizontal (2D) plane** (a zero-radius
+        circle). The coincidence test uses only ``(easting, northing)`` because
+        ``azimuth`` — and therefore the tangent direction — is a 2-D quantity;
+        two points that differ only in altitude have no horizontal separation and
+        thus no well-defined azimuth. Reporting ``π/2`` would be a silent
+        fiction, so this raises instead.
     """
-    if distance(center, point) < EPS_DISTANCE:
+    d_e, d_n = _delta(center, point)
+    if float(np.hypot(d_e, d_n)) < EPS_DISTANCE:
         raise ValueError(
             "tangent_direction: center and circumference point are coincident; "
             "a zero-radius circle has no tangent"
@@ -684,54 +711,65 @@ def tangent_direction(center: Point, point: Point) -> np.float64:
     return normalize_to_2pi(azimuth(center, point) + _HALF_PI)
 
 
-def vector_endpoint(origin: Point, length: float, az: float) -> np.ndarray:
-    """Endpoint of a vector from ``origin`` of the given ``length`` and azimuth.
+def vector_endpoint(origin: Point, length: float, az: float, el: float = 0.0) -> np.ndarray:
+    """3-D endpoint of a vector from ``origin`` of the given ``length``, azimuth, and elevation.
 
-    Uses the azimuth-convention formula
-    ``(e + L·sin(az), n + L·cos(az))``. The ``sin``/``cos`` swap relative to a
-    standard math angle is intentional (azimuth is CW from North) and must not
-    be "corrected".
+    Uses the azimuth + elevation convention from the spec::
+
+        E = origin_e + length·sin(az)·cos(el)
+        N = origin_n + length·cos(az)·cos(el)
+        Z = origin_z + length·sin(el)
+
+    The ``sin``/``cos`` swap between easting and northing is intentional
+    (azimuth is CW from North) and must not be "corrected". The elevation term
+    shortens the horizontal reach by ``cos(el)`` and adds a vertical component
+    via ``sin(el)``.
 
     Parameters
     ----------
     origin : Point
-        Vector origin.
+        Vector origin (provides easting, northing, altitude).
     length : float
         Vector magnitude in metres.
     az : float
         Azimuth in radians.
+    el : float, optional
+        Elevation angle above the horizontal plane in radians; default 0.0
+        (horizontal).  The caller is responsible for keeping this in
+        ``[-π/2, π/2]``; values outside that range are not rejected here.
 
     Returns
     -------
     numpy.ndarray
-        The ``(easting, northing)`` endpoint, shape ``(2,)``.
+        The ``(easting, northing, altitude)`` endpoint, shape ``(3,)``.
 
     Notes
     -----
-    ``az`` is **azimuth-only**. Unlike :func:`direction_unit_vector` — which is
+    ``az`` is **azimuth-only**. Unlike :func:`horizontal_unit_vector` — which is
     mode-aware and resolves ``direction_mode`` — this function does *not* look
     at ``direction_mode`` and always interprets ``az`` as an azimuth. For a
     :class:`~geometry.models.common.ElevatedObject` whose ``direction_mode`` is
     :attr:`DirectionMode.ANGLE`, callers must convert ``direction`` to an
     azimuth first (e.g. via :func:`~geometry.utils.angles.angle_to_azimuth`) or
-    use :func:`direction_unit_vector` instead; passing a raw ANGLE-mode
+    use :func:`horizontal_unit_vector` instead; passing a raw ANGLE-mode
     ``direction`` here yields a wrong endpoint.
 
-    ``az`` and ``length`` are assumed **finite**. This function intentionally
-    carries no ``math.isfinite`` guard — unlike :func:`direction_unit_vector`,
-    which validates because it resolves a stored ``direction`` that may have
-    been corrupted on deserialisation. ``vector_endpoint`` takes plain scalar
-    arguments that the command layer computes locally, so the validation
-    responsibility sits with the caller. A non-finite ``az`` or ``length``
-    propagates silently into a ``nan``/``inf`` endpoint array; callers passing
-    values from an untrusted source must check them before calling.
+    ``az``, ``el``, and ``length`` are assumed **finite**. This function
+    intentionally carries no ``math.isfinite`` guard — unlike
+    :func:`horizontal_unit_vector`, which validates because it resolves a stored
+    ``direction`` that may have been corrupted on deserialisation.
+    ``vector_endpoint`` takes plain scalar arguments that the command layer
+    computes locally, so the validation responsibility sits with the caller. A
+    non-finite argument propagates silently into a ``nan``/``inf`` endpoint
+    array; callers passing values from an untrusted source must check them
+    before calling.
     """
-    length = np.float64(length)
-    az = np.float64(az)
+    length, az, el = np.float64(length), np.float64(az), np.float64(el)
     return np.array(
         [
-            np.float64(origin.easting) + length * np.sin(az),
-            np.float64(origin.northing) + length * np.cos(az),
+            np.float64(origin.easting) + length * np.sin(az) * np.cos(el),
+            np.float64(origin.northing) + length * np.cos(az) * np.cos(el),
+            np.float64(origin.altitude) + length * np.sin(el),
         ],
         dtype=np.float64,
     )

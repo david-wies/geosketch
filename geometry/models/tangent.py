@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from geometry.models.common import ElevatedObject
 
@@ -55,7 +56,7 @@ class Tangent(ElevatedObject):
     """
 
     shape_id: str
-    shape_type: str
+    shape_type: Literal["circle", "ball"]
     point_id: str
     line_color: str
     fill_color: str

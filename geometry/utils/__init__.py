@@ -27,7 +27,14 @@ from geometry.utils.angles import (
     to_degrees,
     to_radians,
 )
-from geometry.utils.constants import EPS_ANGLE, EPS_AREA, EPS_DISTANCE, EPS_PARAM
+from geometry.utils.constants import (
+    EPS_ALTITUDE,
+    EPS_ANGLE,
+    EPS_AREA,
+    EPS_DISTANCE,
+    EPS_PARAM,
+    EPS_VOLUME,
+)
 from geometry.utils.events import (
     CANVAS_STALE,
     DEFINED_EVENTS,
@@ -47,10 +54,12 @@ from geometry.utils.id_factory import IDFactory
 # own __all__. Both lists are intentional public surface declarations.
 __all__ = [
     # constants
+    "EPS_ALTITUDE",
     "EPS_ANGLE",
     "EPS_AREA",
     "EPS_DISTANCE",
     "EPS_PARAM",
+    "EPS_VOLUME",
     # angles
     "angle_to_azimuth",
     "azimuth_to_angle",

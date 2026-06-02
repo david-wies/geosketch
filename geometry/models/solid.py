@@ -50,3 +50,5 @@ class Solid(GeoObject):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.layers = list(self.layers)
+        if len(self.layers) < 2:
+            raise ValueError("Solid requires at least 2 layer polygon IDs")

@@ -15,6 +15,7 @@
 from dataclasses import dataclass, field
 
 from geometry.models.common import GeoObject
+from geometry.utils.constants import EPS_VOLUME
 
 
 @dataclass
@@ -44,3 +45,8 @@ class Ball(GeoObject):
     line_color: str
     fill_color: str
     type: str = field(init=False, default="ball")
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.radius <= EPS_VOLUME:
+            raise ValueError(f"Ball.radius must be > 0; got {self.radius!r}")

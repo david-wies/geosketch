@@ -260,7 +260,7 @@ def test_reseed_is_monotonic():
     assert factory.next_id("pt") == "pt_011"
 
 
-def test_reseed_handles_all_seven_geosketch_prefixes():
+def test_reseed_handles_all_ten_geosketch_prefixes():
     """End-to-end check: every spec-defined ID prefix is parsed correctly."""
     factory = IDFactory()
     factory.reseed(
@@ -272,6 +272,9 @@ def test_reseed_handles_all_seven_geosketch_prefixes():
             "vc_003",  # Vector
             "ci_005",  # Circle
             "tg_009",  # Tangent
+            "ba_006",  # Ball
+            "cy_003",  # Cylinder
+            "so_008",  # Solid
         ]
     )
     assert factory.next_id("pt") == "pt_005"
@@ -281,6 +284,9 @@ def test_reseed_handles_all_seven_geosketch_prefixes():
     assert factory.next_id("vc") == "vc_004"
     assert factory.next_id("ci") == "ci_006"
     assert factory.next_id("tg") == "tg_010"
+    assert factory.next_id("ba") == "ba_007"
+    assert factory.next_id("cy") == "cy_004"
+    assert factory.next_id("so") == "so_009"
 
 
 def test_reseed_empty_list_is_noop():

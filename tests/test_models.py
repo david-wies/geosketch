@@ -434,6 +434,131 @@ def test_solid_apex_layer():
 
 
 # ---------------------------------------------------------------------------
+# Validation: Ball, Cylinder, Solid, ElevatedObject
+# ---------------------------------------------------------------------------
+
+
+def _ball_kwargs(**overrides) -> dict:
+    base = {
+        "id": "ba_001",
+        "name": "B",
+        "alpha": 1.0,
+        "visibility": True,
+        "center_id": "pt_001",
+        "radius": 10.0,
+        "line_color": "#000000",
+        "fill_color": "#ffffff",
+    }
+    base.update(overrides)
+    return base
+
+
+def _cylinder_kwargs(**overrides) -> dict:
+    base = {
+        "id": "cy_001",
+        "name": "C",
+        "alpha": 1.0,
+        "visibility": True,
+        "base_center_id": "pt_001",
+        "radius": 5.0,
+        "height": 10.0,
+        "axis_mode": "vertical",
+        "axis_azimuth": 0.0,
+        "axis_elevation": math.pi / 2,
+        "direction_mode": DirectionMode.AZIMUTH,
+        "direction_units": DirectionUnits.RADIANS,
+        "line_color": "#000000",
+        "fill_color": "#ffffff",
+    }
+    base.update(overrides)
+    return base
+
+
+def _solid_kwargs(**overrides) -> dict:
+    base = {
+        "id": "so_001",
+        "name": "S",
+        "alpha": 1.0,
+        "visibility": True,
+        "layers": ["pg_001", "pg_002"],
+        "line_color": "#000000",
+        "fill_color": "#ffffff",
+    }
+    base.update(overrides)
+    return base
+
+
+def _line_kwargs(**overrides) -> dict:
+    base = {
+        "id": "ln_001",
+        "name": "L",
+        "alpha": 1.0,
+        "visibility": True,
+        "point_a_id": "pt_001",
+        "point_b_id": "pt_002",
+        "direction": 0.0,
+        "elevation": 0.0,
+        "direction_mode": DirectionMode.AZIMUTH,
+        "direction_units": DirectionUnits.RADIANS,
+        "line_color": "#000000",
+        "fill_color": "#ffffff",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_ball_rejects_non_positive_radius():
+    with pytest.raises(ValueError, match="radius"):
+        Ball(**_ball_kwargs(radius=0.0))
+    with pytest.raises(ValueError, match="radius"):
+        Ball(**_ball_kwargs(radius=-5.0))
+
+
+def test_cylinder_rejects_non_positive_radius():
+    with pytest.raises(ValueError, match="radius"):
+        Cylinder(**_cylinder_kwargs(radius=0.0))
+    with pytest.raises(ValueError, match="radius"):
+        Cylinder(**_cylinder_kwargs(radius=-1.0))
+
+
+def test_cylinder_rejects_non_positive_height():
+    with pytest.raises(ValueError, match="height"):
+        Cylinder(**_cylinder_kwargs(height=0.0))
+    with pytest.raises(ValueError, match="height"):
+        Cylinder(**_cylinder_kwargs(height=-10.0))
+
+
+def test_cylinder_inclined_rejects_out_of_range_axis_elevation():
+    # Inclined mode with elevation = 0 is a flat disk — rejected.
+    with pytest.raises(ValueError, match="axis_elevation"):
+        Cylinder(**_cylinder_kwargs(axis_mode="inclined", axis_elevation=0.0))
+    # Elevation > π/2 is beyond vertical — rejected.
+    with pytest.raises(ValueError, match="axis_elevation"):
+        Cylinder(**_cylinder_kwargs(axis_mode="inclined", axis_elevation=math.pi))
+
+
+def test_solid_rejects_fewer_than_two_layers():
+    with pytest.raises(ValueError, match="2"):
+        Solid(**_solid_kwargs(layers=["pg_001"]))
+    with pytest.raises(ValueError, match="2"):
+        Solid(**_solid_kwargs(layers=[]))
+
+
+def test_elevated_object_rejects_non_finite_elevation():
+    for bad in (math.nan, math.inf, -math.inf):
+        with pytest.raises(ValueError, match="finite"):
+            Line(**_line_kwargs(elevation=bad))
+
+
+def test_elevated_object_rejects_out_of_range_elevation():
+    # Elevation outside [-π/2, π/2] must be rejected.
+    with pytest.raises(ValueError, match="π/2"):
+        Line(**_line_kwargs(elevation=math.pi))
+    with pytest.raises(ValueError, match="π/2"):
+        Line(**_line_kwargs(elevation=-math.pi))
+
+
+# ---------------------------------------------------------------------------
 # SlicePlane (ephemeral, not a GeoObject)
 # ---------------------------------------------------------------------------
 
@@ -460,6 +585,29 @@ def test_slice_plane_with_thickness():
 def test_slice_plane_not_geo_object():
     sp = SlicePlane(mode="northing", a=0.0, b=1.0, c=0.0, d=0.0)
     assert not isinstance(sp, GeoObject)
+
+
+def test_slice_plane_custom_mode():
+    # The fourth mode ("custom") must construct without error when the normal
+    # vector is non-zero.
+    sp = SlicePlane(mode="custom", a=1.0, b=1.0, c=1.0, d=50.0)
+    assert sp.mode == "custom"
+    assert sp.thickness == 0.0
+
+
+def test_slice_plane_rejects_invalid_mode():
+    with pytest.raises(ValueError, match="mode"):
+        SlicePlane(mode="diagonal", a=0.0, b=0.0, c=1.0, d=0.0)
+
+
+def test_slice_plane_rejects_negative_thickness():
+    with pytest.raises(ValueError, match="thickness"):
+        SlicePlane(mode="horizontal", a=0.0, b=0.0, c=1.0, d=0.0, thickness=-1.0)
+
+
+def test_slice_plane_rejects_zero_normal():
+    with pytest.raises(ValueError, match="zero vector"):
+        SlicePlane(mode="custom", a=0.0, b=0.0, c=0.0, d=0.0)
 
 
 # ---------------------------------------------------------------------------

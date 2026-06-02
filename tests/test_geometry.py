@@ -70,7 +70,7 @@ def _poly(pid: str, point_ids: list[str], name: str = "poly") -> Polygon:
     )
 
 
-def _directed_kwargs(direction: float = 0.0, mode: DirectionMode = DirectionMode.AZIMUTH) -> dict:
+def _elevated_kwargs(direction: float = 0.0, mode: DirectionMode = DirectionMode.AZIMUTH) -> dict:
     """Common envelope + direction kwargs shared by the elevated-object builders."""
     return {
         "alpha": 1.0,
@@ -85,7 +85,7 @@ def _directed_kwargs(direction: float = 0.0, mode: DirectionMode = DirectionMode
 
 
 def _line(pid: str, a_id: str, b_id: str) -> Line:
-    return Line(id=pid, name=pid, point_a_id=a_id, point_b_id=b_id, **_directed_kwargs())
+    return Line(id=pid, name=pid, point_a_id=a_id, point_b_id=b_id, **_elevated_kwargs())
 
 
 def _ray(
@@ -94,7 +94,7 @@ def _ray(
     direction: float,
     mode: DirectionMode = DirectionMode.AZIMUTH,
 ) -> Ray:
-    return Ray(id=pid, name=pid, origin_id=origin_id, **_directed_kwargs(direction, mode))
+    return Ray(id=pid, name=pid, origin_id=origin_id, **_elevated_kwargs(direction, mode))
 
 
 def _unit_square(prefix: str = "s") -> tuple[dict[str, Point], Polygon]:
@@ -147,44 +147,57 @@ def test_distance_zero_for_coincident_points():
     assert geo.distance(_pt("a", 7, 7), _pt("b", 7, 7)) == pytest.approx(0.0)
 
 
+def test_distance_3d_altitude_component():
+    # Pure vertical separation: only altitude differs, so distance == |Δz|.
+    result = geo.distance(_pt("a", 0, 0, 0.0), _pt("b", 0, 0, 5.0))
+    assert isinstance(result, np.float64)
+    assert result == pytest.approx(5.0)
+
+
+def test_distance_3d_pythagorean_quadruple():
+    # 3-4-12-13 Pythagorean quadruple: sqrt(3²+4²+12²) = sqrt(9+16+144) = 13.
+    result = geo.distance(_pt("a", 0, 0, 0.0), _pt("b", 3, 4, 12.0))
+    assert result == pytest.approx(13.0)
+
+
 # ---------------------------------------------------------------------------
-# direction unit vector (both modes)
+# horizontal unit vector (both modes)
 # ---------------------------------------------------------------------------
 
 
-def test_direction_unit_vector_azimuth_east():
+def test_horizontal_unit_vector_azimuth_east():
     # Azimuth pi/2 is due East => unit vector (1, 0) in (easting, northing).
     ray = _ray("ry", "o", math.pi / 2, DirectionMode.AZIMUTH)
-    vec = geo.direction_unit_vector(ray)
+    vec = geo.horizontal_unit_vector(ray)
     assert vec.shape == (2,)
     assert vec.dtype == np.float64
     assert vec[0] == pytest.approx(1.0)
     assert vec[1] == pytest.approx(0.0)
 
 
-def test_direction_unit_vector_angle_east():
+def test_horizontal_unit_vector_angle_east():
     # Math angle 0 is due East => (cos 0, sin 0) = (1, 0).
     ray = _ray("ry", "o", 0.0, DirectionMode.ANGLE)
-    vec = geo.direction_unit_vector(ray)
+    vec = geo.horizontal_unit_vector(ray)
     assert vec[0] == pytest.approx(1.0)
     assert vec[1] == pytest.approx(0.0)
 
 
-def test_direction_unit_vector_angle_north():
+def test_horizontal_unit_vector_angle_north():
     # Math angle pi/2 is due North => (cos, sin) = (0, 1).
     ray = _ray("ry", "o", math.pi / 2, DirectionMode.ANGLE)
-    vec = geo.direction_unit_vector(ray)
+    vec = geo.horizontal_unit_vector(ray)
     assert vec[0] == pytest.approx(0.0)
     assert vec[1] == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
-def test_direction_unit_vector_rejects_non_finite_direction(bad):
+def test_horizontal_unit_vector_rejects_non_finite_direction(bad):
     # A corrupted (e.g. malformed-JSON) direction must fail loud here rather
     # than propagate a [nan, nan] vector that silently poisons callers.
     ray = _ray("ry", "o", bad)
     with pytest.raises(ValueError, match="finite"):
-        geo.direction_unit_vector(ray)
+        geo.horizontal_unit_vector(ray)
 
 
 # ---------------------------------------------------------------------------
@@ -682,17 +695,21 @@ def test_tangent_direction_rejects_coincident_zero_radius():
 
 
 def test_vector_endpoint_east():
-    # Azimuth East (pi/2): endpoint = (e + L*sin, n + L*cos) = (L, 0).
+    # Azimuth East (pi/2), zero elevation: endpoint = (L, 0, 0); shape is (3,).
     end = geo.vector_endpoint(_pt("o", 0, 0), 5.0, math.pi / 2)
+    assert end.shape == (3,)
     assert end[0] == pytest.approx(5.0)
     assert end[1] == pytest.approx(0.0)
+    assert end[2] == pytest.approx(0.0)
 
 
 def test_vector_endpoint_north():
-    # Azimuth North (0): endpoint = (0, L).
+    # Azimuth North (0), zero elevation: endpoint = (0, L, 0).
     end = geo.vector_endpoint(_pt("o", 0, 0), 5.0, 0.0)
+    assert end.shape == (3,)
     assert end[0] == pytest.approx(0.0)
     assert end[1] == pytest.approx(5.0)
+    assert end[2] == pytest.approx(0.0)
 
 
 def test_vector_endpoint_off_axis_azimuth_pins_sin_cos_convention():
@@ -703,3 +720,17 @@ def test_vector_endpoint_off_axis_azimuth_pins_sin_cos_convention():
     end = geo.vector_endpoint(_pt("o", 0, 0), 10.0, math.pi / 6)
     assert end[0] == pytest.approx(10.0 * math.sin(math.pi / 6))  # 5.0
     assert end[1] == pytest.approx(10.0 * math.cos(math.pi / 6))  # ~8.66
+    assert end[2] == pytest.approx(0.0)
+
+
+def test_vector_endpoint_elevation_shortens_horizontal_reach():
+    # At el=pi/4, horizontal reach = L*cos(pi/4) = L/sqrt(2);
+    # vertical component = L*sin(pi/4) = L/sqrt(2). Azimuth East to keep the
+    # horizontal component purely in easting so the formula is easy to check.
+    length = 10.0
+    el = math.pi / 4
+    end = geo.vector_endpoint(_pt("o", 0, 0), length, math.pi / 2, el)
+    assert end.shape == (3,)
+    assert end[0] == pytest.approx(length * math.cos(el))  # ~7.071 (not 10)
+    assert end[1] == pytest.approx(0.0)
+    assert end[2] == pytest.approx(length * math.sin(el))  # ~7.071

@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
+from typing import Literal
 
 from geometry.models.common import DirectionMode, DirectionUnits, GeoObject
+from geometry.utils.constants import EPS_VOLUME
 
 
 @dataclass
@@ -63,7 +66,7 @@ class Cylinder(GeoObject):
     base_center_id: str
     radius: float
     height: float
-    axis_mode: str
+    axis_mode: Literal["vertical", "inclined"]
     axis_azimuth: float
     axis_elevation: float
     direction_mode: DirectionMode
@@ -71,3 +74,15 @@ class Cylinder(GeoObject):
     line_color: str
     fill_color: str
     type: str = field(init=False, default="cylinder")
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.radius <= EPS_VOLUME:
+            raise ValueError(f"Cylinder.radius must be > 0; got {self.radius!r}")
+        if self.height <= EPS_VOLUME:
+            raise ValueError(f"Cylinder.height must be > 0; got {self.height!r}")
+        if self.axis_mode == "inclined" and not 0.0 < self.axis_elevation <= math.pi / 2:
+            raise ValueError(
+                f"Cylinder.axis_elevation must be in (0, π/2] for an inclined "
+                f"cylinder; got {self.axis_elevation!r}"
+            )
