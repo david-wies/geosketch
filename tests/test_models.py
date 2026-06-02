@@ -38,6 +38,7 @@ from geometry.models import (
     Tangent,
     Vector,
 )
+from geometry.utils.constants import EPS_DISTANCE
 
 SUBCLASS_TYPES = [
     (Point, "point"),
@@ -507,6 +508,26 @@ def _line_kwargs(**overrides) -> dict:
     return base
 
 
+def _tangent_kwargs(**overrides) -> dict:
+    base = {
+        "id": "tg_001",
+        "name": "T",
+        "alpha": 1.0,
+        "visibility": True,
+        "shape_id": "ci_001",
+        "shape_type": "circle",
+        "point_id": "pt_004",
+        "direction": 2.356,
+        "elevation": 0.0,
+        "direction_mode": DirectionMode.AZIMUTH,
+        "direction_units": DirectionUnits.RADIANS,
+        "line_color": "#00ff66",
+        "fill_color": "#00ff66",
+    }
+    base.update(overrides)
+    return base
+
+
 def test_ball_rejects_non_positive_radius():
     with pytest.raises(ValueError, match="radius"):
         Ball(**_ball_kwargs(radius=0.0))
@@ -558,6 +579,80 @@ def test_elevated_object_rejects_out_of_range_elevation():
         Line(**_line_kwargs(elevation=-math.pi))
 
 
+def test_elevated_object_accepts_elevation_boundaries():
+    # ±π/2 ("straight up"/"straight down") are valid — guards a fence-post
+    # change from <= to < silently rejecting vertical directions.
+    for boundary in (math.pi / 2, -math.pi / 2):
+        line = Line(**_line_kwargs(elevation=boundary))
+        assert line.elevation == boundary
+
+
+def test_elevated_object_rejects_non_finite_direction():
+    for bad in (math.nan, math.inf, -math.inf):
+        with pytest.raises(ValueError, match="direction"):
+            Line(**_line_kwargs(direction=bad))
+
+
+def test_ball_rejects_non_finite_radius():
+    for bad in (math.inf, math.nan):
+        with pytest.raises(ValueError, match="radius"):
+            Ball(**_ball_kwargs(radius=bad))
+
+
+def test_ball_rejects_radius_at_distance_floor():
+    # radius must be strictly greater than the linear tolerance EPS_DISTANCE.
+    with pytest.raises(ValueError, match="radius"):
+        Ball(**_ball_kwargs(radius=EPS_DISTANCE))
+
+
+def test_cylinder_rejects_non_finite_radius_and_height():
+    for bad in (math.inf, math.nan):
+        with pytest.raises(ValueError, match="radius"):
+            Cylinder(**_cylinder_kwargs(radius=bad))
+        with pytest.raises(ValueError, match="height"):
+            Cylinder(**_cylinder_kwargs(height=bad))
+
+
+def test_cylinder_rejects_radius_at_distance_floor():
+    with pytest.raises(ValueError, match="radius"):
+        Cylinder(**_cylinder_kwargs(radius=EPS_DISTANCE))
+
+
+def test_cylinder_rejects_invalid_axis_mode():
+    with pytest.raises(ValueError, match="axis_mode"):
+        Cylinder(**_cylinder_kwargs(axis_mode="diagonal"))
+
+
+def test_cylinder_vertical_rejects_wrong_axis_elevation():
+    # A vertical cylinder must store axis_elevation = π/2 exactly.
+    with pytest.raises(ValueError, match="axis_elevation"):
+        Cylinder(**_cylinder_kwargs(axis_mode="vertical", axis_elevation=0.0))
+
+
+def test_cylinder_vertical_rejects_nonzero_axis_azimuth():
+    with pytest.raises(ValueError, match="axis_azimuth"):
+        Cylinder(
+            **_cylinder_kwargs(axis_mode="vertical", axis_azimuth=1.0, axis_elevation=math.pi / 2)
+        )
+
+
+def test_cylinder_inclined_accepts_vertical_axis_elevation_boundary():
+    # π/2 is the inclusive upper bound of the inclined (0, π/2] range.
+    cy = Cylinder(**_cylinder_kwargs(axis_mode="inclined", axis_elevation=math.pi / 2))
+    assert cy.axis_elevation == math.pi / 2
+
+
+def test_tangent_rejects_invalid_shape_type():
+    with pytest.raises(ValueError, match="shape_type"):
+        Tangent(**_tangent_kwargs(shape_type="polygon"))
+
+
+def test_tangent_circle_rejects_nonzero_elevation():
+    # Circle tangents are always horizontal; a non-zero elevation is rejected.
+    with pytest.raises(ValueError, match="elevation"):
+        Tangent(**_tangent_kwargs(shape_type="circle", elevation=0.5))
+
+
 # ---------------------------------------------------------------------------
 # SlicePlane (ephemeral, not a GeoObject)
 # ---------------------------------------------------------------------------
@@ -589,10 +684,18 @@ def test_slice_plane_not_geo_object():
 
 def test_slice_plane_custom_mode():
     # The fourth mode ("custom") must construct without error when the normal
-    # vector is non-zero.
-    sp = SlicePlane(mode="custom", a=1.0, b=1.0, c=1.0, d=50.0)
+    # vector is unit-length (the UI normalises before constructing).
+    unit = 1.0 / math.sqrt(3.0)
+    sp = SlicePlane(mode="custom", a=unit, b=unit, c=unit, d=50.0)
     assert sp.mode == "custom"
     assert sp.thickness == 0.0
+
+
+def test_slice_plane_custom_rejects_non_unit_normal():
+    # A non-unit normal silently changes the effective slab thickness, so the
+    # Custom-mode inclusion test requires a unit normal.
+    with pytest.raises(ValueError, match="unit-length"):
+        SlicePlane(mode="custom", a=1.0, b=1.0, c=1.0, d=50.0)
 
 
 def test_slice_plane_rejects_invalid_mode():

@@ -17,6 +17,8 @@ from typing import Literal
 
 from geometry.models.common import ElevatedObject
 
+_VALID_SHAPE_TYPES = frozenset({"circle", "ball"})
+
 
 @dataclass
 class Tangent(ElevatedObject):
@@ -61,3 +63,12 @@ class Tangent(ElevatedObject):
     line_color: str
     fill_color: str
     type: str = field(init=False, default="tangent")
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.shape_type not in _VALID_SHAPE_TYPES:
+            raise ValueError(
+                f"Tangent.shape_type must be 'circle' or 'ball'; got {self.shape_type!r}"
+            )
+        if self.shape_type == "circle" and self.elevation != 0.0:
+            raise ValueError(f"Tangent to a Circle must have elevation=0.0; got {self.elevation!r}")

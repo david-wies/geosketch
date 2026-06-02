@@ -17,7 +17,9 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from geometry.models.common import DirectionMode, DirectionUnits, GeoObject
-from geometry.utils.constants import EPS_VOLUME
+from geometry.utils.constants import EPS_DISTANCE
+
+_VALID_AXIS_MODES = frozenset({"vertical", "inclined"})
 
 
 @dataclass
@@ -37,11 +39,14 @@ class Cylinder(GeoObject):
     base_center_id : str
         ID of the Point at the center of the base circular face.
     radius : float
-        Radius in metres; must be > 0.
+        Radius in metres; must be finite and greater than ``EPS_DISTANCE``
+        (a linear dimension, so the linear tolerance applies).
     height : float
-        Length of the cylinder along its axis in metres; must be > 0.
+        Length of the cylinder along its axis in metres; must be finite and
+        greater than ``EPS_DISTANCE``.
     axis_mode : str
-        ``"vertical"`` or ``"inclined"``.
+        ``"vertical"`` or ``"inclined"``. A vertical cylinder must store
+        ``axis_azimuth = 0.0`` and ``axis_elevation = π/2``.
     axis_azimuth : float
         Horizontal bearing of the axis in radians (stored as 0.0 when vertical).
     axis_elevation : float
@@ -77,12 +82,30 @@ class Cylinder(GeoObject):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if self.radius <= EPS_VOLUME:
-            raise ValueError(f"Cylinder.radius must be > 0; got {self.radius!r}")
-        if self.height <= EPS_VOLUME:
-            raise ValueError(f"Cylinder.height must be > 0; got {self.height!r}")
+        if self.axis_mode not in _VALID_AXIS_MODES:
+            raise ValueError(
+                f"Cylinder.axis_mode must be 'vertical' or 'inclined'; got {self.axis_mode!r}"
+            )
+        if not math.isfinite(self.radius) or self.radius <= EPS_DISTANCE:
+            raise ValueError(
+                f"Cylinder.radius must be finite and > {EPS_DISTANCE}; got {self.radius!r}"
+            )
+        if not math.isfinite(self.height) or self.height <= EPS_DISTANCE:
+            raise ValueError(
+                f"Cylinder.height must be finite and > {EPS_DISTANCE}; got {self.height!r}"
+            )
         if self.axis_mode == "inclined" and not 0.0 < self.axis_elevation <= math.pi / 2:
             raise ValueError(
                 f"Cylinder.axis_elevation must be in (0, π/2] for an inclined "
                 f"cylinder; got {self.axis_elevation!r}"
+            )
+        if self.axis_mode == "vertical" and self.axis_elevation != math.pi / 2:
+            raise ValueError(
+                f"Cylinder.axis_elevation must be π/2 for a vertical cylinder; "
+                f"got {self.axis_elevation!r}"
+            )
+        if self.axis_mode == "vertical" and self.axis_azimuth != 0.0:
+            raise ValueError(
+                f"Cylinder.axis_azimuth must be 0.0 for a vertical cylinder; "
+                f"got {self.axis_azimuth!r}"
             )

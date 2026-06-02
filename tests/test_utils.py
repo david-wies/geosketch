@@ -41,10 +41,12 @@ from geometry.models.common import DirectionUnits
 from geometry.utils import (
     CANVAS_STALE,
     DEFINED_EVENTS,
+    EPS_ALTITUDE,
     EPS_ANGLE,
     EPS_AREA,
     EPS_DISTANCE,
     EPS_PARAM,
+    EPS_VOLUME,
     HISTORY_CHANGED,
     OBJECT_CREATED,
     OBJECT_DELETED,
@@ -74,6 +76,8 @@ def test_eps_constants_match_spec():
     assert EPS_ANGLE == 1e-9
     assert EPS_AREA == 1e-9
     assert EPS_PARAM == 1e-9
+    assert EPS_ALTITUDE == 1e-6
+    assert EPS_VOLUME == 1e-9
 
 
 # ---------------------------------------------------------------------------

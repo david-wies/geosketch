@@ -194,8 +194,11 @@ def test_horizontal_unit_vector_angle_north():
 @pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
 def test_horizontal_unit_vector_rejects_non_finite_direction(bad):
     # A corrupted (e.g. malformed-JSON) direction must fail loud here rather
-    # than propagate a [nan, nan] vector that silently poisons callers.
-    ray = _ray("ry", "o", bad)
+    # than propagate a [nan, nan] vector that silently poisons callers. The
+    # model now rejects a non-finite direction at construction, so bypass the
+    # constructor to exercise the function's own defense-in-depth guard.
+    ray = _ray("ry", "o", 0.0)
+    ray.direction = bad
     with pytest.raises(ValueError, match="finite"):
         geo.horizontal_unit_vector(ray)
 
@@ -734,3 +737,15 @@ def test_vector_endpoint_elevation_shortens_horizontal_reach():
     assert end[0] == pytest.approx(length * math.cos(el))  # ~7.071 (not 10)
     assert end[1] == pytest.approx(0.0)
     assert end[2] == pytest.approx(length * math.sin(el))  # ~7.071
+
+
+def test_vector_endpoint_adds_origin_offset_including_altitude():
+    # Endpoint is the origin plus the displacement; a non-zero origin (with a
+    # non-zero altitude) must shift all three components. Azimuth East at
+    # el=pi/6 so easting and altitude both pick up the offset.
+    origin = _pt("o", 100.0, 200.0, 30.0)
+    length, el = 10.0, math.pi / 6
+    end = geo.vector_endpoint(origin, length, math.pi / 2, el)
+    assert end[0] == pytest.approx(100.0 + length * math.cos(el))
+    assert end[1] == pytest.approx(200.0)
+    assert end[2] == pytest.approx(30.0 + length * math.sin(el))

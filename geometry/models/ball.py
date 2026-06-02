@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 
 from geometry.models.common import GeoObject
-from geometry.utils.constants import EPS_VOLUME
+from geometry.utils.constants import EPS_DISTANCE
 
 
 @dataclass
@@ -27,7 +28,8 @@ class Ball(GeoObject):
     center_id : str
         ID of the Point at the geometric center of the sphere.
     radius : float
-        Radius in metres; must be > 0.
+        Radius in metres; must be finite and greater than ``EPS_DISTANCE``
+        (radius is a linear dimension, so the linear tolerance applies).
     line_color : str
         Wireframe/stroke color.
     fill_color : str
@@ -48,5 +50,7 @@ class Ball(GeoObject):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if self.radius <= EPS_VOLUME:
-            raise ValueError(f"Ball.radius must be > 0; got {self.radius!r}")
+        if not math.isfinite(self.radius) or self.radius <= EPS_DISTANCE:
+            raise ValueError(
+                f"Ball.radius must be finite and > {EPS_DISTANCE}; got {self.radius!r}"
+            )

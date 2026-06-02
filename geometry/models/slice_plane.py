@@ -12,9 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 
+from geometry.utils.constants import EPS_DISTANCE
+
 _VALID_MODES = frozenset({"horizontal", "easting", "northing", "custom"})
+
+# Squared-magnitude floor below which the normal (a, b, c) is treated as the
+# degenerate zero vector. Expressed via the linear metric tolerance so it stays
+# in lockstep with the rest of the engine rather than a bare literal.
+_EPS_NORMAL_SQ: float = EPS_DISTANCE**2
+
+# Tolerance on |‖(a, b, c)‖² − 1| for the Custom-mode unit-normal check. The
+# inclusion test is only metrically meaningful when the normal is unit-length.
+_EPS_UNIT_NORMAL: float = EPS_DISTANCE
 
 
 @dataclass
@@ -69,5 +81,11 @@ class SlicePlane:
             )
         if self.thickness < 0:
             raise ValueError(f"SlicePlane.thickness must be >= 0; got {self.thickness!r}")
-        if self.a**2 + self.b**2 + self.c**2 < 1e-24:
+        mag_sq = self.a**2 + self.b**2 + self.c**2
+        if mag_sq < _EPS_NORMAL_SQ:
             raise ValueError("SlicePlane normal (a, b, c) must not be the zero vector")
+        if self.mode == "custom" and abs(mag_sq - 1.0) > _EPS_UNIT_NORMAL:
+            raise ValueError(
+                f"SlicePlane normal (a, b, c) must be unit-length for custom mode; "
+                f"got magnitude {math.sqrt(mag_sq):.6f}"
+            )
