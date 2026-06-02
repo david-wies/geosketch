@@ -111,18 +111,15 @@ def _xy(point: Point) -> np.ndarray:
     return np.array([point.easting, point.northing], dtype=np.float64)
 
 
-def _delta(a: Point, b: Point) -> tuple[np.float64, np.float64]:
-    """Return ``(Δeasting, Δnorthing)`` from ``a`` to ``b`` as ``float64``.
+def _delta(a: Point, b: Point) -> tuple[float, float]:
+    """Return ``(Δeasting, Δnorthing)`` from ``a`` to ``b``.
 
     Centralises the ``b - a`` component subtraction used directly by
     :func:`azimuth` and :func:`distance` (and indirectly by
     :func:`tangent_direction` via :func:`azimuth`) so the easting-first
     convention lives in exactly one place.
     """
-    return (
-        np.float64(b.easting) - np.float64(a.easting),
-        np.float64(b.northing) - np.float64(a.northing),
-    )
+    return (b.easting - a.easting, b.northing - a.northing)
 
 
 def _cross2d(u: np.ndarray, v: np.ndarray) -> np.float64:
@@ -131,7 +128,7 @@ def _cross2d(u: np.ndarray, v: np.ndarray) -> np.float64:
     Used instead of ``np.cross`` because NumPy 2.x deprecated the 2-D form of
     ``np.cross``; the explicit determinant is identical and warning-free.
     """
-    return np.float64(u[0] * v[1] - u[1] * v[0])
+    return u[0] * v[1] - u[1] * v[0]
 
 
 def _unit(v: np.ndarray) -> np.ndarray | None:
@@ -226,8 +223,8 @@ def distance(pt_a: Point, pt_b: Point) -> np.float64:
         3-D Euclidean distance in metres.
     """
     d_e, d_n = _delta(pt_a, pt_b)
-    d_z = np.float64(pt_b.altitude) - np.float64(pt_a.altitude)
-    return np.float64(np.sqrt(d_e**2 + d_n**2 + d_z**2))
+    d_z = pt_b.altitude - pt_a.altitude
+    return np.sqrt(d_e**2 + d_n**2 + d_z**2)
 
 
 # ---------------------------------------------------------------------------
@@ -275,23 +272,18 @@ def is_convex(polygon: Polygon, points: Mapping[str, Point]) -> bool:
     coords = _polygon_coords(polygon, points)
     if len(coords) < 3:
         return False
-    edges = np.roll(coords, -1, axis=0) - coords  # edge[i] = V[i+1] - V[i]
-    units = [_unit(edge) for edge in edges]
-    n_edges = len(units)
-    saw_positive = False
-    saw_negative = False
-    for i, u in enumerate(units):
-        v = units[(i + 1) % n_edges]
-        if u is None or v is None:
-            continue  # zero-length edge (duplicate vertex) — no turn to classify
-        cross = _cross2d(u, v)
-        if cross > EPS_ANGLE:
-            saw_positive = True
-        elif cross < -EPS_ANGLE:
-            saw_negative = True
-        if saw_positive and saw_negative:
-            return False
-    return True
+    edges = np.roll(coords, -1, axis=0) - coords  # shape (N, 2)
+    norms = np.hypot(edges[:, 0], edges[:, 1])  # shape (N,)
+    valid = norms >= EPS_DISTANCE
+    safe_norms = np.where(valid, norms, 1.0)  # avoid divide-by-zero in invalid rows
+    unit_e = np.where(valid, edges[:, 0] / safe_norms, 0.0)
+    unit_n = np.where(valid, edges[:, 1] / safe_norms, 0.0)
+    # cross[i] = 2D cross product of unit_edge[i] with unit_edge[i+1]
+    crosses = unit_e * np.roll(unit_n, -1) - unit_n * np.roll(unit_e, -1)
+    sig = crosses[valid & np.roll(valid, -1)]
+    has_pos = bool(np.any(sig > EPS_ANGLE))
+    has_neg = bool(np.any(sig < -EPS_ANGLE))
+    return not (has_pos and has_neg)
 
 
 def convex_hull(polygon: Polygon, points: Mapping[str, Point], new_id: str) -> Polygon:
@@ -403,7 +395,7 @@ def line_intersection(line_a: Line, line_b: Line, points: Mapping[str, Point]) -
 
     Each line is treated as the infinite line through its two defining points.
     The intersection is found by the parametric solve
-    ``A1 + t·d1 == A2 + s·d2`` via :func:`numpy.linalg.solve`. Parallelism is
+    ``A1 + t·d1 == A2 + s·d2`` via Cramer's rule on the 2×2 system. Parallelism is
     tested by :func:`_are_parallel`, which normalises both directions to
     **unit** vectors before taking the cross product, so the comparison is
     ``|sin θ|`` against :data:`EPS_ANGLE` — a genuine angular tolerance that
@@ -423,10 +415,10 @@ def line_intersection(line_a: Line, line_b: Line, points: Mapping[str, Point]) -
     d2 = b2 - a2
     if _are_parallel(d1, d2):
         return None
-    # Columns: [d1, -d2] · [t, s]^T = a2 - a1
-    matrix = np.array([[d1[0], -d2[0]], [d1[1], -d2[1]]], dtype=np.float64)
+    # Solve [d1, -d2] · [t, s]^T = (a2 - a1) via Cramer's rule.
     rhs = a2 - a1
-    t, _s = np.linalg.solve(matrix, rhs)
+    det = d2[0] * d1[1] - d1[0] * d2[1]
+    t = (d2[0] * rhs[1] - rhs[0] * d2[1]) / det
     return a1 + t * d1
 
 
@@ -495,11 +487,16 @@ def _extended_line(
 
 def _edge_crossings(long_line: shapely.LineString, coords: np.ndarray) -> list[np.ndarray]:
     """Collect every point where ``long_line`` meets a polygon edge of ``coords``."""
-    hits: list[np.ndarray] = []
     n = len(coords)
-    for i, vertex in enumerate(coords):
-        edge = shapely.LineString([vertex, coords[(i + 1) % n]])
-        hits.extend(_collect_points(shapely.intersection(long_line, edge)))
+    ends = np.roll(coords, -1, axis=0)
+    # Build all N edge geometries in one batch call (Shapely 2.x vectorised API).
+    coord_seq = np.stack([coords, ends], axis=1).reshape(-1, 2)
+    idx = np.repeat(np.arange(n), 2)
+    edges_geom = shapely.linestrings(coord_seq, indices=idx)
+    results = shapely.intersection(long_line, edges_geom)
+    hits: list[np.ndarray] = []
+    for geom in results[~shapely.is_empty(results)]:
+        hits.extend(_collect_points(geom))
     return hits
 
 
@@ -579,9 +576,11 @@ def _ray_edge_t(origin: np.ndarray, unit: np.ndarray, a: np.ndarray, b: np.ndarr
     edge = b - a
     if _are_parallel(unit, edge):
         return None  # ray parallel to this edge
-    # Solve origin + t*unit = a + s*edge  ->  [unit, -edge] · [t, s] = a - origin
-    matrix = np.array([[unit[0], -edge[0]], [unit[1], -edge[1]]], dtype=np.float64)
-    t, s = np.linalg.solve(matrix, a - origin)
+    # Solve [unit, -edge] · [t, s]^T = (a - origin) via Cramer's rule.
+    rhs = a - origin
+    det = edge[0] * unit[1] - unit[0] * edge[1]
+    t = (edge[0] * rhs[1] - rhs[0] * edge[1]) / det
+    s = (unit[0] * rhs[1] - rhs[0] * unit[1]) / det
     if t >= -EPS_DISTANCE and -EPS_PARAM <= s <= 1.0 + EPS_PARAM:
         return max(0.0, float(t))
     return None
@@ -703,7 +702,7 @@ def tangent_direction(center: Point, point: Point) -> np.float64:
         fiction, so this raises instead.
     """
     d_e, d_n = _delta(center, point)
-    if float(np.hypot(d_e, d_n)) < EPS_DISTANCE:
+    if math.hypot(d_e, d_n) < EPS_DISTANCE:
         raise ValueError(
             "tangent_direction: center and circumference point are coincident; "
             "a zero-radius circle has no tangent"
@@ -764,12 +763,16 @@ def vector_endpoint(origin: Point, length: float, az: float, el: float = 0.0) ->
     array; callers passing values from an untrusted source must check them
     before calling.
     """
-    length, az, el = np.float64(length), np.float64(az), np.float64(el)
+    sin_az = math.sin(az)
+    cos_az = math.cos(az)
+    sin_el = math.sin(el)
+    cos_el = math.cos(el)
+    h = length * cos_el
     return np.array(
         [
-            np.float64(origin.easting) + length * np.sin(az) * np.cos(el),
-            np.float64(origin.northing) + length * np.cos(az) * np.cos(el),
-            np.float64(origin.altitude) + length * np.sin(el),
+            origin.easting + h * sin_az,
+            origin.northing + h * cos_az,
+            origin.altitude + length * sin_el,
         ],
         dtype=np.float64,
     )
