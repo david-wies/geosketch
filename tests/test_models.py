@@ -38,7 +38,7 @@ from geometry.models import (
     Tangent,
     Vector,
 )
-from geometry.utils.constants import EPS_DISTANCE
+from geometry.utils.constants import EPS_ANGLE, EPS_DISTANCE
 
 SUBCLASS_TYPES = [
     (Point, "point"),
@@ -653,6 +653,141 @@ def test_tangent_circle_rejects_nonzero_elevation():
         Tangent(**_tangent_kwargs(shape_type="circle", elevation=0.5))
 
 
+def test_tangent_circle_accepts_near_zero_elevation_within_tolerance():
+    # The horizontal check uses the angular tolerance, so a value 1 ULP off 0.0
+    # (e.g. from radians(0.0) round-trips) must not be wrongly rejected.
+    tg = Tangent(**_tangent_kwargs(shape_type="circle", elevation=EPS_ANGLE / 2))
+    assert tg.shape_type == "circle"
+
+
+# ---------------------------------------------------------------------------
+# Point: altitude default and coordinate finiteness
+# ---------------------------------------------------------------------------
+
+
+def test_point_altitude_defaults_to_zero():
+    # Spec §1: altitude defaults to 0.0 when omitted, so the loader need not
+    # inject it before construction.
+    pt = Point(
+        id="pt_001",
+        name="A",
+        alpha=1.0,
+        visibility=True,
+        easting=1.0,
+        northing=2.0,
+        color="#000000",
+    )
+    assert pt.altitude == 0.0
+
+
+def test_point_rejects_non_finite_coordinates():
+    for field_name in ("easting", "northing", "altitude"):
+        for bad in (math.nan, math.inf, -math.inf):
+            kwargs = {
+                "id": "pt_001",
+                "name": "A",
+                "alpha": 1.0,
+                "visibility": True,
+                "easting": 1.0,
+                "northing": 2.0,
+                "altitude": 3.0,
+                "color": "#000000",
+            }
+            kwargs[field_name] = bad
+            with pytest.raises(ValueError, match=field_name):
+                Point(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Circle: radius validation parity with Ball/Cylinder
+# ---------------------------------------------------------------------------
+
+
+def _circle_kwargs(**overrides) -> dict:
+    base = {
+        "id": "ci_001",
+        "name": "C",
+        "alpha": 1.0,
+        "visibility": True,
+        "center_id": "pt_001",
+        "radius": 10.0,
+        "line_color": "#000000",
+        "fill_color": "#ffffff",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_circle_rejects_non_positive_radius():
+    with pytest.raises(ValueError, match="radius"):
+        Circle(**_circle_kwargs(radius=0.0))
+    with pytest.raises(ValueError, match="radius"):
+        Circle(**_circle_kwargs(radius=-5.0))
+
+
+def test_circle_rejects_non_finite_radius():
+    for bad in (math.inf, math.nan):
+        with pytest.raises(ValueError, match="radius"):
+            Circle(**_circle_kwargs(radius=bad))
+
+
+def test_circle_rejects_radius_at_distance_floor():
+    with pytest.raises(ValueError, match="radius"):
+        Circle(**_circle_kwargs(radius=EPS_DISTANCE))
+
+
+# ---------------------------------------------------------------------------
+# Cylinder: axis-angle finiteness, tolerance, and inclined range additions
+# ---------------------------------------------------------------------------
+
+
+def test_cylinder_inclined_rejects_non_finite_axis_azimuth():
+    for bad in (math.nan, math.inf, -math.inf):
+        with pytest.raises(ValueError, match="axis_azimuth"):
+            Cylinder(**_cylinder_kwargs(axis_mode="inclined", axis_azimuth=bad, axis_elevation=0.5))
+
+
+def test_cylinder_inclined_rejects_negative_axis_elevation():
+    # The lower side of the (0, π/2] inclined range was previously unexercised.
+    with pytest.raises(ValueError, match="axis_elevation"):
+        Cylinder(**_cylinder_kwargs(axis_mode="inclined", axis_elevation=-0.1))
+
+
+def test_cylinder_vertical_accepts_axis_angles_within_tolerance():
+    # A vertical cylinder whose axis_elevation/axis_azimuth land within EPS_ANGLE
+    # of π/2 and 0.0 (e.g. from radians(90.0)) must construct, not be rejected.
+    cy = Cylinder(
+        **_cylinder_kwargs(
+            axis_mode="vertical",
+            axis_azimuth=EPS_ANGLE / 2,
+            axis_elevation=math.pi / 2 - EPS_ANGLE / 2,
+        )
+    )
+    assert cy.axis_mode == "vertical"
+
+
+# ---------------------------------------------------------------------------
+# Solid: Point-ID layer rule (spec §10)
+# ---------------------------------------------------------------------------
+
+
+def test_solid_rejects_multiple_point_layers():
+    with pytest.raises(ValueError, match="at most one Point ID"):
+        Solid(**_solid_kwargs(layers=["pt_001", "pg_001", "pt_002"]))
+
+
+def test_solid_rejects_interior_point_layer():
+    with pytest.raises(ValueError, match="first or last"):
+        Solid(**_solid_kwargs(layers=["pg_001", "pt_001", "pg_002"]))
+
+
+def test_solid_accepts_point_as_first_or_last_layer():
+    first = Solid(**_solid_kwargs(layers=["pt_001", "pg_001", "pg_002"]))
+    assert first.layers[0] == "pt_001"
+    last = Solid(**_solid_kwargs(layers=["pg_001", "pg_002", "pt_001"]))
+    assert last.layers[-1] == "pt_001"
+
+
 # ---------------------------------------------------------------------------
 # SlicePlane (ephemeral, not a GeoObject)
 # ---------------------------------------------------------------------------
@@ -711,6 +846,23 @@ def test_slice_plane_rejects_negative_thickness():
 def test_slice_plane_rejects_zero_normal():
     with pytest.raises(ValueError, match="zero vector"):
         SlicePlane(mode="custom", a=0.0, b=0.0, c=0.0, d=0.0)
+
+
+def test_slice_plane_rejects_non_finite_coefficients():
+    # nan/inf slip past ``< 0`` and the magnitude check, silently degrading the
+    # inclusion test to all-excluded or all-included — they must raise instead.
+    for field_name in ("a", "b", "c", "d"):
+        for bad in (math.nan, math.inf, -math.inf):
+            kwargs = {"mode": "horizontal", "a": 0.0, "b": 0.0, "c": 1.0, "d": 10.0}
+            kwargs[field_name] = bad
+            with pytest.raises(ValueError, match=field_name):
+                SlicePlane(**kwargs)
+
+
+def test_slice_plane_rejects_non_finite_thickness():
+    for bad in (math.nan, math.inf):
+        with pytest.raises(ValueError, match="thickness"):
+            SlicePlane(mode="horizontal", a=0.0, b=0.0, c=1.0, d=0.0, thickness=bad)
 
 
 # ---------------------------------------------------------------------------

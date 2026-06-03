@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 
 from geometry.models.common import GeoObject
+from geometry.utils.constants import EPS_DISTANCE
 
 
 @dataclass
@@ -26,7 +28,8 @@ class Circle(GeoObject):
     center_id : str
         ID of the centre point.
     radius : float
-        Radius in metres.
+        Radius in metres; must be finite and greater than ``EPS_DISTANCE``
+        (a linear dimension, matching the ``Ball``/``Cylinder`` guard).
     line_color : str
         Hex colour string for the outline stroke.
     fill_color : str
@@ -43,3 +46,10 @@ class Circle(GeoObject):
     line_color: str
     fill_color: str
     type: str = field(init=False, default="circle")
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not math.isfinite(self.radius) or self.radius <= EPS_DISTANCE:
+            raise ValueError(
+                f"Circle.radius must be finite and > {EPS_DISTANCE}; got {self.radius!r}"
+            )

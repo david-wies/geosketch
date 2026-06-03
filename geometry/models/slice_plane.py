@@ -41,7 +41,11 @@ class SlicePlane:
     presets. For Custom mode the UI must normalise before constructing this
     object (see ``EPS_ALTITUDE`` contract in ``spec/MVP.md``).
 
-    Inclusion test: ``|a·E + b·N + c·Z - d| ≤ EPS_ALTITUDE + thickness``.
+    Inclusion test:
+    ``|a·E + b·N + c·Z - d| / √(a²+b²+c²) ≤ EPS_ALTITUDE + thickness``.
+    The ``√(a²+b²+c²)`` denominator is 1 for the three axis-aligned presets and
+    for any correctly normalised Custom normal, but a slice-service implementer
+    must keep it to stay metric under a non-unit Custom normal.
 
     Fields
     ------
@@ -79,6 +83,15 @@ class SlicePlane:
             raise ValueError(
                 f"SlicePlane.mode must be one of the four documented modes; got {self.mode!r}"
             )
+        # Guard finiteness before the magnitude/thickness comparisons: nan and
+        # inf slip past ``< 0`` (both ``inf < 0`` and ``nan < 0`` are False) and
+        # would silently degrade the inclusion test to all-excluded or
+        # all-included rather than raising.
+        for name, value in (("a", self.a), ("b", self.b), ("c", self.c), ("d", self.d)):
+            if not math.isfinite(value):
+                raise ValueError(f"SlicePlane.{name} must be finite; got {value!r}")
+        if not math.isfinite(self.thickness):
+            raise ValueError(f"SlicePlane.thickness must be finite; got {self.thickness!r}")
         if self.thickness < 0:
             raise ValueError(f"SlicePlane.thickness must be >= 0; got {self.thickness!r}")
         mag_sq = self.a**2 + self.b**2 + self.c**2

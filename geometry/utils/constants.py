@@ -39,8 +39,10 @@ EPS_PARAM : float
     1e-9. Used for parametric ``t`` clipping on segment/line intersection
     where the parameter is dimensionless and lives roughly in [0, 1].
 EPS_ALTITUDE : float
-    1e-6 m. Slice-plane membership: ``|aE+bN+cZ−d| ≤ EPS_ALTITUDE + thickness``
-    when the plane normal is unit-length.
+    1e-6 m. Slice-plane membership:
+    ``|aE+bN+cZ−d| / √(a²+b²+c²) ≤ EPS_ALTITUDE + thickness``. The denominator
+    is 1 when the plane normal is unit-length (the three presets and a
+    normalised Custom normal) but must be retained for a non-unit normal.
 EPS_VOLUME : float
     1e-9 m³. Solid/Ball/Cylinder degeneracy: ``|volume| < EPS_VOLUME`` rejects,
     analogous to EPS_AREA for 2-D polygons.

@@ -749,3 +749,12 @@ def test_vector_endpoint_adds_origin_offset_including_altitude():
     assert end[0] == pytest.approx(100.0 + length * math.cos(el))
     assert end[1] == pytest.approx(200.0)
     assert end[2] == pytest.approx(30.0 + length * math.sin(el))
+
+
+def test_vector_endpoint_negative_elevation_points_down():
+    # A negative elevation must drive Z below the origin (guards against an
+    # ``abs(sin(el))`` regression that would flip downward vectors upward).
+    length, el = 10.0, -math.pi / 6
+    end = geo.vector_endpoint(_pt("o", 0, 0, 5.0), length, math.pi / 2, el)
+    assert end[2] == pytest.approx(5.0 + length * math.sin(el))
+    assert end[2] < 5.0

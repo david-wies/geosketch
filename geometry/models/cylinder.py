@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from geometry.models.common import DirectionMode, DirectionUnits, GeoObject
-from geometry.utils.constants import EPS_DISTANCE
+from geometry.utils.constants import EPS_ANGLE, EPS_DISTANCE
 
 _VALID_AXIS_MODES = frozenset({"vertical", "inclined"})
 
@@ -94,17 +94,23 @@ class Cylinder(GeoObject):
             raise ValueError(
                 f"Cylinder.height must be finite and > {EPS_DISTANCE}; got {self.height!r}"
             )
+        # Guard both axis angles for finiteness before the mode-specific range
+        # checks, mirroring ElevatedObject's treatment of direction/elevation.
+        if not math.isfinite(self.axis_azimuth):
+            raise ValueError(f"Cylinder.axis_azimuth must be finite; got {self.axis_azimuth!r}")
+        if not math.isfinite(self.axis_elevation):
+            raise ValueError(f"Cylinder.axis_elevation must be finite; got {self.axis_elevation!r}")
         if self.axis_mode == "inclined" and not 0.0 < self.axis_elevation <= math.pi / 2:
             raise ValueError(
                 f"Cylinder.axis_elevation must be in (0, π/2] for an inclined "
                 f"cylinder; got {self.axis_elevation!r}"
             )
-        if self.axis_mode == "vertical" and self.axis_elevation != math.pi / 2:
+        if self.axis_mode == "vertical" and abs(self.axis_elevation - math.pi / 2) > EPS_ANGLE:
             raise ValueError(
                 f"Cylinder.axis_elevation must be π/2 for a vertical cylinder; "
                 f"got {self.axis_elevation!r}"
             )
-        if self.axis_mode == "vertical" and self.axis_azimuth != 0.0:
+        if self.axis_mode == "vertical" and abs(self.axis_azimuth) > EPS_ANGLE:
             raise ValueError(
                 f"Cylinder.axis_azimuth must be 0.0 for a vertical cylinder; "
                 f"got {self.axis_azimuth!r}"

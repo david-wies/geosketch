@@ -51,4 +51,20 @@ class Solid(GeoObject):
         super().__post_init__()
         self.layers = list(self.layers)
         if len(self.layers) < 2:
-            raise ValueError("Solid requires at least 2 layer polygon IDs")
+            raise ValueError(
+                "Solid requires at least 2 layer IDs (Polygon, plus optional apex Point)"
+            )
+        # Per spec §10: at most one layer may be a Point ID (the apex/nadir),
+        # and it must be the first or last element. Both sub-rules are decidable
+        # from the ``pt_`` ID prefix alone — no cross-object lookup needed.
+        point_indices = [i for i, layer_id in enumerate(self.layers) if layer_id.startswith("pt_")]
+        if len(point_indices) > 1:
+            raise ValueError(
+                f"Solid layers may contain at most one Point ID (apex/nadir); "
+                f"got {len(point_indices)}: {[self.layers[i] for i in point_indices]}"
+            )
+        if point_indices and point_indices[0] not in (0, len(self.layers) - 1):
+            raise ValueError(
+                f"Solid apex/nadir Point ID must be the first or last layer; "
+                f"got {self.layers[point_indices[0]]!r} at index {point_indices[0]}"
+            )

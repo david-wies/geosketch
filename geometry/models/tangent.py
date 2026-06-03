@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from geometry.models.common import ElevatedObject
+from geometry.utils.constants import EPS_ANGLE
 
 _VALID_SHAPE_TYPES = frozenset({"circle", "ball"})
 
@@ -70,5 +71,5 @@ class Tangent(ElevatedObject):
             raise ValueError(
                 f"Tangent.shape_type must be 'circle' or 'ball'; got {self.shape_type!r}"
             )
-        if self.shape_type == "circle" and self.elevation != 0.0:
+        if self.shape_type == "circle" and abs(self.elevation) > EPS_ANGLE:
             raise ValueError(f"Tangent to a Circle must have elevation=0.0; got {self.elevation!r}")

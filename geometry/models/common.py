@@ -88,6 +88,12 @@ class GeoObject:
 class ElevatedObject(GeoObject):
     """Abstract intermediate base for the four direction-bearing geometry types.
 
+    "Elevated" names the distinguishing trait of this base: beyond a horizontal
+    ``direction``, each subclass also carries a vertical ``elevation`` angle, so
+    its bearing can point out of the horizontal plane (renamed from
+    ``DirectedObject`` to make that 3-D capability explicit). ``Line``, ``Ray``,
+    ``Vector``, and ``Tangent`` are the four "direction-bearing" subclasses.
+
     ``ElevatedObject`` is not instantiable on its own — like ``GeoObject``,
     it is an abstract base whose only purpose is to share the four
     direction-metadata fields (``direction``, ``elevation``,

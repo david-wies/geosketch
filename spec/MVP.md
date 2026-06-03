@@ -56,6 +56,7 @@ All comparisons that involve floating-point geometry use named tolerances, not b
 | `EPS_AREA` | `1e-9` m² | signed-area sign check for CCW reorder |
 | `EPS_PARAM` | `1e-9` | parametric `t` clipping for segment/line intersection |
 | `EPS_ALTITUDE` | `1e-6` m | slice-plane membership test: `\|aE + bN + cZ − d\| / sqrt(a² + b² + c²) ≤ EPS_ALTITUDE + slab_thickness`. For the three axis-aligned presets the denominator equals 1. For Custom mode the UI must pre-normalize the coefficients so `sqrt(a² + b² + c²) = 1` before constructing `SlicePlane`; otherwise the effective tolerance widens by the normal's magnitude and points further from the plane than intended are silently included. |
+| `EPS_VOLUME` | `1e-9` m³ | 3D degeneracy check for Solid/Ball/Cylinder volume, analogous to `EPS_AREA` for 2D polygons: `\|volume\| < EPS_VOLUME` rejects. Forward-looking — the volume algorithms that consume it are not yet implemented. |
 
 Validation that a tangent point lies on its circle uses `|distance(point, center) - radius| < EPS_DISTANCE`. Parallel-line detection uses `|cross(d1, d2)| < EPS_ANGLE`.
 
@@ -820,6 +821,7 @@ Displays cursor coordinates in UTM format as the mouse moves over the active can
       "properties": {
         "origin_id": "pt_001",
         "direction": 1.5708,
+        "elevation": 0.0,
         "direction_mode": "azimuth",
         "direction_units": "radians"
       }
@@ -853,6 +855,50 @@ Displays cursor coordinates in UTM format as the mouse moves over the active can
       "properties": {
         "center_id": "pt_001",
         "radius": 50.0
+      }
+    },
+    {
+      "id": "ba_001",
+      "type": "ball",
+      "name": "Ball at A",
+      "line_color": "#3366FF",
+      "fill_color": "#99B3FF",
+      "alpha": 0.5,
+      "visibility": true,
+      "properties": {
+        "center_id": "pt_001",
+        "radius": 40.0
+      }
+    },
+    {
+      "id": "cy_001",
+      "type": "cylinder",
+      "name": "Vertical Cylinder",
+      "line_color": "#663399",
+      "fill_color": "#CC99FF",
+      "alpha": 0.5,
+      "visibility": true,
+      "properties": {
+        "base_center_id": "pt_002",
+        "radius": 25.0,
+        "height": 80.0,
+        "axis_mode": "vertical",
+        "axis_azimuth": 0.0,
+        "axis_elevation": 1.5708,
+        "direction_mode": "azimuth",
+        "direction_units": "radians"
+      }
+    },
+    {
+      "id": "so_001",
+      "type": "solid",
+      "name": "Pyramid ABC→apex",
+      "line_color": "#996633",
+      "fill_color": "#D9B38C",
+      "alpha": 0.6,
+      "visibility": true,
+      "properties": {
+        "layers": ["pg_001", "pt_004"]
       }
     },
     {
