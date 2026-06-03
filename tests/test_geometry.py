@@ -789,3 +789,11 @@ def test_vector_endpoint_negative_elevation_points_down():
     end = geo.vector_endpoint(_pt("o", 0, 0, 5.0), length, math.pi / 2, el)
     assert end[2] == pytest.approx(5.0 + length * math.sin(el))
     assert end[2] < 5.0
+
+
+def test_vector_endpoint_propagates_nan_silently():
+    # vector_endpoint carries no finiteness guard by design — non-finite
+    # arguments propagate into nan/inf components without raising. Callers
+    # from untrusted sources must validate before calling (see docstring).
+    end = geo.vector_endpoint(_pt("o", 0, 0), float("nan"), 0.0)
+    assert any(math.isnan(v) for v in end)

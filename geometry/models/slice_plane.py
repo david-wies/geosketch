@@ -24,8 +24,14 @@ _VALID_MODES = frozenset({"horizontal", "easting", "northing", "custom"})
 # in lockstep with the rest of the engine rather than a bare literal.
 _EPS_NORMAL_SQ: float = EPS_DISTANCE**2
 
-# Tolerance on |‖(a, b, c)‖² − 1| for the Custom-mode unit-normal check. The
-# inclusion test is only metrically meaningful when the normal is unit-length.
+# Tolerance on |‖(a, b, c)‖² − 1| for the Custom-mode unit-normal check.
+# This is a *dimensionless* numerical tolerance: the quantity (a²+b²+c²) − 1
+# has no units regardless of the units of the plane coefficients. The value
+# EPS_DISTANCE (1e-6) is reused here for numeric consistency with the rest of
+# the engine, not because the units match. For a nearly-unit vector,
+# |‖n‖² − 1| ≈ 2·|‖n‖ − 1|, so this threshold corresponds to a magnitude
+# error of roughly EPS_DISTANCE / 2 ≈ 5e-7 — tight enough for any
+# floating-point input the UI will produce.
 _EPS_UNIT_NORMAL: float = EPS_DISTANCE
 
 

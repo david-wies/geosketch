@@ -636,10 +636,17 @@ def test_cylinder_vertical_rejects_nonzero_axis_azimuth():
         )
 
 
-def test_cylinder_inclined_accepts_vertical_axis_elevation_boundary():
-    # π/2 is the inclusive upper bound of the inclined (0, π/2] range.
-    cy = Cylinder(**_cylinder_kwargs(axis_mode="inclined", axis_elevation=math.pi / 2))
-    assert cy.axis_elevation == math.pi / 2
+def test_cylinder_inclined_rejects_axis_elevation_at_vertical():
+    # axis_elevation = π/2 with axis_mode='inclined' is ambiguous: axis_azimuth
+    # would be meaningless for a vertical axis. The correct form is
+    # axis_mode='vertical'. Verify that the check catches the exact value and
+    # a value within EPS_ANGLE of π/2.
+    with pytest.raises(ValueError, match="vertical"):
+        Cylinder(**_cylinder_kwargs(axis_mode="inclined", axis_elevation=math.pi / 2))
+    with pytest.raises(ValueError, match="vertical"):
+        Cylinder(
+            **_cylinder_kwargs(axis_mode="inclined", axis_elevation=math.pi / 2 - EPS_ANGLE / 2)
+        )
 
 
 def test_tangent_rejects_invalid_shape_type():

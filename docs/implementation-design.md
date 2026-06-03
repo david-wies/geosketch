@@ -183,7 +183,7 @@ class Tangent(ElevatedObject):
     type: str = field(init=False, default="tangent")
 ```
 
-**`shape_type` drives dispatch**: services and validation pick the Circle-tangent vs Ball-tangent path on `shape_type` — `"circle"` → 2D horizontal tangent (`elevation = 0.0`); `"ball"` → 3D tangent perpendicular to the sphere radius (user-supplied `elevation`). The dep-graph edge is `Tangent → {shape_id, point_id}` for both. Since the project is pre-release, `circle_id` is removed everywhere — there is no compatibility path and no serializer migration to read it.
+**`shape_type` drives dispatch**: services and validation pick the Circle-tangent vs Ball-tangent path on `shape_type` — `"circle"` → 2D horizontal tangent (`elevation = 0.0`); `"ball"` → 3D tangent perpendicular to the sphere radius (user-supplied `elevation`). The dep-graph edge is `Tangent → {shape_id, point_id}` for both. The persistence layer **must** map a legacy `circle_id` key to `shape_id = circle_id, shape_type = "circle"` for backward compatibility — see the JSON migration note in `spec/MVP.md §9 (Tangent)` and the comment in `geometry/models/tangent.py`.
 
 ### 3.8 `geometry/models/polygon.py`
 
