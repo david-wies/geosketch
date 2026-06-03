@@ -884,7 +884,7 @@ Displays cursor coordinates in UTM format as the mouse moves over the active can
         "height": 80.0,
         "axis_mode": "vertical",
         "axis_azimuth": 0.0,
-        "axis_elevation": 1.5708,
+        "axis_elevation": 1.5707963267948966,
         "direction_mode": "azimuth",
         "direction_units": "radians"
       }
