@@ -58,6 +58,10 @@ class Tangent(ElevatedObject):
         inherited by all four direction-bearing types (Line, Ray, Vector, Tangent).
     """
 
+    # ``shape_id`` + ``shape_type`` replaced the pre-1.1 single ``circle_id``
+    # field. When the persistence layer is implemented, the loader must map a
+    # legacy ``circle_id`` key to ``shape_id = circle_id, shape_type = "circle"``
+    # — see the JSON migration note in spec/MVP.md §9 (Tangent).
     shape_id: str
     shape_type: Literal["circle", "ball"]
     point_id: str
