@@ -244,6 +244,37 @@ def test_is_convex_false_for_concave_arrow():
     assert geo.is_convex(poly, pts) is False
 
 
+def test_is_convex_false_for_concave_with_duplicate_at_reflex_vertex():
+    # A duplicated vertex at the reflex notch creates a zero-length edge that
+    # straddles the reflex turn. Pairing turns by raw index would mask that
+    # turn and wrongly report convex; compacting degenerate edges first keeps
+    # the polygon correctly classified as concave.
+    pts = {
+        "c0": _pt("c0", 0, 0),
+        "c1": _pt("c1", 4, 0),
+        "c2": _pt("c2", 2, 2),  # reflex notch
+        "c2b": _pt("c2b", 2, 2),  # exact duplicate of the notch vertex
+        "c3": _pt("c3", 4, 4),
+        "c4": _pt("c4", 0, 4),
+    }
+    poly = _poly("pg_cd", ["c0", "c1", "c2", "c2b", "c3", "c4"])
+    assert geo.is_convex(poly, pts) is False
+
+
+def test_is_convex_true_for_square_with_duplicate_vertex():
+    # A redundant duplicated vertex on a convex polygon must not flip the
+    # result to concave — the compaction drops the zero-length edge cleanly.
+    pts = {
+        "s0": _pt("s0", 0, 0),
+        "s1": _pt("s1", 2, 0),
+        "s1b": _pt("s1b", 2, 0),  # duplicate, mid-boundary
+        "s2": _pt("s2", 2, 2),
+        "s3": _pt("s3", 0, 2),
+    }
+    poly = _poly("pg_sd", ["s0", "s1", "s1b", "s2", "s3"])
+    assert geo.is_convex(poly, pts) is True
+
+
 def test_is_convex_false_for_cw_wound_concave():
     # Same arrowhead, but wound clockwise (reversed order). The sign of the
     # turns flips wholesale, yet a reflex vertex still produces a mixed sign,

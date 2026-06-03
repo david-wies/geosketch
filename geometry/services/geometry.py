@@ -261,8 +261,13 @@ def is_convex(polygon: Polygon, points: Mapping[str, Point]) -> bool:
     A polygon is convex iff every turn has the same orientation (all cross
     products non-negative or all non-positive); near-collinear triplets
     (``|sin θ| < EPS_ANGLE``) are ignored so that redundant boundary vertices
-    do not flip the result. Zero-length edges from duplicated vertices have no
-    direction and are skipped.
+    do not flip the result.
+
+    Zero-length edges from duplicated vertices have no direction and are
+    **compacted out before turns are paired**, not merely skipped index-wise.
+    Pairing by raw index would mask the turn that straddles a duplicated vertex
+    (the real turn spans the zero-length edge) and could misclassify a concave
+    polygon as convex; pairing consecutive *surviving* edges measures it.
 
     Returns
     -------
@@ -275,14 +280,17 @@ def is_convex(polygon: Polygon, points: Mapping[str, Point]) -> bool:
     edges = np.roll(coords, -1, axis=0) - coords  # shape (N, 2)
     norms = np.hypot(edges[:, 0], edges[:, 1])  # shape (N,)
     valid = norms >= EPS_DISTANCE
-    safe_norms = np.where(valid, norms, 1.0)  # avoid divide-by-zero in invalid rows
-    unit_e = np.where(valid, edges[:, 0] / safe_norms, 0.0)
-    unit_n = np.where(valid, edges[:, 1] / safe_norms, 0.0)
-    # cross[i] = 2D cross product of unit_edge[i] with unit_edge[i+1]
+    # Keep only real (non-degenerate) edge directions, in cyclic order, then
+    # pair *consecutive surviving* edges so a reflex turn hidden behind a
+    # duplicated vertex is still measured.
+    unit_e = edges[valid, 0] / norms[valid]
+    unit_n = edges[valid, 1] / norms[valid]
+    if unit_e.shape[0] < 3:
+        return False  # fewer than three real edges → degenerate, not convex
+    # cross[i] = 2D cross product of surviving unit_edge[i] with unit_edge[i+1]
     crosses = unit_e * np.roll(unit_n, -1) - unit_n * np.roll(unit_e, -1)
-    sig = crosses[valid & np.roll(valid, -1)]
-    has_pos = bool(np.any(sig > EPS_ANGLE))
-    has_neg = bool(np.any(sig < -EPS_ANGLE))
+    has_pos = bool(np.any(crosses > EPS_ANGLE))
+    has_neg = bool(np.any(crosses < -EPS_ANGLE))
     return not (has_pos and has_neg)
 
 
