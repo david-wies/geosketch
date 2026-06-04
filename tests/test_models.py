@@ -922,6 +922,15 @@ def _vector_kwargs(**overrides) -> dict:
     return base
 
 
+def test_vector_rejects_invalid_length():
+    # length is a linear dimension; non-finite, zero, negative, or values at/below
+    # the EPS_DISTANCE floor are degenerate and rejected — mirrors the
+    # Ball/Circle/Cylinder radius guards (strict ``> EPS_DISTANCE``).
+    for bad in (0.0, -5.0, EPS_DISTANCE, math.inf, math.nan):
+        with pytest.raises(ValueError, match="length"):
+            Vector(**_vector_kwargs(length=bad))
+
+
 def test_cylinder_rejects_height_at_distance_floor():
     # Mirror of test_cylinder_rejects_radius_at_distance_floor for height.
     with pytest.raises(ValueError, match="height"):
