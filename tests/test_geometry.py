@@ -723,6 +723,17 @@ def test_tangent_direction_rejects_coincident_zero_radius():
         geo.tangent_direction(_pt("c", 5, 5), coincident)
 
 
+def test_tangent_direction_coincidence_is_altitude_invariant():
+    # The coincidence test is purely horizontal (hypot of Δe, Δn): two points
+    # sharing (E, N) but differing in altitude have no horizontal separation
+    # and thus no defined azimuth, so they must still raise "zero-radius"
+    # rather than slip through on the altitude gap.
+    center = _pt("c", 5, 5, 0.0)
+    same_en_higher = _pt("p", 5, 5, 100.0)
+    with pytest.raises(ValueError, match="zero-radius"):
+        geo.tangent_direction(center, same_en_higher)
+
+
 # ---------------------------------------------------------------------------
 # vector endpoint
 # ---------------------------------------------------------------------------

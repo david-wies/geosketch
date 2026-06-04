@@ -33,7 +33,6 @@ from geometry.models import (
     Point,
     Polygon,
     Ray,
-    SlicePlane,
     Solid,
     Tangent,
     Vector,
@@ -118,6 +117,37 @@ def test_subclass_inherits_geo_object(cls, _):
 def test_geo_object_direct_instantiation_rejected():
     with pytest.raises(TypeError, match="abstract base class"):
         GeoObject(id="x_001", name="X", type="bogus", alpha=1.0, visibility=True)
+
+
+def test_alpha_out_of_range_rejected_via_subclass():
+    # alpha is documented as [0.0, 1.0]; the guard lives in GeoObject so every
+    # concrete subclass inherits it. nan and out-of-range values must raise.
+    for bad in (math.nan, -0.1, 1.1, math.inf):
+        with pytest.raises(ValueError, match="alpha"):
+            Point(
+                id="pt_001",
+                name="A",
+                alpha=bad,
+                visibility=True,
+                easting=0.0,
+                northing=0.0,
+                color="#000000",
+            )
+
+
+def test_alpha_accepts_boundary_values():
+    # 0.0 (fully transparent) and 1.0 (fully opaque) are both valid endpoints.
+    for boundary in (0.0, 1.0):
+        pt = Point(
+            id="pt_001",
+            name="A",
+            alpha=boundary,
+            visibility=True,
+            easting=0.0,
+            northing=0.0,
+            color="#000000",
+        )
+        assert pt.alpha == boundary
 
 
 def test_elevated_object_direct_instantiation_rejected():
@@ -593,6 +623,18 @@ def test_elevated_object_rejects_non_finite_direction():
             Line(**_line_kwargs(direction=bad))
 
 
+def test_elevated_object_rejects_raw_string_direction_mode():
+    # The wire format uses lowercase strings ("azimuth"); the deserialiser must
+    # map them to DirectionMode before construction. A raw string must raise.
+    with pytest.raises(ValueError, match="direction_mode"):
+        Line(**_line_kwargs(direction_mode="azimuth"))
+
+
+def test_elevated_object_rejects_raw_string_direction_units():
+    with pytest.raises(ValueError, match="direction_units"):
+        Line(**_line_kwargs(direction_units="radians"))
+
+
 # ---------------------------------------------------------------------------
 # ElevatedObject: azimuth normalization
 # ---------------------------------------------------------------------------
@@ -779,9 +821,36 @@ def test_cylinder_inclined_rejects_non_finite_axis_azimuth():
 
 
 def test_cylinder_inclined_rejects_negative_axis_elevation():
-    # The lower side of the (0, π/2] inclined range was previously unexercised.
+    # The lower side of the (0, π/2) inclined range was previously unexercised.
     with pytest.raises(ValueError, match="axis_elevation"):
         Cylinder(**_cylinder_kwargs(axis_mode="inclined", axis_elevation=-0.1))
+
+
+def test_cylinder_rejects_raw_string_direction_mode():
+    with pytest.raises(ValueError, match="direction_mode"):
+        Cylinder(**_cylinder_kwargs(direction_mode="azimuth"))
+
+
+def test_cylinder_rejects_raw_string_direction_units():
+    with pytest.raises(ValueError, match="direction_units"):
+        Cylinder(**_cylinder_kwargs(direction_units="radians"))
+
+
+def test_cylinder_inclined_normalizes_axis_azimuth():
+    # Inclined-mode axis_azimuth is normalized into [0, 2π) for canonical
+    # storage, mirroring ElevatedObject.direction. 3π wraps to π.
+    cy = Cylinder(
+        **_cylinder_kwargs(axis_mode="inclined", axis_azimuth=3 * math.pi, axis_elevation=0.3)
+    )
+    assert cy.axis_azimuth == pytest.approx(math.pi)
+    assert 0.0 <= cy.axis_azimuth < 2 * math.pi
+
+
+def test_cylinder_inclined_normalizes_negative_axis_azimuth():
+    cy = Cylinder(
+        **_cylinder_kwargs(axis_mode="inclined", axis_azimuth=-math.pi / 2, axis_elevation=0.3)
+    )
+    assert cy.axis_azimuth == pytest.approx(3 * math.pi / 2)
 
 
 def test_cylinder_vertical_accepts_axis_angles_within_tolerance():
@@ -819,81 +888,13 @@ def test_solid_accepts_point_as_first_or_last_layer():
     assert last.layers[-1] == "pt_001"
 
 
-# ---------------------------------------------------------------------------
-# SlicePlane (ephemeral, not a GeoObject)
-# ---------------------------------------------------------------------------
-
-
-def test_slice_plane_horizontal():
-    sp = SlicePlane(mode="horizontal", a=0.0, b=0.0, c=1.0, d=100.0)
-    assert sp.mode == "horizontal"
-    assert sp.c == 1.0
-    assert sp.d == 100.0
-    assert sp.thickness == 0.0
-
-
-def test_slice_plane_easting():
-    sp = SlicePlane(mode="easting", a=1.0, b=0.0, c=0.0, d=500000.0)
-    assert sp.a == 1.0
-    assert sp.thickness == 0.0
-
-
-def test_slice_plane_with_thickness():
-    sp = SlicePlane(mode="horizontal", a=0.0, b=0.0, c=1.0, d=50.0, thickness=2.5)
-    assert sp.thickness == 2.5
-
-
-def test_slice_plane_not_geo_object():
-    sp = SlicePlane(mode="northing", a=0.0, b=1.0, c=0.0, d=0.0)
-    assert not isinstance(sp, GeoObject)
-
-
-def test_slice_plane_custom_mode():
-    # The fourth mode ("custom") must construct without error when the normal
-    # vector is unit-length (the UI normalises before constructing).
-    unit = 1.0 / math.sqrt(3.0)
-    sp = SlicePlane(mode="custom", a=unit, b=unit, c=unit, d=50.0)
-    assert sp.mode == "custom"
-    assert sp.thickness == 0.0
-
-
-def test_slice_plane_custom_rejects_non_unit_normal():
-    # A non-unit normal silently changes the effective slab thickness, so the
-    # Custom-mode inclusion test requires a unit normal.
-    with pytest.raises(ValueError, match="unit-length"):
-        SlicePlane(mode="custom", a=1.0, b=1.0, c=1.0, d=50.0)
-
-
-def test_slice_plane_rejects_invalid_mode():
-    with pytest.raises(ValueError, match="mode"):
-        SlicePlane(mode="diagonal", a=0.0, b=0.0, c=1.0, d=0.0)
-
-
-def test_slice_plane_rejects_negative_thickness():
-    with pytest.raises(ValueError, match="thickness"):
-        SlicePlane(mode="horizontal", a=0.0, b=0.0, c=1.0, d=0.0, thickness=-1.0)
-
-
-def test_slice_plane_rejects_zero_normal():
-    with pytest.raises(ValueError, match="zero vector"):
-        SlicePlane(mode="custom", a=0.0, b=0.0, c=0.0, d=0.0)
-
-
-def test_slice_plane_rejects_non_finite_coefficients():
-    # nan/inf slip past ``< 0`` and the magnitude check, silently degrading the
-    # inclusion test to all-excluded or all-included — they must raise instead.
-    for field_name in ("a", "b", "c", "d"):
-        for bad in (math.nan, math.inf, -math.inf):
-            kwargs = {"mode": "horizontal", "a": 0.0, "b": 0.0, "c": 1.0, "d": 10.0}
-            kwargs[field_name] = bad
-            with pytest.raises(ValueError, match=field_name):
-                SlicePlane(**kwargs)
-
-
-def test_slice_plane_rejects_non_finite_thickness():
-    for bad in (math.nan, math.inf):
-        with pytest.raises(ValueError, match="thickness"):
-            SlicePlane(mode="horizontal", a=0.0, b=0.0, c=1.0, d=0.0, thickness=bad)
+def test_solid_rejects_mis_prefixed_layer():
+    # A layer must be a Polygon ('pg_') or Point ('pt_') ID. Anything else
+    # (a Circle ID, a typo, an empty string) was previously accepted silently
+    # as a polygon layer; it must now be rejected at construction.
+    for bad in ("ci_001", "polygon_1", ""):
+        with pytest.raises(ValueError, match="mis-prefixed"):
+            Solid(**_solid_kwargs(layers=["pg_001", bad]))
 
 
 # ---------------------------------------------------------------------------

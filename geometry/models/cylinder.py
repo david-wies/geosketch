@@ -19,6 +19,9 @@ from typing import Literal
 from geometry.models.common import DirectionMode, DirectionUnits, GeoObject
 from geometry.utils.constants import EPS_ANGLE, EPS_DISTANCE
 
+# ``axis_mode`` is typed ``Literal["vertical", "inclined"]``, but Python does
+# not enforce ``Literal`` at runtime, so this frozenset is the actual guard
+# against bogus wire values — do not delete it as "redundant" with the type.
 _VALID_AXIS_MODES = frozenset({"vertical", "inclined"})
 
 
@@ -48,7 +51,11 @@ class Cylinder(GeoObject):
         ``"vertical"`` or ``"inclined"``. A vertical cylinder must store
         ``axis_azimuth = 0.0`` and ``axis_elevation = π/2``.
     axis_azimuth : float
-        Horizontal bearing of the axis in radians (stored as 0.0 when vertical).
+        Horizontal bearing of the axis in radians. When ``axis_mode='vertical'``
+        it must be 0.0 within ``EPS_ANGLE`` (a vertical axis has no meaningful
+        bearing). When ``axis_mode='inclined'`` it is normalized into ``[0, 2π)``
+        at construction via modulo arithmetic, mirroring
+        ``ElevatedObject.direction``, so callers need not pre-range it.
     axis_elevation : float
         Angle of the axis above the horizontal plane in radians; range
         ``(0, π/2)`` strictly open for ``axis_mode='inclined'``. Must be > 0
@@ -88,6 +95,18 @@ class Cylinder(GeoObject):
             raise ValueError(
                 f"Cylinder.axis_mode must be 'vertical' or 'inclined'; got {self.axis_mode!r}"
             )
+        # Reject raw wire strings that bypass the enum, mirroring ElevatedObject:
+        # the deserialiser must map "azimuth"/"radians" to the enum members.
+        if not isinstance(self.direction_mode, DirectionMode):
+            raise ValueError(
+                f"Cylinder.direction_mode must be a DirectionMode member; "
+                f"got {self.direction_mode!r}"
+            )
+        if not isinstance(self.direction_units, DirectionUnits):
+            raise ValueError(
+                f"Cylinder.direction_units must be a DirectionUnits member; "
+                f"got {self.direction_units!r}"
+            )
         if not math.isfinite(self.radius) or self.radius <= EPS_DISTANCE:
             raise ValueError(
                 f"Cylinder.radius must be finite and > {EPS_DISTANCE}; got {self.radius!r}"
@@ -103,6 +122,10 @@ class Cylinder(GeoObject):
         if not math.isfinite(self.axis_elevation):
             raise ValueError(f"Cylinder.axis_elevation must be finite; got {self.axis_elevation!r}")
         if self.axis_mode == "inclined":
+            # Normalize the bearing into [0, 2π) for canonical storage, matching
+            # ElevatedObject.direction. Done only for inclined mode: vertical mode
+            # forces axis_azimuth ≈ 0.0, which is already canonical.
+            self.axis_azimuth = self.axis_azimuth % (2 * math.pi)
             # Check the near-vertical case first so that values within EPS_ANGLE
             # of π/2 get the actionable "use axis_mode='vertical'" message instead
             # of the generic range message (the range check uses strict <, so

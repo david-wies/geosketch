@@ -82,6 +82,11 @@ class GeoObject:
                 "subclasses (Point, Line, Polygon, Ray, Vector, Circle, "
                 "Ball, Cylinder, Solid, Tangent)."
             )
+        # Enforced here so all ten concrete subclasses inherit the check via
+        # their ``super().__post_init__()`` call; ``nan``/out-of-range opacity
+        # would otherwise construct cleanly and silently corrupt rendering.
+        if not math.isfinite(self.alpha) or not 0.0 <= self.alpha <= 1.0:
+            raise ValueError(f"GeoObject.alpha must be in [0.0, 1.0]; got {self.alpha!r}")
 
 
 @dataclass
@@ -142,6 +147,19 @@ class ElevatedObject(GeoObject):
                 "ElevatedObject is an abstract base class and must not be "
                 "instantiated directly; use one of the four concrete "
                 "subclasses (Line, Ray, Vector, Tangent)."
+            )
+        # Reject raw wire strings (e.g. ``"azimuth"``) that bypass the enum: the
+        # deserialiser must map them to ``DirectionMode``/``DirectionUnits``
+        # before construction, never hand them through verbatim.
+        if not isinstance(self.direction_mode, DirectionMode):
+            raise ValueError(
+                f"ElevatedObject.direction_mode must be a DirectionMode member; "
+                f"got {self.direction_mode!r}"
+            )
+        if not isinstance(self.direction_units, DirectionUnits):
+            raise ValueError(
+                f"ElevatedObject.direction_units must be a DirectionUnits member; "
+                f"got {self.direction_units!r}"
             )
         if not math.isfinite(self.direction):
             raise ValueError(f"ElevatedObject.direction must be finite; got {self.direction!r}")

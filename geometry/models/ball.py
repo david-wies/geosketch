@@ -26,7 +26,8 @@ class Ball(GeoObject):
     Fields
     ------
     center_id : str
-        ID of the Point at the geometric center of the sphere.
+        ID of the Point at the geometric center of the sphere (a ``pt_``-prefixed
+        Point ID).
     radius : float
         Radius in metres; must be finite and greater than ``EPS_DISTANCE``
         (radius is a linear dimension, so the linear tolerance applies).

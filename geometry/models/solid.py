@@ -29,8 +29,10 @@ class Solid(GeoObject):
     Fields
     ------
     layers : tuple[str, ...]
-        Ordered references to existing Polygon or Point IDs. At least 2
-        entries. At most one entry may be a Point ID; it must be first or last.
+        Ordered references to existing Polygon (``pg_``) or Point (``pt_``) IDs.
+        Every entry must carry one of those two prefixes — any other prefix is
+        rejected at construction. At least 2 entries. At most one entry may be a
+        Point ID; it must be first or last.
     line_color : str
         Edge/stroke color.
     fill_color : str
@@ -52,6 +54,20 @@ class Solid(GeoObject):
         self.layers = tuple(self.layers)
         if len(self.layers) < 2:
             raise ValueError("Solid requires at least 2 layer IDs")
+        # A layer is either a Polygon (``pg_``) or a Point (``pt_``); anything
+        # else (typo, empty string, ``ci_001``) would otherwise be silently
+        # treated as a polygon. Reject it here rather than deferring to the
+        # services layer, since a mis-prefixed ID is a real correctness footgun.
+        bad_prefixes = [
+            layer_id
+            for layer_id in self.layers
+            if not (layer_id.startswith("pg_") or layer_id.startswith("pt_"))
+        ]
+        if bad_prefixes:
+            raise ValueError(
+                f"Solid layers must be Polygon ('pg_') or Point ('pt_') IDs; "
+                f"got mis-prefixed: {bad_prefixes}"
+            )
         # Per spec §10: at most one layer may be a Point ID (the apex/nadir),
         # and it must be the first or last element. Both sub-rules are decidable
         # from the ``pt_`` ID prefix alone — no cross-object lookup needed.

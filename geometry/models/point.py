@@ -25,7 +25,9 @@ class Point(GeoObject):
     Coordinates are in meters. Easting comes first in tuples (UTM convention).
     ``altitude`` carries a Python default of 0.0, matching the spec rule that
     altitude defaults to 0.0 when absent or null in the JSON file; the UI form
-    pre-fills 0.0. The serializer always writes ``altitude`` explicitly.
+    pre-fills 0.0. The serializer is expected to write ``altitude`` explicitly
+    (the ``persistence/`` layer is still a stub, so this is a forward-looking
+    contract, not yet enforced).
 
     Fields
     ------

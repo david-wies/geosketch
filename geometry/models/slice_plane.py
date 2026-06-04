@@ -33,6 +33,13 @@ _EPS_NORMAL_SQ: float = EPS_DISTANCE**2
 # |‖n‖² − 1| ≈ 2·|‖n‖ − 1|, so this threshold corresponds to a magnitude
 # error of roughly EPS_DISTANCE / 2 ≈ 5e-7 — tight enough for any
 # floating-point input the UI will produce.
+#
+# This is intentionally *independent* of EPS_ALTITUDE (the slice-membership
+# tolerance named in the class docstring): the unit-normal check is a
+# dimensionless construction-time gate, while EPS_ALTITUDE is a metric
+# membership tolerance applied later by the slice service. They happen to share
+# the EPS_DISTANCE value today, but a future retune of EPS_ALTITUDE must not
+# silently drift this construction guard — hence the separate local constant.
 _EPS_UNIT_NORMAL: float = EPS_DISTANCE
 
 
