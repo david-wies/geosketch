@@ -38,16 +38,31 @@ EPS_AREA : float
 EPS_PARAM : float
     1e-9. Used for parametric ``t`` clipping on segment/line intersection
     where the parameter is dimensionless and lives roughly in [0, 1].
+EPS_ALTITUDE : float
+    1e-6 m. Forward-looking: will gate slice-plane membership once the slice
+    service lands, via
+    ``|aE+bN+cZ−d| / √(a²+b²+c²) ≤ EPS_ALTITUDE + thickness``. The denominator
+    is 1 when the plane normal is unit-length (the three presets and a
+    normalised Custom normal) but must be retained for a non-unit normal. No
+    code consumes this constant yet.
+EPS_VOLUME : float
+    1e-9 m³. Forward-looking: will gate Solid/Ball/Cylinder degeneracy once
+    volume measurement lands (``|volume| < EPS_VOLUME`` will reject), analogous
+    to EPS_AREA for 2-D polygons. No code consumes this constant yet.
 """
 
 EPS_DISTANCE: float = 1e-6
 EPS_ANGLE: float = 1e-9
 EPS_AREA: float = 1e-9
 EPS_PARAM: float = 1e-9
+EPS_ALTITUDE: float = 1e-6
+EPS_VOLUME: float = 1e-9
 
 __all__ = [
     "EPS_DISTANCE",
     "EPS_ANGLE",
     "EPS_AREA",
     "EPS_PARAM",
+    "EPS_ALTITUDE",
+    "EPS_VOLUME",
 ]

@@ -12,18 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from geometry.models.ball import Ball
 from geometry.models.circle import Circle
-from geometry.models.common import DirectedObject, DirectionMode, DirectionUnits, GeoObject
+from geometry.models.common import ElevatedObject, DirectionMode, DirectionUnits, GeoObject
+from geometry.models.cylinder import Cylinder
 from geometry.models.line import Line
 from geometry.models.point import Point
 from geometry.models.polygon import Polygon
 from geometry.models.ray import Ray
+from geometry.models.slice_plane import SlicePlane
+from geometry.models.solid import Solid
 from geometry.models.tangent import Tangent
 from geometry.models.vector import Vector
 
 __all__ = [
     "GeoObject",
-    "DirectedObject",
+    "ElevatedObject",
     "DirectionMode",
     "DirectionUnits",
     "Point",
@@ -32,5 +36,9 @@ __all__ = [
     "Ray",
     "Vector",
     "Circle",
+    "Ball",
+    "Cylinder",
+    "Solid",
     "Tangent",
+    "SlicePlane",
 ]

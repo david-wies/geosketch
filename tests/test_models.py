@@ -16,13 +16,16 @@
 
 import ast
 import dataclasses
+import math
 import pathlib
 
 import pytest
 
 from geometry.models import (
+    Ball,
     Circle,
-    DirectedObject,
+    Cylinder,
+    ElevatedObject,
     DirectionMode,
     DirectionUnits,
     GeoObject,
@@ -30,9 +33,11 @@ from geometry.models import (
     Point,
     Polygon,
     Ray,
+    Solid,
     Tangent,
     Vector,
 )
+from geometry.utils.constants import EPS_ANGLE, EPS_DISTANCE
 
 SUBCLASS_TYPES = [
     (Point, "point"),
@@ -41,6 +46,9 @@ SUBCLASS_TYPES = [
     (Ray, "ray"),
     (Vector, "vector"),
     (Circle, "circle"),
+    (Ball, "ball"),
+    (Cylinder, "cylinder"),
+    (Solid, "solid"),
     (Tangent, "tangent"),
 ]
 
@@ -83,11 +91,13 @@ def test_point_instantiation():
         visibility=True,
         easting=100.0,
         northing=200.0,
+        altitude=50.0,
         color="#ff0000",
     )
     assert pt.type == "point"
     assert pt.easting == 100.0
     assert pt.northing == 200.0
+    assert pt.altitude == 50.0
     assert pt.color == "#ff0000"
 
 
@@ -109,15 +119,47 @@ def test_geo_object_direct_instantiation_rejected():
         GeoObject(id="x_001", name="X", type="bogus", alpha=1.0, visibility=True)
 
 
-def test_directed_object_direct_instantiation_rejected():
+def test_alpha_out_of_range_rejected_via_subclass():
+    # alpha is documented as [0.0, 1.0]; the guard lives in GeoObject so every
+    # concrete subclass inherits it. nan and out-of-range values must raise.
+    for bad in (math.nan, -0.1, 1.1, math.inf):
+        with pytest.raises(ValueError, match="alpha"):
+            Point(
+                id="pt_001",
+                name="A",
+                alpha=bad,
+                visibility=True,
+                easting=0.0,
+                northing=0.0,
+                color="#000000",
+            )
+
+
+def test_alpha_accepts_boundary_values():
+    # 0.0 (fully transparent) and 1.0 (fully opaque) are both valid endpoints.
+    for boundary in (0.0, 1.0):
+        pt = Point(
+            id="pt_001",
+            name="A",
+            alpha=boundary,
+            visibility=True,
+            easting=0.0,
+            northing=0.0,
+            color="#000000",
+        )
+        assert pt.alpha == boundary
+
+
+def test_elevated_object_direct_instantiation_rejected():
     with pytest.raises(TypeError, match="abstract base class"):
-        DirectedObject(
+        ElevatedObject(
             id="x_001",
             name="X",
             type="bogus",
             alpha=1.0,
             visibility=True,
             direction=0.0,
+            elevation=0.0,
             direction_mode=DirectionMode.AZIMUTH,
             direction_units=DirectionUnits.RADIANS,
         )
@@ -131,6 +173,7 @@ def test_point_isinstance_geo_object():
         visibility=True,
         easting=0.0,
         northing=0.0,
+        altitude=0.0,
         color="#000000",
     )
     assert isinstance(pt, GeoObject)
@@ -163,6 +206,7 @@ def test_line_instantiation():
         point_a_id="pt_001",
         point_b_id="pt_002",
         direction=0.785,
+        elevation=0.0,
         direction_mode=DirectionMode.AZIMUTH,
         direction_units=DirectionUnits.RADIANS,
         line_color="#0000ff",
@@ -170,6 +214,7 @@ def test_line_instantiation():
     )
     assert ln.type == "line"
     assert ln.point_a_id == "pt_001"
+    assert ln.elevation == 0.0
 
 
 def test_polygon_instantiation():
@@ -196,6 +241,7 @@ def test_ray_instantiation():
         visibility=True,
         origin_id="pt_001",
         direction=1.571,
+        elevation=0.0,
         direction_mode=DirectionMode.AZIMUTH,
         direction_units=DirectionUnits.RADIANS,
         line_color="#ff00ff",
@@ -203,6 +249,7 @@ def test_ray_instantiation():
     )
     assert ry.type == "ray"
     assert ry.origin_id == "pt_001"
+    assert ry.elevation == 0.0
 
 
 def test_vector_instantiation_length_direction():
@@ -213,6 +260,7 @@ def test_vector_instantiation_length_direction():
         visibility=True,
         origin_id="pt_001",
         direction=0.785,
+        elevation=0.0,
         direction_mode=DirectionMode.AZIMUTH,
         direction_units=DirectionUnits.RADIANS,
         length=100.0,
@@ -223,6 +271,7 @@ def test_vector_instantiation_length_direction():
     assert vc.type == "vector"
     assert vc.endpoint_id is None
     assert vc.length == 100.0
+    assert vc.elevation == 0.0
 
 
 def test_vector_instantiation_origin_endpoint():
@@ -233,6 +282,7 @@ def test_vector_instantiation_origin_endpoint():
         visibility=True,
         origin_id="pt_001",
         direction=0.785,
+        elevation=0.3,
         direction_mode=DirectionMode.AZIMUTH,
         direction_units=DirectionUnits.RADIANS,
         length=50.0,
@@ -241,6 +291,7 @@ def test_vector_instantiation_origin_endpoint():
         fill_color="#00ffff",
     )
     assert vc.endpoint_id == "pt_002"
+    assert vc.elevation == 0.3
 
 
 def test_circle_instantiation():
@@ -258,23 +309,655 @@ def test_circle_instantiation():
     assert ci.radius == 50.0
 
 
-def test_tangent_instantiation():
+def test_tangent_instantiation_circle():
     tg = Tangent(
         id="tg_001",
         name="T",
         alpha=1.0,
         visibility=True,
-        circle_id="ci_001",
+        shape_id="ci_001",
+        shape_type="circle",
         point_id="pt_004",
         direction=2.356,
+        elevation=0.0,
         direction_mode=DirectionMode.AZIMUTH,
         direction_units=DirectionUnits.RADIANS,
         line_color="#00ff66",
         fill_color="#00ff66",
     )
     assert tg.type == "tangent"
-    assert tg.circle_id == "ci_001"
+    assert tg.shape_id == "ci_001"
+    assert tg.shape_type == "circle"
     assert tg.point_id == "pt_004"
+    assert tg.elevation == 0.0
+
+
+def test_tangent_instantiation_ball():
+    tg = Tangent(
+        id="tg_002",
+        name="T2",
+        alpha=1.0,
+        visibility=True,
+        shape_id="ba_001",
+        shape_type="ball",
+        point_id="pt_005",
+        direction=1.0,
+        elevation=0.5,
+        direction_mode=DirectionMode.AZIMUTH,
+        direction_units=DirectionUnits.RADIANS,
+        line_color="#00ff66",
+        fill_color="#00ff66",
+    )
+    assert tg.type == "tangent"
+    assert tg.shape_id == "ba_001"
+    assert tg.shape_type == "ball"
+    assert tg.elevation == 0.5
+
+
+# ---------------------------------------------------------------------------
+# New 3D types: Ball, Cylinder, Solid
+# ---------------------------------------------------------------------------
+
+
+def test_ball_instantiation():
+    ba = Ball(
+        id="ba_001",
+        name="B",
+        alpha=1.0,
+        visibility=True,
+        center_id="pt_001",
+        radius=25.0,
+        line_color="#ff6600",
+        fill_color="#ffd699",
+    )
+    assert ba.type == "ball"
+    assert ba.center_id == "pt_001"
+    assert ba.radius == 25.0
+
+
+def test_cylinder_instantiation():
+    cy = Cylinder(
+        id="cy_001",
+        name="C",
+        alpha=1.0,
+        visibility=True,
+        base_center_id="pt_001",
+        radius=10.0,
+        height=50.0,
+        axis_mode="vertical",
+        axis_azimuth=0.0,
+        axis_elevation=math.pi / 2,
+        direction_mode=DirectionMode.AZIMUTH,
+        direction_units=DirectionUnits.RADIANS,
+        line_color="#336699",
+        fill_color="#99bbdd",
+    )
+    assert cy.type == "cylinder"
+    assert cy.base_center_id == "pt_001"
+    assert cy.axis_mode == "vertical"
+    assert cy.axis_elevation == math.pi / 2
+
+
+def test_cylinder_inclined():
+    cy = Cylinder(
+        id="cy_002",
+        name="CI",
+        alpha=0.8,
+        visibility=True,
+        base_center_id="pt_002",
+        radius=5.0,
+        height=20.0,
+        axis_mode="inclined",
+        axis_azimuth=0.785,
+        axis_elevation=0.3,
+        direction_mode=DirectionMode.AZIMUTH,
+        direction_units=DirectionUnits.RADIANS,
+        line_color="#336699",
+        fill_color="#99bbdd",
+    )
+    assert cy.type == "cylinder"
+    assert cy.axis_mode == "inclined"
+    assert cy.axis_azimuth == 0.785
+
+
+def test_solid_instantiation():
+    so = Solid(
+        id="so_001",
+        name="S",
+        alpha=0.9,
+        visibility=True,
+        layers=["pg_001", "pg_002", "pg_003"],
+        line_color="#993300",
+        fill_color="#cc9966",
+    )
+    assert so.type == "solid"
+    assert so.layers == ("pg_001", "pg_002", "pg_003")
+
+
+def test_solid_layers_defensively_copied():
+    shared = ["pg_001", "pg_002"]
+    so = Solid(
+        id="so_002",
+        name="S2",
+        alpha=1.0,
+        visibility=True,
+        layers=shared,
+        line_color="#000000",
+        fill_color="#ffffff",
+    )
+    assert so.layers == tuple(shared)
+    assert so.layers is not shared
+    shared.append("pg_999")
+    assert "pg_999" not in so.layers
+
+
+def test_solid_apex_layer():
+    so = Solid(
+        id="so_003",
+        name="Pyramid",
+        alpha=1.0,
+        visibility=True,
+        layers=["pg_001", "pt_010"],
+        line_color="#000000",
+        fill_color="#aaaaaa",
+    )
+    assert so.layers[-1] == "pt_010"
+
+
+# ---------------------------------------------------------------------------
+# Validation: Ball, Cylinder, Solid, ElevatedObject
+# ---------------------------------------------------------------------------
+
+
+def _ball_kwargs(**overrides) -> dict:
+    base = {
+        "id": "ba_001",
+        "name": "B",
+        "alpha": 1.0,
+        "visibility": True,
+        "center_id": "pt_001",
+        "radius": 10.0,
+        "line_color": "#000000",
+        "fill_color": "#ffffff",
+    }
+    base.update(overrides)
+    return base
+
+
+def _cylinder_kwargs(**overrides) -> dict:
+    base = {
+        "id": "cy_001",
+        "name": "C",
+        "alpha": 1.0,
+        "visibility": True,
+        "base_center_id": "pt_001",
+        "radius": 5.0,
+        "height": 10.0,
+        "axis_mode": "vertical",
+        "axis_azimuth": 0.0,
+        "axis_elevation": math.pi / 2,
+        "direction_mode": DirectionMode.AZIMUTH,
+        "direction_units": DirectionUnits.RADIANS,
+        "line_color": "#000000",
+        "fill_color": "#ffffff",
+    }
+    base.update(overrides)
+    return base
+
+
+def _solid_kwargs(**overrides) -> dict:
+    base = {
+        "id": "so_001",
+        "name": "S",
+        "alpha": 1.0,
+        "visibility": True,
+        "layers": ["pg_001", "pg_002"],
+        "line_color": "#000000",
+        "fill_color": "#ffffff",
+    }
+    base.update(overrides)
+    return base
+
+
+def _line_kwargs(**overrides) -> dict:
+    base = {
+        "id": "ln_001",
+        "name": "L",
+        "alpha": 1.0,
+        "visibility": True,
+        "point_a_id": "pt_001",
+        "point_b_id": "pt_002",
+        "direction": 0.0,
+        "elevation": 0.0,
+        "direction_mode": DirectionMode.AZIMUTH,
+        "direction_units": DirectionUnits.RADIANS,
+        "line_color": "#000000",
+        "fill_color": "#ffffff",
+    }
+    base.update(overrides)
+    return base
+
+
+def _tangent_kwargs(**overrides) -> dict:
+    base = {
+        "id": "tg_001",
+        "name": "T",
+        "alpha": 1.0,
+        "visibility": True,
+        "shape_id": "ci_001",
+        "shape_type": "circle",
+        "point_id": "pt_004",
+        "direction": 2.356,
+        "elevation": 0.0,
+        "direction_mode": DirectionMode.AZIMUTH,
+        "direction_units": DirectionUnits.RADIANS,
+        "line_color": "#00ff66",
+        "fill_color": "#00ff66",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_ball_rejects_non_positive_radius():
+    with pytest.raises(ValueError, match="radius"):
+        Ball(**_ball_kwargs(radius=0.0))
+    with pytest.raises(ValueError, match="radius"):
+        Ball(**_ball_kwargs(radius=-5.0))
+
+
+def test_cylinder_rejects_non_positive_radius():
+    with pytest.raises(ValueError, match="radius"):
+        Cylinder(**_cylinder_kwargs(radius=0.0))
+    with pytest.raises(ValueError, match="radius"):
+        Cylinder(**_cylinder_kwargs(radius=-1.0))
+
+
+def test_cylinder_rejects_non_positive_height():
+    with pytest.raises(ValueError, match="height"):
+        Cylinder(**_cylinder_kwargs(height=0.0))
+    with pytest.raises(ValueError, match="height"):
+        Cylinder(**_cylinder_kwargs(height=-10.0))
+
+
+def test_cylinder_inclined_rejects_out_of_range_axis_elevation():
+    # Inclined mode with elevation = 0 is a flat disk — rejected.
+    with pytest.raises(ValueError, match="axis_elevation"):
+        Cylinder(**_cylinder_kwargs(axis_mode="inclined", axis_elevation=0.0))
+    # Elevation > π/2 is beyond vertical — rejected.
+    with pytest.raises(ValueError, match="axis_elevation"):
+        Cylinder(**_cylinder_kwargs(axis_mode="inclined", axis_elevation=math.pi))
+
+
+def test_solid_rejects_fewer_than_two_layers():
+    with pytest.raises(ValueError, match="2"):
+        Solid(**_solid_kwargs(layers=["pg_001"]))
+    with pytest.raises(ValueError, match="2"):
+        Solid(**_solid_kwargs(layers=[]))
+
+
+def test_elevated_object_rejects_non_finite_elevation():
+    for bad in (math.nan, math.inf, -math.inf):
+        with pytest.raises(ValueError, match="finite"):
+            Line(**_line_kwargs(elevation=bad))
+
+
+def test_elevated_object_rejects_out_of_range_elevation():
+    # Elevation outside [-π/2, π/2] must be rejected.
+    with pytest.raises(ValueError, match="π/2"):
+        Line(**_line_kwargs(elevation=math.pi))
+    with pytest.raises(ValueError, match="π/2"):
+        Line(**_line_kwargs(elevation=-math.pi))
+
+
+def test_elevated_object_accepts_elevation_boundaries():
+    # ±π/2 ("straight up"/"straight down") are valid — guards a fence-post
+    # change from <= to < silently rejecting vertical directions.
+    for boundary in (math.pi / 2, -math.pi / 2):
+        line = Line(**_line_kwargs(elevation=boundary))
+        assert line.elevation == boundary
+
+
+def test_elevated_object_rejects_non_finite_direction():
+    for bad in (math.nan, math.inf, -math.inf):
+        with pytest.raises(ValueError, match="direction"):
+            Line(**_line_kwargs(direction=bad))
+
+
+def test_elevated_object_rejects_raw_string_direction_mode():
+    # The wire format uses lowercase strings ("azimuth"); the deserialiser must
+    # map them to DirectionMode before construction. A raw string must raise.
+    with pytest.raises(ValueError, match="direction_mode"):
+        Line(**_line_kwargs(direction_mode="azimuth"))
+
+
+def test_elevated_object_rejects_raw_string_direction_units():
+    with pytest.raises(ValueError, match="direction_units"):
+        Line(**_line_kwargs(direction_units="radians"))
+
+
+# ---------------------------------------------------------------------------
+# ElevatedObject: azimuth normalization
+# ---------------------------------------------------------------------------
+
+
+def test_azimuth_mode_normalizes_direction_above_two_pi():
+    # 3π mod 2π = π — a value one full turn past π wraps back to π.
+    ln = Line(**_line_kwargs(direction=3 * math.pi, direction_mode=DirectionMode.AZIMUTH))
+    assert ln.direction == pytest.approx(math.pi)
+
+
+def test_azimuth_mode_normalizes_negative_direction():
+    # -π/2 mod 2π = 3π/2 — negative azimuths wrap into [0, 2π).
+    ln = Line(**_line_kwargs(direction=-math.pi / 2, direction_mode=DirectionMode.AZIMUTH))
+    assert ln.direction == pytest.approx(3 * math.pi / 2)
+
+
+def test_angle_mode_normalizes_direction_above_two_pi():
+    # Angle mode applies the same [0, 2π) normalization as azimuth mode.
+    # 3π mod 2π = π — a value one full turn past π wraps back to π.
+    ln = Line(**_line_kwargs(direction=3 * math.pi, direction_mode=DirectionMode.ANGLE))
+    assert ln.direction == pytest.approx(math.pi)
+
+
+def test_ball_rejects_non_finite_radius():
+    for bad in (math.inf, math.nan):
+        with pytest.raises(ValueError, match="radius"):
+            Ball(**_ball_kwargs(radius=bad))
+
+
+def test_ball_rejects_radius_at_distance_floor():
+    # radius must be strictly greater than the linear tolerance EPS_DISTANCE.
+    with pytest.raises(ValueError, match="radius"):
+        Ball(**_ball_kwargs(radius=EPS_DISTANCE))
+
+
+def test_cylinder_rejects_non_finite_radius_and_height():
+    for bad in (math.inf, math.nan):
+        with pytest.raises(ValueError, match="radius"):
+            Cylinder(**_cylinder_kwargs(radius=bad))
+        with pytest.raises(ValueError, match="height"):
+            Cylinder(**_cylinder_kwargs(height=bad))
+
+
+def test_cylinder_rejects_radius_at_distance_floor():
+    with pytest.raises(ValueError, match="radius"):
+        Cylinder(**_cylinder_kwargs(radius=EPS_DISTANCE))
+
+
+def test_cylinder_rejects_invalid_axis_mode():
+    with pytest.raises(ValueError, match="axis_mode"):
+        Cylinder(**_cylinder_kwargs(axis_mode="diagonal"))
+
+
+def test_cylinder_vertical_rejects_wrong_axis_elevation():
+    # A vertical cylinder must store axis_elevation = π/2 exactly.
+    with pytest.raises(ValueError, match="axis_elevation"):
+        Cylinder(**_cylinder_kwargs(axis_mode="vertical", axis_elevation=0.0))
+
+
+def test_cylinder_vertical_rejects_nonzero_axis_azimuth():
+    with pytest.raises(ValueError, match="axis_azimuth"):
+        Cylinder(
+            **_cylinder_kwargs(axis_mode="vertical", axis_azimuth=1.0, axis_elevation=math.pi / 2)
+        )
+
+
+def test_cylinder_inclined_rejects_axis_elevation_at_vertical():
+    # axis_elevation = π/2 with axis_mode='inclined' is ambiguous: axis_azimuth
+    # would be meaningless for a vertical axis. The correct form is
+    # axis_mode='vertical'. Verify that the check catches the exact value and
+    # a value within EPS_ANGLE of π/2.
+    with pytest.raises(ValueError, match="vertical"):
+        Cylinder(**_cylinder_kwargs(axis_mode="inclined", axis_elevation=math.pi / 2))
+    with pytest.raises(ValueError, match="vertical"):
+        Cylinder(
+            **_cylinder_kwargs(axis_mode="inclined", axis_elevation=math.pi / 2 - EPS_ANGLE / 2)
+        )
+
+
+def test_tangent_rejects_invalid_shape_type():
+    with pytest.raises(ValueError, match="shape_type"):
+        Tangent(**_tangent_kwargs(shape_type="polygon"))
+
+
+def test_tangent_circle_rejects_nonzero_elevation():
+    # Circle tangents are always horizontal; a non-zero elevation is rejected.
+    with pytest.raises(ValueError, match="elevation"):
+        Tangent(**_tangent_kwargs(shape_type="circle", elevation=0.5))
+
+
+def test_tangent_circle_accepts_near_zero_elevation_within_tolerance():
+    # The horizontal check uses the angular tolerance, so a value 1 ULP off 0.0
+    # (e.g. from radians(0.0) round-trips) must not be wrongly rejected.
+    tg = Tangent(**_tangent_kwargs(shape_type="circle", elevation=EPS_ANGLE / 2))
+    assert tg.shape_type == "circle"
+
+
+# ---------------------------------------------------------------------------
+# Point: altitude default and coordinate finiteness
+# ---------------------------------------------------------------------------
+
+
+def test_point_altitude_defaults_to_zero():
+    # Spec §1: altitude defaults to 0.0 when omitted, so the loader need not
+    # inject it before construction.
+    pt = Point(
+        id="pt_001",
+        name="A",
+        alpha=1.0,
+        visibility=True,
+        easting=1.0,
+        northing=2.0,
+        color="#000000",
+    )
+    assert pt.altitude == 0.0
+
+
+def test_point_rejects_non_finite_coordinates():
+    for field_name in ("easting", "northing", "altitude"):
+        for bad in (math.nan, math.inf, -math.inf):
+            kwargs = {
+                "id": "pt_001",
+                "name": "A",
+                "alpha": 1.0,
+                "visibility": True,
+                "easting": 1.0,
+                "northing": 2.0,
+                "altitude": 3.0,
+                "color": "#000000",
+            }
+            kwargs[field_name] = bad
+            with pytest.raises(ValueError, match=field_name):
+                Point(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Circle: radius validation parity with Ball/Cylinder
+# ---------------------------------------------------------------------------
+
+
+def _circle_kwargs(**overrides) -> dict:
+    base = {
+        "id": "ci_001",
+        "name": "C",
+        "alpha": 1.0,
+        "visibility": True,
+        "center_id": "pt_001",
+        "radius": 10.0,
+        "line_color": "#000000",
+        "fill_color": "#ffffff",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_circle_rejects_non_positive_radius():
+    with pytest.raises(ValueError, match="radius"):
+        Circle(**_circle_kwargs(radius=0.0))
+    with pytest.raises(ValueError, match="radius"):
+        Circle(**_circle_kwargs(radius=-5.0))
+
+
+def test_circle_rejects_non_finite_radius():
+    for bad in (math.inf, math.nan):
+        with pytest.raises(ValueError, match="radius"):
+            Circle(**_circle_kwargs(radius=bad))
+
+
+def test_circle_rejects_radius_at_distance_floor():
+    with pytest.raises(ValueError, match="radius"):
+        Circle(**_circle_kwargs(radius=EPS_DISTANCE))
+
+
+# ---------------------------------------------------------------------------
+# Cylinder: axis-angle finiteness, tolerance, and inclined range additions
+# ---------------------------------------------------------------------------
+
+
+def test_cylinder_inclined_rejects_non_finite_axis_azimuth():
+    for bad in (math.nan, math.inf, -math.inf):
+        with pytest.raises(ValueError, match="axis_azimuth"):
+            Cylinder(**_cylinder_kwargs(axis_mode="inclined", axis_azimuth=bad, axis_elevation=0.5))
+
+
+def test_cylinder_inclined_rejects_negative_axis_elevation():
+    # The lower side of the (0, π/2) inclined range was previously unexercised.
+    with pytest.raises(ValueError, match="axis_elevation"):
+        Cylinder(**_cylinder_kwargs(axis_mode="inclined", axis_elevation=-0.1))
+
+
+def test_cylinder_rejects_raw_string_direction_mode():
+    with pytest.raises(ValueError, match="direction_mode"):
+        Cylinder(**_cylinder_kwargs(direction_mode="azimuth"))
+
+
+def test_cylinder_rejects_raw_string_direction_units():
+    with pytest.raises(ValueError, match="direction_units"):
+        Cylinder(**_cylinder_kwargs(direction_units="radians"))
+
+
+def test_cylinder_inclined_normalizes_axis_azimuth():
+    # Inclined-mode axis_azimuth is normalized into [0, 2π) for canonical
+    # storage, mirroring ElevatedObject.direction. 3π wraps to π.
+    cy = Cylinder(
+        **_cylinder_kwargs(axis_mode="inclined", axis_azimuth=3 * math.pi, axis_elevation=0.3)
+    )
+    assert cy.axis_azimuth == pytest.approx(math.pi)
+    assert 0.0 <= cy.axis_azimuth < 2 * math.pi
+
+
+def test_cylinder_inclined_normalizes_negative_axis_azimuth():
+    cy = Cylinder(
+        **_cylinder_kwargs(axis_mode="inclined", axis_azimuth=-math.pi / 2, axis_elevation=0.3)
+    )
+    assert cy.axis_azimuth == pytest.approx(3 * math.pi / 2)
+
+
+def test_cylinder_vertical_accepts_axis_angles_within_tolerance():
+    # A vertical cylinder whose axis_elevation/axis_azimuth land within EPS_ANGLE
+    # of π/2 and 0.0 (e.g. from radians(90.0)) must construct, not be rejected.
+    cy = Cylinder(
+        **_cylinder_kwargs(
+            axis_mode="vertical",
+            axis_azimuth=EPS_ANGLE / 2,
+            axis_elevation=math.pi / 2 - EPS_ANGLE / 2,
+        )
+    )
+    assert cy.axis_mode == "vertical"
+
+
+# ---------------------------------------------------------------------------
+# Solid: Point-ID layer rule (spec §10)
+# ---------------------------------------------------------------------------
+
+
+def test_solid_rejects_multiple_point_layers():
+    with pytest.raises(ValueError, match="at most one Point ID"):
+        Solid(**_solid_kwargs(layers=["pt_001", "pg_001", "pt_002"]))
+
+
+def test_solid_rejects_interior_point_layer():
+    with pytest.raises(ValueError, match="first or last"):
+        Solid(**_solid_kwargs(layers=["pg_001", "pt_001", "pg_002"]))
+
+
+def test_solid_accepts_point_as_first_or_last_layer():
+    first = Solid(**_solid_kwargs(layers=["pt_001", "pg_001", "pg_002"]))
+    assert first.layers[0] == "pt_001"
+    last = Solid(**_solid_kwargs(layers=["pg_001", "pg_002", "pt_001"]))
+    assert last.layers[-1] == "pt_001"
+
+
+def test_solid_rejects_mis_prefixed_layer():
+    # A layer must be a Polygon ('pg_') or Point ('pt_') ID. Anything else
+    # (a Circle ID, a typo, an empty string) was previously accepted silently
+    # as a polygon layer; it must now be rejected at construction.
+    for bad in ("ci_001", "polygon_1", ""):
+        with pytest.raises(ValueError, match="mis-prefixed"):
+            Solid(**_solid_kwargs(layers=["pg_001", bad]))
+
+
+# ---------------------------------------------------------------------------
+# Vector: length validation
+# ---------------------------------------------------------------------------
+
+
+def _vector_kwargs(**overrides) -> dict:
+    base = {
+        "id": "vc_001",
+        "name": "V",
+        "alpha": 1.0,
+        "visibility": True,
+        "origin_id": "pt_001",
+        "direction": 0.785,
+        "elevation": 0.0,
+        "direction_mode": DirectionMode.AZIMUTH,
+        "direction_units": DirectionUnits.RADIANS,
+        "length": 100.0,
+        "endpoint_id": None,
+        "line_color": "#000000",
+        "fill_color": "#ffffff",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_vector_rejects_invalid_length():
+    # length is a linear dimension; non-finite, zero, negative, or values at/below
+    # the EPS_DISTANCE floor are degenerate and rejected — mirrors the
+    # Ball/Circle/Cylinder radius guards (strict ``> EPS_DISTANCE``).
+    for bad in (0.0, -5.0, EPS_DISTANCE, math.inf, math.nan):
+        with pytest.raises(ValueError, match="length"):
+            Vector(**_vector_kwargs(length=bad))
+
+
+def test_cylinder_rejects_height_at_distance_floor():
+    # Mirror of test_cylinder_rejects_radius_at_distance_floor for height.
+    with pytest.raises(ValueError, match="height"):
+        Cylinder(**_cylinder_kwargs(height=EPS_DISTANCE))
+
+
+def test_cylinder_inclined_accepts_small_positive_axis_elevation():
+    # A small positive elevation well below EPS_ANGLE of π/2 must be accepted
+    # for inclined mode, pinning the strict lower bound from the acceptance side.
+    cy = Cylinder(
+        **_cylinder_kwargs(
+            axis_mode="inclined",
+            axis_azimuth=0.785,
+            axis_elevation=0.01,
+        )
+    )
+    assert cy.axis_mode == "inclined"
+    assert cy.axis_elevation == pytest.approx(0.01)
+
+
+def test_tangent_circle_accepts_elevation_at_exact_tolerance_boundary():
+    # elevation = EPS_ANGLE: the check is ``abs(elevation) > EPS_ANGLE``, so the
+    # exact boundary value is accepted (strict >), not rejected. This pins the
+    # strict inequality so a future change to >= would fail loud.
+    tg = Tangent(**_tangent_kwargs(shape_type="circle", elevation=EPS_ANGLE))
+    assert tg.shape_type == "circle"
+    assert tg.elevation == EPS_ANGLE
 
 
 # ---------------------------------------------------------------------------

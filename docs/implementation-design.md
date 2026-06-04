@@ -183,7 +183,7 @@ class Tangent(ElevatedObject):
     type: str = field(init=False, default="tangent")
 ```
 
-**`shape_type` drives dispatch**: services and validation pick the Circle-tangent vs Ball-tangent path on `shape_type` — `"circle"` → 2D horizontal tangent (`elevation = 0.0`); `"ball"` → 3D tangent perpendicular to the sphere radius (user-supplied `elevation`). The dep-graph edge is `Tangent → {shape_id, point_id}` for both. Since the project is pre-release, `circle_id` is removed everywhere — there is no compatibility path and no serializer migration to read it.
+**`shape_type` drives dispatch**: services and validation pick the Circle-tangent vs Ball-tangent path on `shape_type` — `"circle"` → 2D horizontal tangent (`elevation = 0.0`); `"ball"` → 3D tangent perpendicular to the sphere radius (user-supplied `elevation`). The dep-graph edge is `Tangent → {shape_id, point_id}` for both. The persistence layer **must** map a legacy `circle_id` key to `shape_id = circle_id, shape_type = "circle"` for backward compatibility — see the JSON migration note in `spec/MVP.md §9 (Tangent)` and the comment in `geometry/models/tangent.py`.
 
 ### 3.8 `geometry/models/polygon.py`
 
@@ -441,7 +441,7 @@ def vector_endpoint(
 
 `el` defaults to `0.0` purely as ergonomics for a horizontal vector; callers normally pass the vector's stored elevation. The return shape changes from `(2,)` to `(3,)`, so every caller (tests, render, command layer) updates from `e, n = vector_endpoint(...)` to `e, n, z = vector_endpoint(...)`.
 
-**`direction_unit_vector(obj)`** — currently returns a 2D `(e, n)` unit vector from `ElevatedObject.direction`. This function is used for `ray_polygon_distance` (2D ray-polygon test) which is correct — the ray-polygon intersection is a 2D operation on `(easting, northing)`. No change needed to this function; the 2D projection is intentional.
+**`horizontal_unit_vector(obj)`** (renamed from `direction_unit_vector`) — returns a 2D `(e, n)` unit vector from `ElevatedObject.direction`. This function is used for `ray_polygon_distance` (2D ray-polygon test) which is correct — the ray-polygon intersection is a 2D operation on `(easting, northing)`. The 2D projection is intentional; the rename makes the horizontal-only semantics explicit now that `ElevatedObject` also carries an out-of-plane `elevation`.
 
 **`_xy(point)`** — currently returns `(easting, northing)`. No change; it is used by 2D operations only. A new helper `_xyz(point)` is added for 3D operations:
 
@@ -1917,8 +1917,8 @@ The Mirtich (1996) algorithm (§14) requires consistent outward-facing normals o
 ### 13.9 EventBus listener retention
 The `EventBus` holds subscribers strongly (confirmed by implementation). UI components that subscribe in `__init__` must call `bus.unsubscribe(event, handler)` in their teardown path. `CanvasTabController.teardown()` calls `teardown()` on all three canvas views; `MainWindow` calls `canvas_tabs.teardown()` on window close. Failure to unsubscribe causes dead-widget callbacks after tkinter destroys the widget, producing `TclError` on the next event fire.
 
-### 13.10 `direction_unit_vector()` is 2D — intentional
-`direction_unit_vector(obj)` returns a 2D `(e, n)` unit vector. It is used by `ray_polygon_distance()`, which is a 2D operation (ray-polygon in the horizontal plane). For the 3D view, rays are rendered using `(sin(az)*cos(el), cos(az)*cos(el), sin(el))` — this computation lives in `build_3d_instructions()` and does not go through `direction_unit_vector()`. Do not change `direction_unit_vector()` to 3D; doing so would break the 2D ray-polygon distance calculation.
+### 13.10 `horizontal_unit_vector()` is 2D — intentional
+`horizontal_unit_vector(obj)` (renamed from `direction_unit_vector`) returns a 2D `(e, n)` unit vector. It is used by `ray_polygon_distance()`, which is a 2D operation (ray-polygon in the horizontal plane). For the 3D view, rays are rendered using `(sin(az)*cos(el), cos(az)*cos(el), sin(el))` — this computation lives in `build_3d_instructions()` and does not go through `horizontal_unit_vector()`. Do not change `horizontal_unit_vector()` to 3D; doing so would break the 2D ray-polygon distance calculation.
 
 ### 13.11 `distance()` is now 3D — test impact
 The existing test suite for `geometry.py` calls `distance()` on Points without altitude. After the change, those calls still pass because `altitude` defaults to `0.0` and `sqrt(Δe² + Δn² + 0²) == sqrt(Δe² + Δn²)`. No test changes are required for existing test cases, but new test cases must verify the 3D formula with non-zero altitudes.

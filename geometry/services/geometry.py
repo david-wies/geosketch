@@ -28,8 +28,10 @@ Conventions
 * Coordinates are UTM metres expressed as ``(easting, northing)`` — easting
   first. All coordinate arrays returned by this module follow that order.
 * Scalar results are returned as :class:`numpy.float64` so they drop straight
-  into further NumPy expressions without an implicit cast. Coordinate results
-  are returned as ``numpy.ndarray`` of shape ``(2,)``.
+  into further NumPy expressions without an implicit cast. 2-D coordinate
+  results (e.g. intersection points) are returned as ``numpy.ndarray`` of
+  shape ``(2,)``; 3-D coordinate results (e.g. :func:`vector_endpoint`) use
+  shape ``(3,)``.
 * Functions that consume polygons or direction-bearing objects take a
   ``points`` mapping (``id -> Point``) and resolve coordinates on demand. No
   function caches geometry — shapely objects are built at the call boundary
@@ -71,7 +73,7 @@ import numpy as np
 import shapely
 from scipy.spatial import ConvexHull  # pylint: disable=no-name-in-module
 
-from geometry.models.common import DirectedObject, DirectionMode
+from geometry.models.common import ElevatedObject, DirectionMode
 from geometry.models.line import Line
 from geometry.models.point import Point
 from geometry.models.polygon import Polygon
@@ -85,7 +87,7 @@ __all__ = [
     "signed_area",
     "is_convex",
     "convex_hull",
-    "direction_unit_vector",
+    "horizontal_unit_vector",
     "line_intersection",
     "line_polygon_intersections",
     "polygon_polygon_intersections",
@@ -109,18 +111,15 @@ def _xy(point: Point) -> np.ndarray:
     return np.array([point.easting, point.northing], dtype=np.float64)
 
 
-def _delta(a: Point, b: Point) -> tuple[np.float64, np.float64]:
-    """Return ``(Δeasting, Δnorthing)`` from ``a`` to ``b`` as ``float64``.
+def _delta(a: Point, b: Point) -> tuple[float, float]:
+    """Return ``(Δeasting, Δnorthing)`` from ``a`` to ``b``.
 
     Centralises the ``b - a`` component subtraction used directly by
     :func:`azimuth` and :func:`distance` (and indirectly by
     :func:`tangent_direction` via :func:`azimuth`) so the easting-first
     convention lives in exactly one place.
     """
-    return (
-        np.float64(b.easting) - np.float64(a.easting),
-        np.float64(b.northing) - np.float64(a.northing),
-    )
+    return (b.easting - a.easting, b.northing - a.northing)
 
 
 def _cross2d(u: np.ndarray, v: np.ndarray) -> np.float64:
@@ -129,7 +128,7 @@ def _cross2d(u: np.ndarray, v: np.ndarray) -> np.float64:
     Used instead of ``np.cross`` because NumPy 2.x deprecated the 2-D form of
     ``np.cross``; the explicit determinant is identical and warning-free.
     """
-    return np.float64(u[0] * v[1] - u[1] * v[0])
+    return u[0] * v[1] - u[1] * v[0]
 
 
 def _unit(v: np.ndarray) -> np.ndarray | None:
@@ -207,9 +206,25 @@ def azimuth(pt_a: Point, pt_b: Point) -> np.float64:
 
 
 def distance(pt_a: Point, pt_b: Point) -> np.float64:
-    """Euclidean distance between two points via ``np.hypot`` (float64)."""
+    """3-D Euclidean distance between two points (float64).
+
+    Computes ``√[(Δe)²+(Δn)²+(Δz)²]`` per the domain rule that distance
+    between two Points is always 3-D. This matches the Vector ``length``
+    formula and the spec's point-import text format.
+
+    Parameters
+    ----------
+    pt_a, pt_b : Point
+        Start and end points, each with an ``altitude`` field.
+
+    Returns
+    -------
+    numpy.float64
+        3-D Euclidean distance in metres.
+    """
     d_e, d_n = _delta(pt_a, pt_b)
-    return np.hypot(d_e, d_n)
+    d_z = pt_b.altitude - pt_a.altitude
+    return np.sqrt(d_e**2 + d_n**2 + d_z**2)
 
 
 # ---------------------------------------------------------------------------
@@ -246,8 +261,13 @@ def is_convex(polygon: Polygon, points: Mapping[str, Point]) -> bool:
     A polygon is convex iff every turn has the same orientation (all cross
     products non-negative or all non-positive); near-collinear triplets
     (``|sin θ| < EPS_ANGLE``) are ignored so that redundant boundary vertices
-    do not flip the result. Zero-length edges from duplicated vertices have no
-    direction and are skipped.
+    do not flip the result.
+
+    Zero-length edges from duplicated vertices have no direction and are
+    **compacted out before turns are paired**, not merely skipped index-wise.
+    Pairing by raw index would mask the turn that straddles a duplicated vertex
+    (the real turn spans the zero-length edge) and could misclassify a concave
+    polygon as convex; pairing consecutive *surviving* edges measures it.
 
     Returns
     -------
@@ -257,23 +277,21 @@ def is_convex(polygon: Polygon, points: Mapping[str, Point]) -> bool:
     coords = _polygon_coords(polygon, points)
     if len(coords) < 3:
         return False
-    edges = np.roll(coords, -1, axis=0) - coords  # edge[i] = V[i+1] - V[i]
-    units = [_unit(edge) for edge in edges]
-    n_edges = len(units)
-    saw_positive = False
-    saw_negative = False
-    for i, u in enumerate(units):
-        v = units[(i + 1) % n_edges]
-        if u is None or v is None:
-            continue  # zero-length edge (duplicate vertex) — no turn to classify
-        cross = _cross2d(u, v)
-        if cross > EPS_ANGLE:
-            saw_positive = True
-        elif cross < -EPS_ANGLE:
-            saw_negative = True
-        if saw_positive and saw_negative:
-            return False
-    return True
+    edges = np.roll(coords, -1, axis=0) - coords  # shape (N, 2)
+    norms = np.hypot(edges[:, 0], edges[:, 1])  # shape (N,)
+    valid = norms >= EPS_DISTANCE
+    # Keep only real (non-degenerate) edge directions, in cyclic order, then
+    # pair *consecutive surviving* edges so a reflex turn hidden behind a
+    # duplicated vertex is still measured.
+    unit_e = edges[valid, 0] / norms[valid]
+    unit_n = edges[valid, 1] / norms[valid]
+    if unit_e.shape[0] < 3:
+        return False  # fewer than three real edges → degenerate, not convex
+    # cross[i] = 2D cross product of surviving unit_edge[i] with unit_edge[i+1]
+    crosses = unit_e * np.roll(unit_n, -1) - unit_n * np.roll(unit_e, -1)
+    has_pos = bool(np.any(crosses > EPS_ANGLE))
+    has_neg = bool(np.any(crosses < -EPS_ANGLE))
+    return not (has_pos and has_neg)
 
 
 def convex_hull(polygon: Polygon, points: Mapping[str, Point], new_id: str) -> Polygon:
@@ -333,8 +351,13 @@ def convex_hull(polygon: Polygon, points: Mapping[str, Point], new_id: str) -> P
 # ---------------------------------------------------------------------------
 
 
-def direction_unit_vector(obj: DirectedObject) -> np.ndarray:
-    """Unit ``(easting, northing)`` vector for a direction-bearing object.
+def horizontal_unit_vector(obj: ElevatedObject) -> np.ndarray:
+    """Horizontal unit ``(easting, northing)`` vector for a direction-bearing object.
+
+    Computes a **2-D horizontal projection** of the bearing stored in
+    ``obj.direction``, deliberately ignoring ``obj.elevation``. This is the
+    correct input for 2-D geometry operations such as ray-polygon distance,
+    where the plane geometry is independent of the ray's vertical tilt.
 
     ``obj.direction`` is stored in radians but means either an azimuth
     (CW from North) or a math angle (CCW from East) depending on
@@ -346,7 +369,7 @@ def direction_unit_vector(obj: DirectedObject) -> np.ndarray:
     Returns
     -------
     numpy.ndarray
-        Unit direction vector, shape ``(2,)``.
+        Horizontal unit direction vector, shape ``(2,)``.
 
     Raises
     ------
@@ -360,7 +383,7 @@ def direction_unit_vector(obj: DirectedObject) -> np.ndarray:
     """
     if not math.isfinite(obj.direction):
         raise ValueError(
-            f"direction_unit_vector: obj.direction is {obj.direction!r}; "
+            f"horizontal_unit_vector: obj.direction is {obj.direction!r}; "
             "expected a finite radian value"
         )
     if obj.direction_mode is DirectionMode.AZIMUTH:
@@ -380,7 +403,7 @@ def line_intersection(line_a: Line, line_b: Line, points: Mapping[str, Point]) -
 
     Each line is treated as the infinite line through its two defining points.
     The intersection is found by the parametric solve
-    ``A1 + t·d1 == A2 + s·d2`` via :func:`numpy.linalg.solve`. Parallelism is
+    ``A1 + t·d1 == A2 + s·d2`` via Cramer's rule on the 2×2 system. Parallelism is
     tested by :func:`_are_parallel`, which normalises both directions to
     **unit** vectors before taking the cross product, so the comparison is
     ``|sin θ|`` against :data:`EPS_ANGLE` — a genuine angular tolerance that
@@ -400,10 +423,10 @@ def line_intersection(line_a: Line, line_b: Line, points: Mapping[str, Point]) -
     d2 = b2 - a2
     if _are_parallel(d1, d2):
         return None
-    # Columns: [d1, -d2] · [t, s]^T = a2 - a1
-    matrix = np.array([[d1[0], -d2[0]], [d1[1], -d2[1]]], dtype=np.float64)
+    # Solve [d1, -d2] · [t, s]^T = (a2 - a1) via Cramer's rule.
     rhs = a2 - a1
-    t, _s = np.linalg.solve(matrix, rhs)
+    det = d2[0] * d1[1] - d1[0] * d2[1]
+    t = (d2[0] * rhs[1] - rhs[0] * d2[1]) / det
     return a1 + t * d1
 
 
@@ -472,11 +495,16 @@ def _extended_line(
 
 def _edge_crossings(long_line: shapely.LineString, coords: np.ndarray) -> list[np.ndarray]:
     """Collect every point where ``long_line`` meets a polygon edge of ``coords``."""
-    hits: list[np.ndarray] = []
     n = len(coords)
-    for i, vertex in enumerate(coords):
-        edge = shapely.LineString([vertex, coords[(i + 1) % n]])
-        hits.extend(_collect_points(shapely.intersection(long_line, edge)))
+    ends = np.roll(coords, -1, axis=0)
+    # Build all N edge geometries in one batch call (Shapely 2.x vectorised API).
+    coord_seq = np.stack([coords, ends], axis=1).reshape(-1, 2)
+    idx = np.repeat(np.arange(n), 2)
+    edges_geom = shapely.linestrings(coord_seq, indices=idx)
+    results = shapely.intersection(long_line, edges_geom)
+    hits: list[np.ndarray] = []
+    for geom in results[~shapely.is_empty(results)]:
+        hits.extend(_collect_points(geom))
     return hits
 
 
@@ -556,9 +584,11 @@ def _ray_edge_t(origin: np.ndarray, unit: np.ndarray, a: np.ndarray, b: np.ndarr
     edge = b - a
     if _are_parallel(unit, edge):
         return None  # ray parallel to this edge
-    # Solve origin + t*unit = a + s*edge  ->  [unit, -edge] · [t, s] = a - origin
-    matrix = np.array([[unit[0], -edge[0]], [unit[1], -edge[1]]], dtype=np.float64)
-    t, s = np.linalg.solve(matrix, a - origin)
+    # Solve [unit, -edge] · [t, s]^T = (a - origin) via Cramer's rule.
+    rhs = a - origin
+    det = edge[0] * unit[1] - unit[0] * edge[1]
+    t = (edge[0] * rhs[1] - rhs[0] * edge[1]) / det
+    s = (unit[0] * rhs[1] - rhs[0] * unit[1]) / det
     if t >= -EPS_DISTANCE and -EPS_PARAM <= s <= 1.0 + EPS_PARAM:
         return max(0.0, float(t))
     return None
@@ -581,7 +611,7 @@ def ray_polygon_distance(ray: Ray, polygon: Polygon, points: Mapping[str, Point]
         Distance to the nearest intersection, or ``numpy.float64(inf)``.
     """
     origin = _xy(points[ray.origin_id])
-    unit = direction_unit_vector(ray)
+    unit = horizontal_unit_vector(ray)
     coords = _polygon_coords(polygon, points)
     n = len(coords)
     best = math.inf
@@ -672,11 +702,15 @@ def tangent_direction(center: Point, point: Point) -> np.float64:
     ------
     ValueError
         If ``center`` and ``point`` are coincident within
-        :data:`EPS_DISTANCE` (a zero-radius circle). The radius then has no
-        direction — :func:`azimuth` would return ``atan2(0, 0) == 0`` — so the
-        tangent is undefined and reporting ``π/2`` would be a silent fiction.
+        :data:`EPS_DISTANCE` in the **horizontal (2D) plane** (a zero-radius
+        circle). The coincidence test uses only ``(easting, northing)`` because
+        ``azimuth`` — and therefore the tangent direction — is a 2-D quantity;
+        two points that differ only in altitude have no horizontal separation and
+        thus no well-defined azimuth. Reporting ``π/2`` would be a silent
+        fiction, so this raises instead.
     """
-    if distance(center, point) < EPS_DISTANCE:
+    d_e, d_n = _delta(center, point)
+    if math.hypot(d_e, d_n) < EPS_DISTANCE:
         raise ValueError(
             "tangent_direction: center and circumference point are coincident; "
             "a zero-radius circle has no tangent"
@@ -684,54 +718,69 @@ def tangent_direction(center: Point, point: Point) -> np.float64:
     return normalize_to_2pi(azimuth(center, point) + _HALF_PI)
 
 
-def vector_endpoint(origin: Point, length: float, az: float) -> np.ndarray:
-    """Endpoint of a vector from ``origin`` of the given ``length`` and azimuth.
+def vector_endpoint(origin: Point, length: float, az: float, el: float = 0.0) -> np.ndarray:
+    """3-D endpoint of a vector from ``origin`` of the given ``length``, azimuth, and elevation.
 
-    Uses the azimuth-convention formula
-    ``(e + L·sin(az), n + L·cos(az))``. The ``sin``/``cos`` swap relative to a
-    standard math angle is intentional (azimuth is CW from North) and must not
-    be "corrected".
+    Uses the azimuth + elevation convention from the spec::
+
+        E = origin_e + length·sin(az)·cos(el)
+        N = origin_n + length·cos(az)·cos(el)
+        Z = origin_z + length·sin(el)
+
+    The ``sin``/``cos`` swap between easting and northing is intentional
+    (azimuth is CW from North) and must not be "corrected". The elevation term
+    shortens the horizontal reach by ``cos(el)`` and adds a vertical component
+    via ``sin(el)``.
 
     Parameters
     ----------
     origin : Point
-        Vector origin.
+        Vector origin (provides easting, northing, altitude).
     length : float
         Vector magnitude in metres.
     az : float
         Azimuth in radians.
+    el : float, optional
+        Elevation angle above the horizontal plane in radians; default 0.0
+        (horizontal).  The caller is responsible for keeping this in
+        ``[-π/2, π/2]``; values outside that range are not rejected here.
 
     Returns
     -------
     numpy.ndarray
-        The ``(easting, northing)`` endpoint, shape ``(2,)``.
+        The ``(easting, northing, altitude)`` endpoint, shape ``(3,)``.
 
     Notes
     -----
-    ``az`` is **azimuth-only**. Unlike :func:`direction_unit_vector` — which is
+    ``az`` is **azimuth-only**. Unlike :func:`horizontal_unit_vector` — which is
     mode-aware and resolves ``direction_mode`` — this function does *not* look
     at ``direction_mode`` and always interprets ``az`` as an azimuth. For a
-    :class:`~geometry.models.common.DirectedObject` whose ``direction_mode`` is
+    :class:`~geometry.models.common.ElevatedObject` whose ``direction_mode`` is
     :attr:`DirectionMode.ANGLE`, callers must convert ``direction`` to an
     azimuth first (e.g. via :func:`~geometry.utils.angles.angle_to_azimuth`) or
-    use :func:`direction_unit_vector` instead; passing a raw ANGLE-mode
+    use :func:`horizontal_unit_vector` instead; passing a raw ANGLE-mode
     ``direction`` here yields a wrong endpoint.
 
-    ``az`` and ``length`` are assumed **finite**. This function intentionally
-    carries no ``math.isfinite`` guard — unlike :func:`direction_unit_vector`,
-    which validates because it resolves a stored ``direction`` that may have
-    been corrupted on deserialisation. ``vector_endpoint`` takes plain scalar
-    arguments that the command layer computes locally, so the validation
-    responsibility sits with the caller. A non-finite ``az`` or ``length``
-    propagates silently into a ``nan``/``inf`` endpoint array; callers passing
-    values from an untrusted source must check them before calling.
+    ``az``, ``el``, and ``length`` are assumed **finite**. This function
+    intentionally carries no ``math.isfinite`` guard — unlike
+    :func:`horizontal_unit_vector`, which validates because it resolves a stored
+    ``direction`` that may have been corrupted on deserialisation.
+    ``vector_endpoint`` takes plain scalar arguments that the command layer
+    computes locally, so the validation responsibility sits with the caller. A
+    non-finite argument propagates silently into a ``nan``/``inf`` endpoint
+    array; callers passing values from an untrusted source must check them
+    before calling.
     """
-    length = np.float64(length)
-    az = np.float64(az)
+    sin_az = math.sin(az)
+    cos_az = math.cos(az)
+    sin_el = math.sin(el)
+    cos_el = math.cos(el)
+    h = length * cos_el
     return np.array(
         [
-            np.float64(origin.easting) + length * np.sin(az),
-            np.float64(origin.northing) + length * np.cos(az),
+            origin.easting + h * sin_az,
+            origin.northing + h * cos_az,
+            origin.altitude + length * sin_el,
         ],
         dtype=np.float64,
     )

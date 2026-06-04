@@ -14,16 +14,16 @@
 
 from dataclasses import dataclass, field
 
-from geometry.models.common import DirectedObject
+from geometry.models.common import ElevatedObject
 
 
 @dataclass
-class Ray(DirectedObject):
+class Ray(ElevatedObject):
     """A ray originating from a point and extending infinitely in one direction.
 
-    Inherits ``direction``, ``direction_mode``, and ``direction_units`` from
-    ``DirectedObject``.  ``fill_color`` is stored for schema consistency but
-    is not rendered for this 1-D object.
+    Inherits ``direction``, ``elevation``, ``direction_mode``, and
+    ``direction_units`` from ``ElevatedObject``.  ``fill_color`` is stored
+    for schema consistency but is not rendered for this 1-D object.
 
     Fields
     ------
@@ -38,9 +38,9 @@ class Ray(DirectedObject):
     --------
     geometry.models.common.GeoObject : Shared envelope fields (``id``, ``name``,
         ``type``, ``alpha``, ``visibility``) inherited by every concrete model.
-    geometry.models.common.DirectedObject : Direction metadata (``direction``,
-        ``direction_mode``, ``direction_units``) inherited by all four
-        direction-bearing types (Line, Ray, Vector, Tangent).
+    geometry.models.common.ElevatedObject : Direction and elevation metadata
+        (``direction``, ``elevation``, ``direction_mode``, ``direction_units``)
+        inherited by all four direction-bearing types (Line, Ray, Vector, Tangent).
     """
 
     origin_id: str

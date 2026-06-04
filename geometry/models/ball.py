@@ -20,20 +20,22 @@ from geometry.utils.constants import EPS_DISTANCE
 
 
 @dataclass
-class Circle(GeoObject):
-    """A circle defined by a centre point and a radius.
+class Ball(GeoObject):
+    """A 3D sphere defined by a center Point and radius.
 
     Fields
     ------
     center_id : str
-        ID of the centre point.
+        ID of the Point at the geometric center of the sphere (a ``pt_``-prefixed
+        Point ID).
     radius : float
         Radius in metres; must be finite and greater than ``EPS_DISTANCE``
-        (a linear dimension, matching the ``Ball``/``Cylinder`` guard).
+        (radius is a linear dimension, so the linear tolerance applies).
     line_color : str
-        Hex colour string for the outline stroke.
+        Wireframe/stroke color.
     fill_color : str
-        Hex colour string for the interior fill.
+        Interior fill color (rendered in 3D and Slice views; projected circle
+        in 2D flat view).
 
     See Also
     --------
@@ -45,11 +47,11 @@ class Circle(GeoObject):
     radius: float
     line_color: str
     fill_color: str
-    type: str = field(init=False, default="circle")
+    type: str = field(init=False, default="ball")
 
     def __post_init__(self) -> None:
         super().__post_init__()
         if not math.isfinite(self.radius) or self.radius <= EPS_DISTANCE:
             raise ValueError(
-                f"Circle.radius must be finite and > {EPS_DISTANCE}; got {self.radius!r}"
+                f"Ball.radius must be finite and > {EPS_DISTANCE}; got {self.radius!r}"
             )

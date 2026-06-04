@@ -12,20 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 
-from geometry.models.common import DirectedObject
+from geometry.models.common import ElevatedObject
+from geometry.utils.constants import EPS_DISTANCE
 
 
 @dataclass
-class Vector(DirectedObject):
-    """A vector with a fixed origin, direction, and length.
+class Vector(ElevatedObject):
+    """A vector with a fixed origin, direction, length, and elevation.
 
-    Inherits ``direction``, ``direction_mode``, and ``direction_units`` from
-    ``DirectedObject``.
+    Inherits ``direction``, ``elevation``, ``direction_mode``, and
+    ``direction_units`` from ``ElevatedObject``.
 
-    Endpoint formula (azimuth convention):
-        endpoint = (origin_e + length * sin(az), origin_n + length * cos(az))
+    Endpoint formula (azimuth + elevation convention):
+        E = origin.easting  + length * sin(az) * cos(el)
+        N = origin.northing + length * cos(az) * cos(el)
+        Z = origin.altitude + length * sin(el)
 
     The ``endpoint_id`` field is ``None`` when the vector was created via the
     Length + Direction tab; it is set to a Point ID when the vector was created
@@ -51,9 +55,9 @@ class Vector(DirectedObject):
     --------
     geometry.models.common.GeoObject : Shared envelope fields (``id``, ``name``,
         ``type``, ``alpha``, ``visibility``) inherited by every concrete model.
-    geometry.models.common.DirectedObject : Direction metadata (``direction``,
-        ``direction_mode``, ``direction_units``) inherited by all four
-        direction-bearing types (Line, Ray, Vector, Tangent).
+    geometry.models.common.ElevatedObject : Direction and elevation metadata
+        (``direction``, ``elevation``, ``direction_mode``, ``direction_units``)
+        inherited by all four direction-bearing types (Line, Ray, Vector, Tangent).
     """
 
     origin_id: str
@@ -62,3 +66,10 @@ class Vector(DirectedObject):
     line_color: str
     fill_color: str
     type: str = field(init=False, default="vector")
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not math.isfinite(self.length) or self.length <= EPS_DISTANCE:
+            raise ValueError(
+                f"Vector.length must be finite and > {EPS_DISTANCE}; got {self.length!r}"
+            )

@@ -14,16 +14,17 @@
 
 from dataclasses import dataclass, field
 
-from geometry.models.common import DirectedObject
+from geometry.models.common import ElevatedObject
 
 
 @dataclass
-class Line(DirectedObject):
+class Line(ElevatedObject):
     """A directed line segment defined by two point IDs.
 
-    Inherits ``direction``, ``direction_mode``, and ``direction_units`` from
-    ``DirectedObject``.  ``fill_color`` is present in the schema for
-    consistency but is ignored at render time for this 1-D object.
+    Inherits ``direction``, ``elevation``, ``direction_mode``, and
+    ``direction_units`` from ``ElevatedObject``.  ``fill_color`` is present
+    in the schema for consistency but is ignored at render time for this 1-D
+    object.
 
     Fields
     ------
@@ -40,9 +41,9 @@ class Line(DirectedObject):
     --------
     geometry.models.common.GeoObject : Shared envelope fields (``id``, ``name``,
         ``type``, ``alpha``, ``visibility``) inherited by every concrete model.
-    geometry.models.common.DirectedObject : Direction metadata (``direction``,
-        ``direction_mode``, ``direction_units``) inherited by all four
-        direction-bearing types (Line, Ray, Vector, Tangent).
+    geometry.models.common.ElevatedObject : Direction and elevation metadata
+        (``direction``, ``elevation``, ``direction_mode``, ``direction_units``)
+        inherited by all four direction-bearing types (Line, Ray, Vector, Tangent).
 
     Notes
     -----
