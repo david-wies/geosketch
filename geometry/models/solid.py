@@ -28,7 +28,7 @@ class Solid(GeoObject):
 
     Fields
     ------
-    layers : list[str]
+    layers : tuple[str, ...]
         Ordered references to existing Polygon or Point IDs. At least 2
         entries. At most one entry may be a Point ID; it must be first or last.
     line_color : str
@@ -42,18 +42,16 @@ class Solid(GeoObject):
         ``type``, ``alpha``, ``visibility``) inherited by every concrete model.
     """
 
-    layers: list[str]
+    layers: tuple[str, ...]
     line_color: str
     fill_color: str
     type: str = field(init=False, default="solid")
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        self.layers = list(self.layers)
+        self.layers = tuple(self.layers)
         if len(self.layers) < 2:
-            raise ValueError(
-                "Solid requires at least 2 layer IDs (Polygon, plus optional apex Point)"
-            )
+            raise ValueError("Solid requires at least 2 layer IDs")
         # Per spec §10: at most one layer may be a Point ID (the apex/nadir),
         # and it must be the first or last element. Both sub-rules are decidable
         # from the ``pt_`` ID prefix alone — no cross-object lookup needed.

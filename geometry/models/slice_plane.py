@@ -14,6 +14,7 @@
 
 import math
 from dataclasses import dataclass, field
+from typing import Literal
 
 from geometry.utils.constants import EPS_DISTANCE
 
@@ -55,7 +56,7 @@ class SlicePlane:
 
     Fields
     ------
-    mode : str
+    mode : Literal["horizontal", "easting", "northing", "custom"]
         One of ``"horizontal"``, ``"easting"``, ``"northing"``, ``"custom"``.
     a : float
         Coefficient of Easting in the plane equation.
@@ -69,6 +70,12 @@ class SlicePlane:
         Half-thickness of the slab in metres (default 0.0 = exact plane).
         Points within ±``thickness`` of the plane are included.
 
+    All four modes require ``(a, b, c)`` to be a unit normal
+    (``|‖n‖² − 1| ≤ _EPS_UNIT_NORMAL``). The three axis-aligned presets use
+    canonical unit coefficients; Custom mode requires the caller to normalise
+    before constructing. Construction raises ``ValueError`` for any mode if the
+    normal is not unit-length.
+
     Preset encodings
     ----------------
     Horizontal Z=v  →  a=0, b=0, c=1, d=v
@@ -77,7 +84,7 @@ class SlicePlane:
     Custom          →  UI normalises so sqrt(a²+b²+c²)=1, then d is offset.
     """
 
-    mode: str
+    mode: Literal["horizontal", "easting", "northing", "custom"]
     a: float
     b: float
     c: float
@@ -103,8 +110,8 @@ class SlicePlane:
         mag_sq = self.a**2 + self.b**2 + self.c**2
         if mag_sq < _EPS_NORMAL_SQ:
             raise ValueError("SlicePlane normal (a, b, c) must not be the zero vector")
-        if self.mode == "custom" and abs(mag_sq - 1.0) > _EPS_UNIT_NORMAL:
+        if abs(mag_sq - 1.0) > _EPS_UNIT_NORMAL:
             raise ValueError(
-                f"SlicePlane normal (a, b, c) must be unit-length for custom mode; "
+                f"SlicePlane normal (a, b, c) must be unit-length for {self.mode!r} mode; "
                 f"got magnitude {math.sqrt(mag_sq):.6f}"
             )

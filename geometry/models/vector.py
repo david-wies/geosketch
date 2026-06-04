@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 
 from geometry.models.common import ElevatedObject
+from geometry.utils.constants import EPS_DISTANCE
 
 
 @dataclass
@@ -64,3 +66,10 @@ class Vector(ElevatedObject):
     line_color: str
     fill_color: str
     type: str = field(init=False, default="vector")
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not math.isfinite(self.length) or self.length <= EPS_DISTANCE:
+            raise ValueError(
+                f"Vector.length must be finite and > {EPS_DISTANCE}; got {self.length!r}"
+            )

@@ -797,3 +797,23 @@ def test_vector_endpoint_propagates_nan_silently():
     # from untrusted sources must validate before calling (see docstring).
     end = geo.vector_endpoint(_pt("o", 0, 0), float("nan"), 0.0)
     assert any(math.isnan(v) for v in end)
+
+
+def test_vector_endpoint_straight_up():
+    # At elevation = π/2: cos(el)=0 so no horizontal movement, sin(el)=1 so
+    # the full length goes into the Z component. Guards a future sin/cos
+    # transposition in the formula.
+    end = geo.vector_endpoint(_pt("o", 100.0, 200.0, 30.0), 10.0, math.pi / 2, math.pi / 2)
+    assert end[0] == pytest.approx(100.0)
+    assert end[1] == pytest.approx(200.0)
+    assert end[2] == pytest.approx(40.0)
+
+
+def test_horizontal_unit_vector_azimuth_north():
+    # Azimuth 0.0 is due North. azimuth_to_angle should yield π/2, so the unit
+    # vector should be (easting=0.0, northing=1.0). The existing tests cover East
+    # via azimuth and North via angle, but not North via azimuth.
+    ray = _ray("ry", "o", 0.0, DirectionMode.AZIMUTH)
+    vec = geo.horizontal_unit_vector(ray)
+    assert vec[0] == pytest.approx(0.0)
+    assert vec[1] == pytest.approx(1.0)

@@ -113,6 +113,10 @@ class ElevatedObject(GeoObject):
     ------
     direction : float
         Horizontal bearing in radians (internal storage); must be finite.
+        Regardless of ``direction_mode``, the value is automatically
+        normalized into ``[0, 2π)`` at construction via modulo arithmetic,
+        so callers do not need to pre-range direction values in either
+        AZIMUTH or ANGLE mode.
     elevation : float
         Angle above the horizontal plane in radians, range ``[-π/2, π/2]``;
         0.0 = horizontal. Required at construction (forms/loader supply 0.0).
@@ -141,6 +145,7 @@ class ElevatedObject(GeoObject):
             )
         if not math.isfinite(self.direction):
             raise ValueError(f"ElevatedObject.direction must be finite; got {self.direction!r}")
+        self.direction = self.direction % (2 * math.pi)
         if not math.isfinite(self.elevation):
             raise ValueError(f"ElevatedObject.elevation must be finite; got {self.elevation!r}")
         if not -math.pi / 2 <= self.elevation <= math.pi / 2:

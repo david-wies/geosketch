@@ -51,11 +51,10 @@ class Cylinder(GeoObject):
         Horizontal bearing of the axis in radians (stored as 0.0 when vertical).
     axis_elevation : float
         Angle of the axis above the horizontal plane in radians; range
-        ``(0, π/2]``. π/2 = vertical. Must be > 0 (0 = flat disk, rejected
-        by validation). For ``axis_mode='inclined'`` the upper bound is
-        strictly open (``axis_elevation < π/2``, within ``EPS_ANGLE``); use
-        ``axis_mode='vertical'`` for a vertical axis so that ``axis_azimuth``
-        is always meaningful.
+        ``(0, π/2)`` strictly open for ``axis_mode='inclined'``. Must be > 0
+        (0 = flat disk, rejected by validation). Values within ``EPS_ANGLE``
+        of π/2 are also rejected for inclined mode — use ``axis_mode='vertical'``
+        for a vertical axis so that ``axis_azimuth`` is always meaningful.
     direction_mode : DirectionMode
         Controls display of ``axis_azimuth``.
     direction_units : DirectionUnits
@@ -104,15 +103,19 @@ class Cylinder(GeoObject):
         if not math.isfinite(self.axis_elevation):
             raise ValueError(f"Cylinder.axis_elevation must be finite; got {self.axis_elevation!r}")
         if self.axis_mode == "inclined":
-            if not 0.0 < self.axis_elevation <= math.pi / 2:
-                raise ValueError(
-                    f"Cylinder.axis_elevation must be in (0, π/2) for an inclined "
-                    f"cylinder; got {self.axis_elevation!r}"
-                )
+            # Check the near-vertical case first so that values within EPS_ANGLE
+            # of π/2 get the actionable "use axis_mode='vertical'" message instead
+            # of the generic range message (the range check uses strict <, so
+            # values at or above π/2 would otherwise hit the range error first).
             if abs(self.axis_elevation - math.pi / 2) < EPS_ANGLE:
                 raise ValueError(
-                    f"Cylinder.axis_elevation = π/2 is vertical; use "
-                    f"axis_mode='vertical' instead; got {self.axis_elevation!r}"
+                    f"Cylinder.axis_elevation = π/2 (or within EPS_ANGLE) is vertical; "
+                    f"use axis_mode='vertical' instead; got {self.axis_elevation!r}"
+                )
+            if not 0.0 < self.axis_elevation < math.pi / 2:
+                raise ValueError(
+                    f"Cylinder.axis_elevation must be strictly in (0, π/2) for an "
+                    f"inclined cylinder; got {self.axis_elevation!r}"
                 )
         if self.axis_mode == "vertical" and abs(self.axis_elevation - math.pi / 2) > EPS_ANGLE:
             raise ValueError(

@@ -401,7 +401,7 @@ def test_solid_instantiation():
         fill_color="#cc9966",
     )
     assert so.type == "solid"
-    assert so.layers == ["pg_001", "pg_002", "pg_003"]
+    assert so.layers == ("pg_001", "pg_002", "pg_003")
 
 
 def test_solid_layers_defensively_copied():
@@ -415,7 +415,7 @@ def test_solid_layers_defensively_copied():
         line_color="#000000",
         fill_color="#ffffff",
     )
-    assert so.layers == shared
+    assert so.layers == tuple(shared)
     assert so.layers is not shared
     shared.append("pg_999")
     assert "pg_999" not in so.layers
@@ -591,6 +591,30 @@ def test_elevated_object_rejects_non_finite_direction():
     for bad in (math.nan, math.inf, -math.inf):
         with pytest.raises(ValueError, match="direction"):
             Line(**_line_kwargs(direction=bad))
+
+
+# ---------------------------------------------------------------------------
+# ElevatedObject: azimuth normalization
+# ---------------------------------------------------------------------------
+
+
+def test_azimuth_mode_normalizes_direction_above_two_pi():
+    # 3π mod 2π = π — a value one full turn past π wraps back to π.
+    ln = Line(**_line_kwargs(direction=3 * math.pi, direction_mode=DirectionMode.AZIMUTH))
+    assert ln.direction == pytest.approx(math.pi)
+
+
+def test_azimuth_mode_normalizes_negative_direction():
+    # -π/2 mod 2π = 3π/2 — negative azimuths wrap into [0, 2π).
+    ln = Line(**_line_kwargs(direction=-math.pi / 2, direction_mode=DirectionMode.AZIMUTH))
+    assert ln.direction == pytest.approx(3 * math.pi / 2)
+
+
+def test_angle_mode_normalizes_direction_above_two_pi():
+    # Angle mode applies the same [0, 2π) normalization as azimuth mode.
+    # 3π mod 2π = π — a value one full turn past π wraps back to π.
+    ln = Line(**_line_kwargs(direction=3 * math.pi, direction_mode=DirectionMode.ANGLE))
+    assert ln.direction == pytest.approx(math.pi)
 
 
 def test_ball_rejects_non_finite_radius():
@@ -870,6 +894,60 @@ def test_slice_plane_rejects_non_finite_thickness():
     for bad in (math.nan, math.inf):
         with pytest.raises(ValueError, match="thickness"):
             SlicePlane(mode="horizontal", a=0.0, b=0.0, c=1.0, d=0.0, thickness=bad)
+
+
+# ---------------------------------------------------------------------------
+# Vector: length validation
+# ---------------------------------------------------------------------------
+
+
+def _vector_kwargs(**overrides) -> dict:
+    base = {
+        "id": "vc_001",
+        "name": "V",
+        "alpha": 1.0,
+        "visibility": True,
+        "origin_id": "pt_001",
+        "direction": 0.785,
+        "elevation": 0.0,
+        "direction_mode": DirectionMode.AZIMUTH,
+        "direction_units": DirectionUnits.RADIANS,
+        "length": 100.0,
+        "endpoint_id": None,
+        "line_color": "#000000",
+        "fill_color": "#ffffff",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_cylinder_rejects_height_at_distance_floor():
+    # Mirror of test_cylinder_rejects_radius_at_distance_floor for height.
+    with pytest.raises(ValueError, match="height"):
+        Cylinder(**_cylinder_kwargs(height=EPS_DISTANCE))
+
+
+def test_cylinder_inclined_accepts_small_positive_axis_elevation():
+    # A small positive elevation well below EPS_ANGLE of π/2 must be accepted
+    # for inclined mode, pinning the strict lower bound from the acceptance side.
+    cy = Cylinder(
+        **_cylinder_kwargs(
+            axis_mode="inclined",
+            axis_azimuth=0.785,
+            axis_elevation=0.01,
+        )
+    )
+    assert cy.axis_mode == "inclined"
+    assert cy.axis_elevation == pytest.approx(0.01)
+
+
+def test_tangent_circle_accepts_elevation_at_exact_tolerance_boundary():
+    # elevation = EPS_ANGLE: the check is ``abs(elevation) > EPS_ANGLE``, so the
+    # exact boundary value is accepted (strict >), not rejected. This pins the
+    # strict inequality so a future change to >= would fail loud.
+    tg = Tangent(**_tangent_kwargs(shape_type="circle", elevation=EPS_ANGLE))
+    assert tg.shape_type == "circle"
+    assert tg.elevation == EPS_ANGLE
 
 
 # ---------------------------------------------------------------------------
