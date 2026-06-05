@@ -33,6 +33,10 @@ max-attributes = 15
 
 [tool.pylint.format]
 max-line-length = 100
+# tests/test_geometry.py is a single cohesive known-input/known-output suite
+# for the geometry service and naturally runs long; splitting it would only
+# duplicate fixtures. 1500 leaves headroom above the default 1000.
+max-module-lines = 1500
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

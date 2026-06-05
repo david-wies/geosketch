@@ -930,6 +930,19 @@ def test_three_point_azimuth_none_for_vertical_arm():
     assert el == pytest.approx(math.pi / 2)
 
 
+def test_three_point_azimuth_none_for_vertical_first_arm():
+    # The mirror of the previous case: arm B→A is purely vertical while arm B→C
+    # is horizontal. The azimuth ``None`` guard is ``hypot(ba) < EPS or
+    # hypot(bc) < EPS``; here only the left operand fires, so this exercises the
+    # ba-vertical-alone trigger. The elevation el(BC) − el(BA) is 0 − π/2 = −π/2.
+    b = _pt("b", 0, 0, 0.0)
+    a = _pt("a", 0, 0, 5.0)  # directly above B
+    c = _pt("c", 10, 0, 0.0)  # horizontal from B
+    az, el = geo.three_point_azimuth_elevation(a, b, c)
+    assert az is None
+    assert el == pytest.approx(-math.pi / 2)
+
+
 def test_three_point_raises_on_zero_length_arm():
     # An arm of zero 3-D length (A coincident with vertex B) leaves the angle
     # undefined and must raise.
