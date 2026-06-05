@@ -1,0 +1,311 @@
+# Copyright 2026 David Wies
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests for :mod:`geometry.services.dep_graph`.
+
+Two concerns are exercised here:
+
+* the bare graph mechanics (``register`` / ``unregister`` / ``dependents_of``),
+  including transitive closure, diamond de-duplication and edge pruning, using
+  plain string IDs so the traversal is tested in isolation; and
+* :meth:`DependencyGraph.deps_for_type`, the per-type edge table, against real
+  model instances so the forward-edge sets match the design spec for all ten
+  object types.
+"""
+
+import pytest
+
+from geometry.models import (
+    Ball,
+    Circle,
+    Cylinder,
+    DirectionMode,
+    DirectionUnits,
+    Line,
+    Point,
+    Polygon,
+    Ray,
+    Solid,
+    Tangent,
+    Vector,
+)
+from geometry.services.dep_graph import DependencyGraph
+
+
+# ---------------------------------------------------------------------------
+# Compact model builders. Only the reference fields matter for deps_for_type;
+# the rest are filled with valid-but-arbitrary envelope values.
+# ---------------------------------------------------------------------------
+
+_BEARING = {
+    "direction": 0.0,
+    "elevation": 0.0,
+    "direction_mode": DirectionMode.AZIMUTH,
+    "direction_units": DirectionUnits.RADIANS,
+}
+
+
+def _env(prefix: str, idx: int = 1) -> dict:
+    return {
+        "id": f"{prefix}_{idx:03d}",
+        "name": f"{prefix}{idx}",
+        "alpha": 1.0,
+        "visibility": True,
+    }
+
+
+def _colors() -> dict:
+    return {"line_color": "#000000", "fill_color": "#ffffff"}
+
+
+# ---------------------------------------------------------------------------
+# Bare graph mechanics
+# ---------------------------------------------------------------------------
+
+
+def test_register_then_dependents_of_returns_direct_dependent():
+    graph = DependencyGraph()
+    graph.register("ln_001", {"pt_001", "pt_002"})
+    assert graph.dependents_of("pt_001") == {"ln_001"}
+    assert graph.dependents_of("pt_002") == {"ln_001"}
+
+
+def test_dependents_of_leaf_with_no_dependents_is_empty():
+    graph = DependencyGraph()
+    graph.register("ln_001", {"pt_001"})
+    # The line itself is a leaf — nothing depends on it.
+    assert graph.dependents_of("ln_001") == set()
+
+
+def test_dependents_of_unknown_id_is_empty():
+    graph = DependencyGraph()
+    assert graph.dependents_of("pt_999") == set()
+
+
+def test_dependents_of_excludes_the_queried_node_itself():
+    graph = DependencyGraph()
+    graph.register("ln_001", {"pt_001"})
+    graph.register("pg_001", {"pt_001"})
+    assert "pt_001" not in graph.dependents_of("pt_001")
+
+
+def test_dependents_of_collects_transitive_closure():
+    graph = DependencyGraph()
+    # pt_001 <- ci_001 <- tg_001  (tangent depends on circle depends on point)
+    graph.register("ci_001", {"pt_001"})
+    graph.register("tg_001", {"ci_001"})
+    assert graph.dependents_of("pt_001") == {"ci_001", "tg_001"}
+
+
+def test_dependents_of_fan_out_multiple_direct_dependents():
+    graph = DependencyGraph()
+    graph.register("ln_001", {"pt_001"})
+    graph.register("ry_001", {"pt_001"})
+    graph.register("ci_001", {"pt_001"})
+    assert graph.dependents_of("pt_001") == {"ln_001", "ry_001", "ci_001"}
+
+
+def test_dependents_of_diamond_deduplicates():
+    graph = DependencyGraph()
+    # pt_001 feeds ln_001 and ln_002; pg_001 depends on both lines.
+    graph.register("ln_001", {"pt_001"})
+    graph.register("ln_002", {"pt_001"})
+    graph.register("pg_001", {"ln_001", "ln_002"})
+    assert graph.dependents_of("pt_001") == {"ln_001", "ln_002", "pg_001"}
+
+
+def test_register_with_empty_deps_creates_no_edges():
+    graph = DependencyGraph()
+    graph.register("pt_001", set())
+    assert graph.dependents_of("pt_001") == set()
+
+
+def test_reregister_replaces_old_edges():
+    graph = DependencyGraph()
+    graph.register("ln_001", {"pt_001", "pt_002"})
+    graph.register("ln_001", {"pt_002", "pt_003"})
+    # pt_001 is no longer a dependency of ln_001 after re-registration.
+    assert graph.dependents_of("pt_001") == set()
+    assert graph.dependents_of("pt_002") == {"ln_001"}
+    assert graph.dependents_of("pt_003") == {"ln_001"}
+
+
+def test_unregister_removes_node_as_a_dependent():
+    graph = DependencyGraph()
+    graph.register("ln_001", {"pt_001"})
+    graph.unregister("ln_001")
+    assert graph.dependents_of("pt_001") == set()
+
+
+def test_unregister_prunes_node_from_transitive_closure():
+    graph = DependencyGraph()
+    graph.register("ci_001", {"pt_001"})
+    graph.register("tg_001", {"ci_001"})
+    graph.unregister("ci_001")
+    # With the circle gone, the point no longer transitively reaches anything.
+    assert graph.dependents_of("pt_001") == set()
+
+
+def test_unregister_unknown_id_is_noop():
+    graph = DependencyGraph()
+    graph.register("ln_001", {"pt_001"})
+    graph.unregister("pt_999")
+    assert graph.dependents_of("pt_001") == {"ln_001"}
+
+
+# ---------------------------------------------------------------------------
+# deps_for_type — the per-type forward-edge table
+# ---------------------------------------------------------------------------
+
+
+def test_deps_for_type_point_is_empty():
+    pt = Point(**_env("pt"), easting=0.0, northing=0.0, altitude=0.0, color="#ff0000")
+    assert DependencyGraph().deps_for_type(pt) == set()
+
+
+def test_deps_for_type_line():
+    ln = Line(
+        **_env("ln"),
+        point_a_id="pt_001",
+        point_b_id="pt_002",
+        **_BEARING,
+        **_colors(),
+    )
+    assert DependencyGraph().deps_for_type(ln) == {"pt_001", "pt_002"}
+
+
+def test_deps_for_type_polygon():
+    pg = Polygon(
+        **_env("pg"),
+        point_ids=["pt_001", "pt_002", "pt_003"],
+        is_convex=True,
+        **_colors(),
+    )
+    assert DependencyGraph().deps_for_type(pg) == {"pt_001", "pt_002", "pt_003"}
+
+
+def test_deps_for_type_ray():
+    ry = Ray(**_env("ry"), origin_id="pt_001", **_BEARING, **_colors())
+    assert DependencyGraph().deps_for_type(ry) == {"pt_001"}
+
+
+def test_deps_for_type_vector_without_endpoint():
+    vc = Vector(
+        **_env("vc"),
+        origin_id="pt_001",
+        length=10.0,
+        endpoint_id=None,
+        **_BEARING,
+        **_colors(),
+    )
+    assert DependencyGraph().deps_for_type(vc) == {"pt_001"}
+
+
+def test_deps_for_type_vector_with_endpoint():
+    vc = Vector(
+        **_env("vc"),
+        origin_id="pt_001",
+        length=10.0,
+        endpoint_id="pt_002",
+        **_BEARING,
+        **_colors(),
+    )
+    assert DependencyGraph().deps_for_type(vc) == {"pt_001", "pt_002"}
+
+
+def test_deps_for_type_circle():
+    ci = Circle(**_env("ci"), center_id="pt_001", radius=5.0, **_colors())
+    assert DependencyGraph().deps_for_type(ci) == {"pt_001"}
+
+
+def test_deps_for_type_ball():
+    ba = Ball(**_env("ba"), center_id="pt_001", radius=5.0, **_colors())
+    assert DependencyGraph().deps_for_type(ba) == {"pt_001"}
+
+
+def test_deps_for_type_cylinder():
+    cy = Cylinder(
+        **_env("cy"),
+        base_center_id="pt_001",
+        radius=5.0,
+        height=10.0,
+        axis_mode="vertical",
+        axis_azimuth=0.0,
+        axis_elevation=1.5707963267948966,
+        direction_mode=DirectionMode.AZIMUTH,
+        direction_units=DirectionUnits.RADIANS,
+        **_colors(),
+    )
+    assert DependencyGraph().deps_for_type(cy) == {"pt_001"}
+
+
+def test_deps_for_type_solid():
+    so = Solid(**_env("so"), layers=["pg_001", "pg_002", "pt_010"], **_colors())
+    assert DependencyGraph().deps_for_type(so) == {"pg_001", "pg_002", "pt_010"}
+
+
+def test_deps_for_type_tangent_on_circle():
+    tg = Tangent(
+        **_env("tg"),
+        shape_id="ci_001",
+        shape_type="circle",
+        point_id="pt_001",
+        **_BEARING,
+        **_colors(),
+    )
+    assert DependencyGraph().deps_for_type(tg) == {"ci_001", "pt_001"}
+
+
+def test_deps_for_type_tangent_on_ball():
+    tg = Tangent(
+        **_env("tg"),
+        shape_id="ba_001",
+        shape_type="ball",
+        point_id="pt_001",
+        **_BEARING,
+        **_colors(),
+    )
+    assert DependencyGraph().deps_for_type(tg) == {"ba_001", "pt_001"}
+
+
+# ---------------------------------------------------------------------------
+# Integration: deps_for_type feeding register, then a multi-hop cascade query
+# ---------------------------------------------------------------------------
+
+
+def test_cascade_point_circle_tangent_via_deps_for_type():
+    graph = DependencyGraph()
+    ci = Circle(**_env("ci"), center_id="pt_001", radius=5.0, **_colors())
+    tg = Tangent(
+        **_env("tg"),
+        shape_id="ci_001",
+        shape_type="circle",
+        point_id="pt_002",
+        **_BEARING,
+        **_colors(),
+    )
+    graph.register(ci.id, graph.deps_for_type(ci))
+    graph.register(tg.id, graph.deps_for_type(tg))
+    # Deleting the centre point cascades to the circle and onward to the tangent.
+    assert graph.dependents_of("pt_001") == {"ci_001", "tg_001"}
+    # The tangent's own point only reaches the tangent.
+    assert graph.dependents_of("pt_002") == {"tg_001"}
+
+
+def test_deps_for_type_unknown_type_raises():
+    graph = DependencyGraph()
+    pt = Point(**_env("pt"), easting=0.0, northing=0.0, altitude=0.0, color="#ff0000")
+    object.__setattr__(pt, "type", "bogus")
+    with pytest.raises(ValueError):
+        graph.deps_for_type(pt)
