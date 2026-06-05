@@ -84,6 +84,8 @@ from geometry.utils.constants import EPS_ANGLE, EPS_DISTANCE, EPS_PARAM
 __all__ = [
     "azimuth",
     "distance",
+    "elevation",
+    "three_point_azimuth_elevation",
     "signed_area",
     "is_convex",
     "convex_hull",
@@ -109,6 +111,16 @@ _HALF_PI = math.pi / 2.0
 def _xy(point: Point) -> np.ndarray:
     """Return ``point`` as a ``float64`` ``(easting, northing)`` array."""
     return np.array([point.easting, point.northing], dtype=np.float64)
+
+
+def _xyz(point: Point) -> np.ndarray:
+    """Return ``point`` as a ``float64`` ``(easting, northing, altitude)`` array.
+
+    The 3-D sibling of :func:`_xy`, used by the 3-D operations
+    (:func:`elevation`) so the easting-first, altitude-last ordering lives in
+    one place.
+    """
+    return np.array([point.easting, point.northing, point.altitude], dtype=np.float64)
 
 
 def _delta(a: Point, b: Point) -> tuple[float, float]:
@@ -225,6 +237,31 @@ def distance(pt_a: Point, pt_b: Point) -> np.float64:
     d_e, d_n = _delta(pt_a, pt_b)
     d_z = pt_b.altitude - pt_a.altitude
     return np.sqrt(d_e**2 + d_n**2 + d_z**2)
+
+
+def elevation(pt_a: Point, pt_b: Point) -> np.float64:
+    """Elevation angle from ``pt_a`` to ``pt_b`` in radians.
+
+    The elevation is the angle of the arm ``pt_a → pt_b`` above the horizontal
+    plane, ``atan2(Δz, √(Δe²+Δn²))``. It is the vertical counterpart of
+    :func:`azimuth`: azimuth answers *which horizontal bearing*, elevation
+    answers *how steeply up or down*.
+
+    Parameters
+    ----------
+    pt_a, pt_b : Point
+        Start and end points, each with an ``altitude`` field.
+
+    Returns
+    -------
+    numpy.float64
+        Elevation in radians in ``[-π/2, π/2]``. Positive when ``pt_b`` is
+        higher than ``pt_a``, negative when lower, ``±π/2`` for a purely
+        vertical arm, and ``0.0`` when the two points are coincident (the
+        ``atan2(0, 0)`` degenerate case is well-defined as ``0.0``).
+    """
+    d_e, d_n, d_z = _xyz(pt_b) - _xyz(pt_a)
+    return np.arctan2(d_z, np.hypot(d_e, d_n))
 
 
 # ---------------------------------------------------------------------------
@@ -784,3 +821,66 @@ def vector_endpoint(origin: Point, length: float, az: float, el: float = 0.0) ->
         ],
         dtype=np.float64,
     )
+
+
+# ---------------------------------------------------------------------------
+# angle measurements
+# ---------------------------------------------------------------------------
+
+
+def three_point_azimuth_elevation(
+    a: Point, b: Point, c: Point
+) -> tuple[np.float64 | None, np.float64]:
+    """Azimuth and elevation of the angle at vertex ``b`` for the ordered triple.
+
+    The vertex is ``b``; the two arms are ``b → a`` and ``b → c``. The result is
+    the *directed* turn from arm ``BA`` to arm ``BC``, split into a horizontal
+    component (azimuth) and a vertical component (elevation). This is the
+    three-point sibling of :func:`azimuth`/:func:`elevation`, surfaced by the
+    *Angle at Vertex* measurement.
+
+    The triple is **ordered**: swapping ``a`` and ``c`` yields the explementary
+    azimuth (``2π − az``, for a non-zero turn) and the negated elevation.
+
+    Parameters
+    ----------
+    a, b, c : Point
+        The first arm endpoint, the vertex, and the second arm endpoint.
+
+    Returns
+    -------
+    tuple[numpy.float64 | None, numpy.float64]
+        ``(azimuth, elevation)`` in radians.
+
+        ``azimuth`` is the horizontal turn from ``BA`` to ``BC``, altitude
+        ignored, normalised to ``[0, 2π)``. It is ``None`` when either arm has
+        no horizontal extent (a purely vertical arm whose horizontal length is
+        ``< EPS_DISTANCE``) — the bearing is undefined there.
+
+        ``elevation`` is ``elevation(b, c) − elevation(b, a)`` in ``[-π, π]``;
+        always defined when the arms have non-zero 3-D length.
+
+    Raises
+    ------
+    ValueError
+        If either arm has zero 3-D length (``distance(a, b)`` or
+        ``distance(c, b)`` ``< EPS_DISTANCE``) — the angle is undefined.
+    """
+    # The arm deltas are recomputed across distance() (guard), the inline
+    # azimuth below, and elevation() (return). That redundancy is intentional:
+    # this runs once per measurement, so the few extra subtractions cost
+    # nothing, and delegating to distance()/elevation() keeps those formulas
+    # single-sourced rather than duplicating them here.
+    if distance(a, b) < EPS_DISTANCE:
+        raise ValueError("three_point_azimuth_elevation: arm BA has zero length")
+    if distance(c, b) < EPS_DISTANCE:
+        raise ValueError("three_point_azimuth_elevation: arm BC has zero length")
+
+    ba_e, ba_n = a.easting - b.easting, a.northing - b.northing
+    bc_e, bc_n = c.easting - b.easting, c.northing - b.northing
+    if np.hypot(ba_e, ba_n) < EPS_DISTANCE or np.hypot(bc_e, bc_n) < EPS_DISTANCE:
+        azimuth_turn = None
+    else:
+        azimuth_turn = normalize_to_2pi(np.arctan2(bc_e, bc_n) - np.arctan2(ba_e, ba_n))
+
+    return azimuth_turn, elevation(b, c) - elevation(b, a)
