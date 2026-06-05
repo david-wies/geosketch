@@ -47,14 +47,33 @@ class DependencyGraph:
     Fields
     ------
     _deps : dict[str, set[str]]
-        Forward edges: ``obj_id`` -> set of IDs it depends on.
+        Forward edges: ``obj_id`` -> set of IDs it depends on. A registered
+        object always keeps an entry here, even when its set is empty (a Point,
+        or an object whose every dependency has since been unregistered): the
+        empty set is a deliberate presence marker, not noise.
     _rdeps : dict[str, set[str]]
-        Reverse edges: ``obj_id`` -> set of IDs that depend on it.
+        Reverse edges: ``obj_id`` -> set of IDs that depend on it. Empty sets
+        are never retained here — a key is dropped the moment its last reverse
+        edge is pruned — so the two maps are intentionally asymmetric. Only
+        ``_rdeps`` is walked by :meth:`dependents_of`, so its emptiness is what
+        matters for query results.
     """
 
     def __init__(self) -> None:
         self._deps: dict[str, set[str]] = {}
         self._rdeps: dict[str, set[str]] = {}
+
+    def add(self, obj: GeoObject) -> None:
+        """Register ``obj`` using the dependency set derived from its own type.
+
+        Convenience wrapper that couples :meth:`register` to
+        :meth:`deps_for_type`, so a caller cannot accidentally register an
+        incomplete edge set (which would let an orphan survive a cascade
+        delete). Command code should prefer this over calling :meth:`register`
+        directly; :meth:`register` stays available for tests and for callers
+        that already hold a precomputed dependency set.
+        """
+        self.register(obj.id, self.deps_for_type(obj))
 
     def register(self, obj_id: str, dep_ids: set[str]) -> None:
         """Record that ``obj_id`` depends on every id in ``dep_ids``.
@@ -95,6 +114,11 @@ class DependencyGraph:
         for dependent in self._rdeps.pop(obj_id, set()):
             forward = self._deps.get(dependent)
             if forward is not None:
+                # Intentionally do NOT delete an emptied forward set: a
+                # dependent that loses its last edge is still a registered
+                # object, and an empty ``_deps`` entry is its presence marker
+                # (identical to a freshly registered Point). ``_rdeps`` is the
+                # map that must stay free of empty sets; see the class docstring.
                 forward.discard(obj_id)
 
     def dependents_of(self, obj_id: str) -> set[str]:
@@ -141,6 +165,11 @@ class DependencyGraph:
             If ``obj.type`` is not one of the ten known object types.
         """
         deps: set[str]
+        # Dispatch on the string discriminant ``obj.type`` — the same
+        # discriminated-union key used by the JSON wire format — rather than
+        # ``isinstance``. Deliberate trade-off: a static checker cannot verify
+        # the subtype-only attribute reads in each arm, so the exhaustive
+        # per-type tests plus the ``case _`` guard are the safety net.
         match obj.type:
             case "point":
                 deps = set()

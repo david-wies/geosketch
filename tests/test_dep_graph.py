@@ -164,6 +164,43 @@ def test_unregister_unknown_id_is_noop():
     assert graph.dependents_of("pt_001") == {"ln_001"}
 
 
+def test_dependents_of_terminates_on_a_two_node_cycle():
+    # The real domain is a DAG, but the BFS visited-guard is the only thing
+    # preventing an infinite loop should a cyclic reverse edge ever exist.
+    # Pin the termination contract so a refactor that drops the guard fails
+    # here (by hanging) rather than passing silently.
+    graph = DependencyGraph()
+    graph.register("a", {"b"})
+    graph.register("b", {"a"})
+    assert graph.dependents_of("a") == {"a", "b"}
+    assert graph.dependents_of("b") == {"a", "b"}
+
+
+def test_dependents_of_terminates_on_a_self_loop():
+    graph = DependencyGraph()
+    graph.register("x", {"x"})
+    assert graph.dependents_of("x") == {"x"}
+
+
+def test_dependents_of_returns_a_fresh_set_callers_cannot_corrupt_state():
+    # Mutating a returned set must not bleed back into the graph's internals.
+    graph = DependencyGraph()
+    graph.register("ln_001", {"pt_001"})
+    result = graph.dependents_of("pt_001")
+    result.add("bogus")
+    assert graph.dependents_of("pt_001") == {"ln_001"}
+
+
+def test_register_copies_its_input_set():
+    # A caller mutating the set it passed to register must not alter the graph.
+    graph = DependencyGraph()
+    deps = {"pt_001"}
+    graph.register("ln_001", deps)
+    deps.add("pt_002")
+    assert graph.dependents_of("pt_002") == set()
+    assert graph.dependents_of("pt_001") == {"ln_001"}
+
+
 # ---------------------------------------------------------------------------
 # deps_for_type — the per-type forward-edge table
 # ---------------------------------------------------------------------------
@@ -279,6 +316,46 @@ def test_deps_for_type_tangent_on_ball():
     assert DependencyGraph().deps_for_type(tg) == {"ba_001", "pt_001"}
 
 
+def test_deps_for_type_line_with_identical_endpoints_collapses():
+    # A degenerate Line whose two endpoint ids coincide yields a one-element
+    # set. Pin the intent so the collapse is documented, not accidental.
+    ln = Line(
+        **_env("ln"),
+        point_a_id="pt_001",
+        point_b_id="pt_001",
+        **_BEARING,
+        **_colors(),
+    )
+    assert DependencyGraph().deps_for_type(ln) == {"pt_001"}
+
+
+def test_deps_for_type_tangent_with_identical_shape_and_point_collapses():
+    tg = Tangent(
+        **_env("tg"),
+        shape_id="x_001",
+        shape_type="circle",
+        point_id="x_001",
+        **_BEARING,
+        **_colors(),
+    )
+    assert DependencyGraph().deps_for_type(tg) == {"x_001"}
+
+
+def test_deps_for_type_returns_a_fresh_set_callers_cannot_corrupt():
+    # The returned set must be independent of any internal state, so mutating
+    # it cannot affect a later register/deps_for_type call.
+    graph = DependencyGraph()
+    pg = Polygon(
+        **_env("pg"),
+        point_ids=["pt_001", "pt_002"],
+        is_convex=True,
+        **_colors(),
+    )
+    deps = graph.deps_for_type(pg)
+    deps.add("bogus")
+    assert graph.deps_for_type(pg) == {"pt_001", "pt_002"}
+
+
 # ---------------------------------------------------------------------------
 # Integration: deps_for_type feeding register, then a multi-hop cascade query
 # ---------------------------------------------------------------------------
@@ -309,3 +386,56 @@ def test_deps_for_type_unknown_type_raises():
     object.__setattr__(pt, "type", "bogus")
     with pytest.raises(ValueError):
         graph.deps_for_type(pt)
+
+
+# ---------------------------------------------------------------------------
+# add — convenience wrapper that couples register to deps_for_type
+# ---------------------------------------------------------------------------
+
+
+def test_add_registers_object_with_its_derived_dependency_set():
+    graph = DependencyGraph()
+    ci = Circle(**_env("ci"), center_id="pt_001", radius=5.0, **_colors())
+    graph.add(ci)
+    # add() must record exactly what deps_for_type derives — no caller can omit
+    # an edge the way a hand-rolled register() call could.
+    assert graph.dependents_of("pt_001") == {"ci_001"}
+
+
+def test_add_matches_register_with_deps_for_type():
+    obj = Line(
+        **_env("ln"),
+        point_a_id="pt_001",
+        point_b_id="pt_002",
+        **_BEARING,
+        **_colors(),
+    )
+    via_add = DependencyGraph()
+    via_add.add(obj)
+    via_register = DependencyGraph()
+    via_register.register(obj.id, via_register.deps_for_type(obj))
+    assert via_add.dependents_of("pt_001") == via_register.dependents_of("pt_001")
+    assert via_add.dependents_of("pt_002") == via_register.dependents_of("pt_002")
+
+
+def test_add_point_creates_presence_entry_with_no_edges():
+    graph = DependencyGraph()
+    pt = Point(**_env("pt"), easting=0.0, northing=0.0, altitude=0.0, color="#ff0000")
+    graph.add(pt)
+    assert graph.dependents_of("pt_001") == set()
+
+
+def test_add_cascade_point_circle_tangent():
+    graph = DependencyGraph()
+    ci = Circle(**_env("ci"), center_id="pt_001", radius=5.0, **_colors())
+    tg = Tangent(
+        **_env("tg"),
+        shape_id="ci_001",
+        shape_type="circle",
+        point_id="pt_002",
+        **_BEARING,
+        **_colors(),
+    )
+    graph.add(ci)
+    graph.add(tg)
+    assert graph.dependents_of("pt_001") == {"ci_001", "tg_001"}
