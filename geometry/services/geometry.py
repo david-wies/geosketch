@@ -866,6 +866,11 @@ def three_point_azimuth_elevation(
         If either arm has zero 3-D length (``distance(a, b)`` or
         ``distance(c, b)`` ``< EPS_DISTANCE``) — the angle is undefined.
     """
+    # The arm deltas are recomputed across distance() (guard), the inline
+    # azimuth below, and elevation() (return). That redundancy is intentional:
+    # this runs once per measurement, so the few extra subtractions cost
+    # nothing, and delegating to distance()/elevation() keeps those formulas
+    # single-sourced rather than duplicating them here.
     if distance(a, b) < EPS_DISTANCE or distance(c, b) < EPS_DISTANCE:
         raise ValueError("three_point_azimuth_elevation: an arm has zero length")
 
