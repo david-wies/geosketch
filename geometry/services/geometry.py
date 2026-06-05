@@ -840,7 +840,7 @@ def three_point_azimuth_elevation(
     *Angle at Vertex* measurement.
 
     The triple is **ordered**: swapping ``a`` and ``c`` yields the explementary
-    azimuth (``2π − az``) and the negated elevation.
+    azimuth (``2π − az``, for a non-zero turn) and the negated elevation.
 
     Parameters
     ----------

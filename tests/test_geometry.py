@@ -938,3 +938,55 @@ def test_three_point_raises_on_zero_length_arm():
     c = _pt("c", 10, 5, 5.0)
     with pytest.raises(ValueError):
         geo.three_point_azimuth_elevation(a, b, c)
+
+
+def test_three_point_raises_when_last_arm_zero_length():
+    # The other half of the zero-length guard: C coincident with vertex B
+    # exercises the ``distance(c, b)`` branch of the ``or`` condition. A is well
+    # separated so only the BC arm is degenerate.
+    b = _pt("b", 5, 5, 5.0)
+    a = _pt("a", 10, 5, 5.0)
+    c = _pt("c", 5, 5, 5.0)  # coincident with B
+    with pytest.raises(ValueError):
+        geo.three_point_azimuth_elevation(a, b, c)
+
+
+def test_three_point_elevation_near_pi_when_arms_point_opposite_vertically():
+    # Arm B→A plunges almost straight down, arm B→C climbs almost straight up,
+    # each keeping a tiny horizontal reach so the azimuth stays defined. The
+    # elevation el(BC) − el(BA) approaches +π, exercising the upper end of the
+    # [-π, π] range the π/4 case never reaches.
+    b = _pt("b", 0, 0, 0.0)
+    a = _pt("a", 1, 0, -1000.0)  # reach 1 East, 1000 down
+    c = _pt("c", 1, 0, 1000.0)  # reach 1 East, 1000 up
+    az, el = geo.three_point_azimuth_elevation(a, b, c)
+    # Both arms share the same horizontal bearing (due East), so the turn is 0.
+    assert az == pytest.approx(0.0)
+    expected = math.atan2(1000.0, 1.0) - math.atan2(-1000.0, 1.0)
+    assert el == pytest.approx(expected)
+    assert expected == pytest.approx(math.pi, abs=2e-3)
+
+
+def test_three_point_both_arms_vertical_none_azimuth_and_negative_pi_elevation():
+    # Both arms purely vertical (horizontal length < EPS): the undefined branch
+    # fires only when BOTH hypots are below EPS, so the azimuth is None. With A
+    # straight up (el +π/2) and C straight down (el −π/2), the elevation
+    # el(BC) − el(BA) is exactly −π — the lower end of the [-π, π] range.
+    b = _pt("b", 0, 0, 0.0)
+    a = _pt("a", 0, 0, 10.0)  # directly above B
+    c = _pt("c", 0, 0, -10.0)  # directly below B
+    az, el = geo.three_point_azimuth_elevation(a, b, c)
+    assert az is None
+    assert el == pytest.approx(-math.pi)
+
+
+def test_three_point_azimuth_wraps_negative_raw_difference():
+    # When the raw az_BC − az_BA is negative it must wrap into [0, 2π). Arm B→A
+    # points East (bearing π/2), arm B→C points North (bearing 0), so the raw
+    # difference is 0 − π/2 = −π/2, which normalises to 3π/2.
+    b = _pt("b", 0, 0, 0.0)
+    a = _pt("a", 10, 0, 0.0)  # due East of B
+    c = _pt("c", 0, 10, 0.0)  # due North of B
+    az, el = geo.three_point_azimuth_elevation(a, b, c)
+    assert az == pytest.approx(3 * math.pi / 2)
+    assert el == pytest.approx(0.0)
