@@ -949,7 +949,7 @@ def test_three_point_raises_on_zero_length_arm():
     b = _pt("b", 5, 5, 5.0)
     a = _pt("a", 5, 5, 5.0)  # coincident with B
     c = _pt("c", 10, 5, 5.0)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="arm BA"):
         geo.three_point_azimuth_elevation(a, b, c)
 
 
@@ -960,7 +960,7 @@ def test_three_point_raises_when_last_arm_zero_length():
     b = _pt("b", 5, 5, 5.0)
     a = _pt("a", 10, 5, 5.0)
     c = _pt("c", 5, 5, 5.0)  # coincident with B
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="arm BC"):
         geo.three_point_azimuth_elevation(a, b, c)
 
 
@@ -1003,3 +1003,32 @@ def test_three_point_azimuth_wraps_negative_raw_difference():
     az, el = geo.three_point_azimuth_elevation(a, b, c)
     assert az == pytest.approx(3 * math.pi / 2)
     assert el == pytest.approx(0.0)
+
+
+def test_three_point_tiny_horizontal_extent_still_defines_azimuth():
+    # The azimuth ``None`` guard fires only when the horizontal reach is
+    # strictly below EPS_DISTANCE. Here each arm keeps a tiny-but-nonzero
+    # horizontal reach (10·EPS_DISTANCE) atop a large altitude component, so the
+    # 3-D arm clears the zero-length guard and the horizontal hypot
+    # (10·EPS ≥ EPS) keeps the azimuth defined. Arm B→A reaches tiny-East
+    # (bearing π/2), arm B→C reaches tiny-North (bearing 0), so the raw turn is
+    # 0 − π/2 = −π/2, normalising to 3π/2 — defined, not None.
+    b = _pt("b", 0, 0, 0.0)
+    a = _pt("a", 10 * EPS_DISTANCE, 0, 1000.0)  # tiny-East, far up
+    c = _pt("c", 0, 10 * EPS_DISTANCE, 1000.0)  # tiny-North, far up
+    az, _el = geo.three_point_azimuth_elevation(a, b, c)
+    assert az is not None
+    assert az == pytest.approx(3 * math.pi / 2)
+
+
+def test_three_point_both_arms_vertical_positive_pi_elevation():
+    # Symmetric counterpart of the −π case: both arms purely vertical (horizontal
+    # length < EPS), so the azimuth is None. With A directly BELOW B (el −π/2)
+    # and C directly ABOVE B (el +π/2), the elevation el(BC) − el(BA) is
+    # +π/2 − (−π/2) = +π exactly — the upper end of the [-π, π] range.
+    b = _pt("b", 0, 0, 0.0)
+    a = _pt("a", 0, 0, -10.0)  # directly below B
+    c = _pt("c", 0, 0, 10.0)  # directly above B
+    az, el = geo.three_point_azimuth_elevation(a, b, c)
+    assert az is None
+    assert el == pytest.approx(math.pi)

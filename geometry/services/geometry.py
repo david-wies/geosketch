@@ -871,8 +871,10 @@ def three_point_azimuth_elevation(
     # this runs once per measurement, so the few extra subtractions cost
     # nothing, and delegating to distance()/elevation() keeps those formulas
     # single-sourced rather than duplicating them here.
-    if distance(a, b) < EPS_DISTANCE or distance(c, b) < EPS_DISTANCE:
-        raise ValueError("three_point_azimuth_elevation: an arm has zero length")
+    if distance(a, b) < EPS_DISTANCE:
+        raise ValueError("three_point_azimuth_elevation: arm BA has zero length")
+    if distance(c, b) < EPS_DISTANCE:
+        raise ValueError("three_point_azimuth_elevation: arm BC has zero length")
 
     ba_e, ba_n = a.easting - b.easting, a.northing - b.northing
     bc_e, bc_n = c.easting - b.easting, c.northing - b.northing
