@@ -30,6 +30,7 @@ imports only the model dataclasses (:mod:`geometry.models`); no ``tkinter`` or
 """
 
 from collections import deque
+from collections.abc import Iterable
 
 from geometry.models import GeoObject
 
@@ -68,14 +69,15 @@ class DependencyGraph:
 
         Convenience wrapper that couples :meth:`register` to
         :meth:`deps_for_type`, so a caller cannot accidentally register an
-        incomplete edge set (which would let an orphan survive a cascade
-        delete). Command code should prefer this over calling :meth:`register`
-        directly; :meth:`register` stays available for tests and for callers
-        that already hold a precomputed dependency set.
+        incomplete edge set (which would cause a cascade delete triggered from
+        a missing dependency to silently skip this object). Command code should
+        prefer this over calling :meth:`register` directly; :meth:`register`
+        stays available for tests and for callers that already hold a
+        precomputed dependency set.
         """
         self.register(obj.id, self.deps_for_type(obj))
 
-    def register(self, obj_id: str, dep_ids: set[str]) -> None:
+    def register(self, obj_id: str, dep_ids: Iterable[str]) -> None:
         """Record that ``obj_id`` depends on every id in ``dep_ids``.
 
         Safe to call repeatedly: any previously registered edges for ``obj_id``
@@ -91,8 +93,9 @@ class DependencyGraph:
                 if not reverse:
                     del self._rdeps[old_dep]
 
-        self._deps[obj_id] = set(dep_ids)
-        for dep_id in dep_ids:
+        dep_set = set(dep_ids)
+        self._deps[obj_id] = dep_set
+        for dep_id in dep_set:
             self._rdeps.setdefault(dep_id, set()).add(obj_id)
 
     def unregister(self, obj_id: str) -> None:
@@ -101,6 +104,10 @@ class DependencyGraph:
         No-op if ``obj_id`` was never registered. Both the object's own forward
         edges and any reverse edges pointing at it are removed, so a later
         ``dependents_of`` never surfaces a deleted object.
+
+        Callers running a cascade delete should unregister every object returned
+        by ``dependents_of`` as well, so their forward edges stay consistent
+        with the remaining graph state.
         """
         # Remove forward edges out of obj_id and their mirrored reverse edges.
         for dep_id in self._deps.pop(obj_id, set()):
@@ -124,9 +131,12 @@ class DependencyGraph:
     def dependents_of(self, obj_id: str) -> set[str]:
         """Return the transitive closure of objects that depend on ``obj_id``.
 
-        Breadth-first walk over the reverse edges. The result never includes
-        ``obj_id`` itself, and is empty for an unknown id or a leaf that nothing
-        references.
+        Breadth-first walk over the reverse edges. The result is empty for an
+        unknown id or a leaf that nothing references. In the well-formed DAG
+        that the real domain always produces, ``obj_id`` itself will not appear
+        in the result; in a pathological cycle, ``obj_id`` may appear — the BFS
+        visited-guard halts the traversal but does not explicitly exclude the
+        queried node.
         """
         result: set[str] = set()
         queue: deque[str] = deque(self._rdeps.get(obj_id, set()))
@@ -138,7 +148,38 @@ class DependencyGraph:
             queue.extend(self._rdeps.get(current, set()))
         return result
 
-    def deps_for_type(self, obj: GeoObject) -> set[str]:
+    def is_registered(self, obj_id: str) -> bool:
+        """Return whether ``obj_id`` is currently tracked by the graph.
+
+        Exposes the presence-marker invariant: every registered object has a
+        ``_deps`` entry, even if its dependency set is empty (e.g. a Point).
+        The command layer can use this to check graph state after load without
+        exposing ``_deps`` directly.
+        """
+        return obj_id in self._deps
+
+    def _assert_consistent(self) -> None:
+        """Assert the bidirectional mirror invariant holds on both maps.
+
+        Every forward edge ``(obj_id, dep_id)`` in ``_deps`` must have a
+        matching reverse edge in ``_rdeps``, and vice versa. ``_rdeps`` must
+        never contain an empty set. Call this at the end of mutation-heavy
+        test scenarios to catch any regression that silently breaks the mirror.
+        """
+        for obj_id, fwd in self._deps.items():
+            for dep_id in fwd:
+                assert obj_id in self._rdeps.get(dep_id, set()), (
+                    f"forward edge {obj_id!r}→{dep_id!r} has no matching reverse edge"
+                )
+        for dep_id, rev in self._rdeps.items():
+            assert rev, f"_rdeps must not contain empty sets; found key {dep_id!r}"
+            for obj_id in rev:
+                assert dep_id in self._deps.get(obj_id, set()), (
+                    f"reverse edge {dep_id!r}→{obj_id!r} has no matching forward edge"
+                )
+
+    @staticmethod
+    def deps_for_type(obj: GeoObject) -> set[str]:
         """Derive the forward-edge set (direct dependencies) for any object.
 
         Centralises the per-type edge table so command code never has to
@@ -164,33 +205,33 @@ class DependencyGraph:
         ValueError
             If ``obj.type`` is not one of the ten known object types.
         """
-        deps: set[str]
         # Dispatch on the string discriminant ``obj.type`` — the same
         # discriminated-union key used by the JSON wire format — rather than
         # ``isinstance``. Deliberate trade-off: a static checker cannot verify
         # the subtype-only attribute reads in each arm, so the exhaustive
         # per-type tests plus the ``case _`` guard are the safety net.
+        # pylint: disable=too-many-return-statements
         match obj.type:
             case "point":
-                deps = set()
+                return set()
             case "line":
-                deps = {obj.point_a_id, obj.point_b_id}
+                return {obj.point_a_id, obj.point_b_id}
             case "polygon":
-                deps = set(obj.point_ids)
+                return set(obj.point_ids)
             case "ray":
-                deps = {obj.origin_id}
+                return {obj.origin_id}
             case "vector":
                 deps = {obj.origin_id}
                 if obj.endpoint_id is not None:
                     deps.add(obj.endpoint_id)
+                return deps
             case "circle" | "ball":
-                deps = {obj.center_id}
+                return {obj.center_id}
             case "cylinder":
-                deps = {obj.base_center_id}
+                return {obj.base_center_id}
             case "solid":
-                deps = set(obj.layers)
+                return set(obj.layers)
             case "tangent":
-                deps = {obj.shape_id, obj.point_id}
+                return {obj.shape_id, obj.point_id}
             case _:
                 raise ValueError(f"deps_for_type: unknown object type {obj.type!r}")
-        return deps

@@ -24,6 +24,8 @@ Two concerns are exercised here:
   object types.
 """
 
+import dataclasses
+
 import pytest
 
 from geometry.models import (
@@ -169,6 +171,7 @@ def test_dependents_of_terminates_on_a_two_node_cycle():
     # preventing an infinite loop should a cyclic reverse edge ever exist.
     # Pin the termination contract so a refactor that drops the guard fails
     # here (by hanging) rather than passing silently.
+    # Note: in a cycle the queried node may appear in the result — this tests termination only.
     graph = DependencyGraph()
     graph.register("a", {"b"})
     graph.register("b", {"a"})
@@ -177,6 +180,8 @@ def test_dependents_of_terminates_on_a_two_node_cycle():
 
 
 def test_dependents_of_terminates_on_a_self_loop():
+    # Pin termination contract only — the queried node appears in the result
+    # in a cycle, which is expected and impossible in production.
     graph = DependencyGraph()
     graph.register("x", {"x"})
     assert graph.dependents_of("x") == {"x"}
@@ -199,6 +204,48 @@ def test_register_copies_its_input_set():
     deps.add("pt_002")
     assert graph.dependents_of("pt_002") == set()
     assert graph.dependents_of("pt_001") == {"ln_001"}
+
+
+def test_reregister_prunes_stale_rdeps_entry():
+    # Directly verify the _rdeps key is removed, not just that query results
+    # are empty — a stale empty set in _rdeps would be invisible to
+    # dependents_of but would break the asymmetric invariant.
+    graph = DependencyGraph()
+    graph.register("ln_001", {"pt_001"})
+    graph.register("ln_001", {"pt_002"})  # replaces pt_001
+    assert "pt_001" not in graph._rdeps  # pylint: disable=protected-access
+
+
+def test_unregister_prunes_rdeps_entry_for_former_deps():
+    graph = DependencyGraph()
+    graph.register("ln_001", {"pt_001"})
+    graph.unregister("ln_001")
+    assert "pt_001" not in graph._rdeps  # pylint: disable=protected-access
+
+
+def test_unregister_middle_node_preserves_orphaned_dependent_presence():
+    # After unregistering ci_001, tg_001 loses its forward edge but must
+    # remain a registered object (empty _deps entry = presence marker).
+    graph = DependencyGraph()
+    graph.register("ci_001", {"pt_001"})
+    graph.register("tg_001", {"ci_001"})
+    graph.unregister("ci_001")
+    assert graph.dependents_of("tg_001") == set()
+    # Re-registering must not accumulate stale edges from before unregister.
+    graph.register("tg_001", {"pt_002"})
+    assert graph.dependents_of("pt_002") == {"tg_001"}
+    assert graph.dependents_of("pt_001") == set()
+
+
+def test_unregister_bidirectional_cleanup():
+    graph = DependencyGraph()
+    graph.register("pt_001", set())
+    graph.register("ci_001", {"pt_001"})
+    graph.register("tg_001", {"ci_001"})
+    graph.unregister("ci_001")
+    assert graph.dependents_of("pt_001") == set()
+    assert graph.dependents_of("tg_001") == set()
+    assert graph.dependents_of("ci_001") == set()
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +403,13 @@ def test_deps_for_type_returns_a_fresh_set_callers_cannot_corrupt():
     assert graph.deps_for_type(pg) == {"pt_001", "pt_002"}
 
 
+def test_deps_for_type_solid_with_duplicate_layers_collapses():
+    # set(obj.layers) silently collapses duplicate IDs. Pin the intent so the
+    # collapse is documented rather than accidental.
+    so = Solid(**_env("so"), layers=["pg_001", "pg_001", "pt_010"], **_colors())
+    assert DependencyGraph.deps_for_type(so) == {"pg_001", "pt_010"}
+
+
 # ---------------------------------------------------------------------------
 # Integration: deps_for_type feeding register, then a multi-hop cascade query
 # ---------------------------------------------------------------------------
@@ -439,3 +493,25 @@ def test_add_cascade_point_circle_tangent():
     graph.add(ci)
     graph.add(tg)
     assert graph.dependents_of("pt_001") == {"ci_001", "tg_001"}
+
+
+def test_add_replaces_old_edges_on_readd():
+    # Verify that add() (not just register()) replaces rather than accumulates
+    # when an already-registered object is re-added with a changed dependency.
+    graph = DependencyGraph()
+    ci = Circle(**_env("ci"), center_id="pt_001", radius=5.0, **_colors())
+    graph.add(ci)
+    ci_edited = dataclasses.replace(ci, center_id="pt_002")
+    graph.add(ci_edited)
+    assert graph.dependents_of("pt_001") == set()
+    assert graph.dependents_of("pt_002") == {"ci_001"}
+
+
+def test_add_unknown_type_raises():
+    # add() must propagate the ValueError from deps_for_type rather than
+    # silently registering with a wrong edge set.
+    graph = DependencyGraph()
+    pt = Point(**_env("pt"), easting=0.0, northing=0.0, altitude=0.0, color="#ff0000")
+    object.__setattr__(pt, "type", "bogus")
+    with pytest.raises(ValueError):
+        graph.add(pt)
