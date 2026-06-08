@@ -30,6 +30,10 @@ max-args = 8
 # DirectedObject + 5 own fields). 15 leaves a small margin for future models
 # without bumping the default 7 too aggressively.
 max-attributes = 15
+# deps_for_type dispatches on 10 object types via match/case — 9 returns plus
+# the ValueError arm in the wildcard case. 12 gives a small margin for future
+# object types without requiring another bump.
+max-returns = 12
 
 [tool.pylint.format]
 max-line-length = 100

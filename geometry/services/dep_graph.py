@@ -47,6 +47,9 @@ class DependencyGraph:
     the full transitive closure of objects affected by a delete or point-move,
     without scanning the entire object store.
 
+    Not thread-safe; callers must serialise mutations. This is intentional for
+    a single-threaded desktop application.
+
     Fields
     ------
     _deps : dict[str, set[str]]
@@ -85,6 +88,10 @@ class DependencyGraph:
         Safe to call repeatedly: any previously registered edges for ``obj_id``
         are removed first, so re-registration replaces rather than accumulates.
         An empty ``dep_ids`` (e.g. a Point) records the object with no edges.
+
+        Prefer :meth:`add` over calling this directly unless you already hold a
+        precomputed dependency set — ``add`` derives the correct edge set from
+        the object's type so a partial manual set cannot be accidentally passed.
         """
         # Drop stale forward edges before re-adding, so re-registration with a
         # changed dependency set does not leave orphaned reverse edges behind.
@@ -116,6 +123,10 @@ class DependencyGraph:
         logging at the call site.
         """
         # Remove forward edges out of obj_id and their mirrored reverse edges.
+        # No-op if obj_id was never registered (pop returns the empty default).
+        # TODO(commands): production callers that guarantee exactly-once delete
+        # should assert obj_id in _deps before this call — a silent no-op here
+        # signals a double-delete bug at the command layer.
         for dep_id in self._deps.pop(obj_id, set()):
             reverse = self._rdeps.get(dep_id)
             if reverse is not None:
@@ -141,18 +152,25 @@ class DependencyGraph:
         unknown id or a leaf that nothing references. To distinguish an unknown
         id from a registered leaf with no dependents, use :meth:`is_registered`.
         In the well-formed DAG that the real domain always produces, ``obj_id``
-        itself will not appear in the result; in a pathological cycle,
-        ``obj_id`` may appear — the BFS visited-guard halts the traversal but
-        does not explicitly exclude the queried node.
+        itself will not appear in the result. In a pathological cycle,
+        ``obj_id`` may appear because the BFS seeds ``result`` from the
+        first-wave dependents only; ``obj_id`` is never pre-placed into the
+        visited set, so a reverse path that leads back to it will collect it.
+        The BFS terminates regardless because the visited-guard prevents
+        re-enqueueing any already-collected node.
         """
         result: set[str] = set()
-        queue: deque[str] = deque(self._rdeps.get(obj_id, _EMPTY))
+        queue: deque[str] = deque()
+        for node in self._rdeps.get(obj_id, _EMPTY):
+            if node not in result:
+                result.add(node)
+                queue.append(node)
         while queue:
             current = queue.popleft()
-            if current in result:
-                continue
-            result.add(current)
-            queue.extend(self._rdeps.get(current, _EMPTY))
+            for node in self._rdeps.get(current, _EMPTY):
+                if node not in result:
+                    result.add(node)
+                    queue.append(node)
         return result
 
     def is_registered(self, obj_id: str) -> bool:
@@ -172,6 +190,17 @@ class DependencyGraph:
         matching reverse edge in ``_rdeps``, and vice versa. ``_rdeps`` must
         never contain an empty set. Call this at the end of mutation-heavy
         test scenarios to catch any regression that silently breaks the mirror.
+
+        **Note on ``_rdeps`` keys:** A key in ``_rdeps`` need not be a
+        registered object (in ``_deps``) — callers may register a dependent
+        before its dependency (forward reference). The pruning logic in
+        :meth:`unregister` ensures no stale ``_rdeps`` entries survive a
+        properly ordered cascade delete, so asserting presence in ``_deps``
+        would flag valid forward references, not actual bugs.
+
+        **Warning:** This method uses ``assert`` statements and is silently
+        inert when Python is run with ``-O`` or ``-OO``. It is for test-time
+        invariant verification only; do not call it as a production guard.
         """
         for obj_id, fwd in self._deps.items():
             for dep_id in fwd:
@@ -222,28 +251,33 @@ class DependencyGraph:
         # ``isinstance``. Deliberate trade-off: a static checker cannot verify
         # the subtype-only attribute reads in each arm, so the exhaustive
         # per-type tests plus the ``case _`` guard are the safety net.
-        # pylint: disable=too-many-return-statements
-        match obj.type:
-            case "point":
-                return set()
-            case "line":
-                return {obj.point_a_id, obj.point_b_id}
-            case "polygon":
-                return set(obj.point_ids)
-            case "ray":
-                return {obj.origin_id}
-            case "vector":
-                deps = {obj.origin_id}
-                if obj.endpoint_id is not None:
-                    deps.add(obj.endpoint_id)
-                return deps
-            case "circle" | "ball":
-                return {obj.center_id}
-            case "cylinder":
-                return {obj.base_center_id}
-            case "solid":
-                return set(obj.layers)
-            case "tangent":
-                return {obj.shape_id, obj.point_id}
-            case _:
-                raise ValueError(f"deps_for_type: unknown object type {obj.type!r}")
+        try:
+            match obj.type:
+                case "point":
+                    return set()
+                case "line":
+                    return {obj.point_a_id, obj.point_b_id}
+                case "polygon":
+                    return set(obj.point_ids)
+                case "ray":
+                    return {obj.origin_id}
+                case "vector":
+                    deps = {obj.origin_id}
+                    if obj.endpoint_id is not None:
+                        deps.add(obj.endpoint_id)
+                    return deps
+                case "circle" | "ball":
+                    return {obj.center_id}
+                case "cylinder":
+                    return {obj.base_center_id}
+                case "solid":
+                    return set(obj.layers)
+                case "tangent":
+                    return {obj.shape_id, obj.point_id}
+                case _:
+                    raise ValueError(f"deps_for_type: unknown object type {obj.type!r}")
+        except AttributeError as exc:
+            raise AttributeError(
+                f"deps_for_type: object {obj.id!r} has type={obj.type!r} but is "
+                f"missing an expected attribute — likely a type/class mismatch: {exc}"
+            ) from exc

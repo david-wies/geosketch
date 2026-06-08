@@ -144,6 +144,20 @@ def test_reregister_replaces_old_edges():
     graph._assert_consistent()  # pylint: disable=protected-access
 
 
+def test_reregister_empty_deps_node_does_not_break_rdep_pointing_at_it():
+    # Re-registering a leaf (empty deps) while something still depends on it
+    # must not accidentally clear the reverse edge pointing at it. The prune
+    # loop in register() exits immediately for empty dep sets, but pin the
+    # invariant explicitly so a refactor that clears _rdeps during re-registration
+    # fails here rather than passing silently.
+    graph = DependencyGraph()
+    graph.register("pt_001", set())
+    graph.register("ln_001", {"pt_001"})
+    graph.register("pt_001", set())  # re-register with same empty deps
+    assert graph.dependents_of("pt_001") == {"ln_001"}
+    graph._assert_consistent()  # pylint: disable=protected-access
+
+
 def test_unregister_removes_node_as_a_dependent():
     graph = DependencyGraph()
     graph.register("ln_001", {"pt_001"})
@@ -565,6 +579,8 @@ def test_is_registered_true_for_dependent_whose_dependency_was_unregistered():
 def test_full_cascade_delete_leaves_graph_clean():
     # Pin the three-step pattern: dependents_of → unregister each dependent →
     # unregister root. Graph must be completely empty and consistent afterward.
+    # Order of unregistration is arbitrary (affected is a set); both orderings
+    # (ci_001 first, tg_001 first) must leave the graph clean and consistent.
     graph = DependencyGraph()
     graph.register("pt_001", set())
     graph.register("ci_001", {"pt_001"})
