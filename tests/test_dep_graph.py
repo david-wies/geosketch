@@ -181,6 +181,25 @@ def test_unregister_unknown_id_is_noop():
     assert graph.dependents_of("pt_001") == {"ln_001"}
 
 
+def test_unregister_strict_raises_for_unregistered_id():
+    graph = DependencyGraph()
+    with pytest.raises(KeyError):
+        graph.unregister("pt_999", strict=True)
+
+
+def test_unregister_strict_succeeds_for_registered_id():
+    graph = DependencyGraph()
+    graph.register("pt_001", set())
+    graph.unregister("pt_001", strict=True)
+    assert not graph.is_registered("pt_001")
+
+
+def test_register_empty_obj_id_raises():
+    graph = DependencyGraph()
+    with pytest.raises(ValueError, match="non-empty"):
+        graph.register("", {"pt_001"})
+
+
 def test_dependents_of_terminates_on_a_two_node_cycle():
     # The real domain is a DAG, but the BFS visited-guard is the only thing
     # preventing an infinite loop should a cyclic reverse edge ever exist.
@@ -469,6 +488,7 @@ def test_add_registers_object_with_its_derived_dependency_set():
     graph = DependencyGraph()
     ci = Circle(**_env("ci"), center_id="pt_001", radius=5.0, **_colors())
     graph.add(ci)
+    assert graph.is_registered(ci.id)
     # add() must record exactly what deps_for_type derives — no caller can omit
     # an edge the way a hand-rolled register() call could.
     assert graph.dependents_of("pt_001") == {"ci_001"}
@@ -576,18 +596,23 @@ def test_is_registered_true_for_dependent_whose_dependency_was_unregistered():
 # ---------------------------------------------------------------------------
 
 
-def test_full_cascade_delete_leaves_graph_clean():
+@pytest.mark.parametrize(
+    "order",
+    [["ci_001", "tg_001"], ["tg_001", "ci_001"]],
+    ids=["circle-first", "tangent-first"],
+)
+def test_full_cascade_delete_leaves_graph_clean(order):
     # Pin the three-step pattern: dependents_of → unregister each dependent →
-    # unregister root. Graph must be completely empty and consistent afterward.
-    # Order of unregistration is arbitrary (affected is a set); both orderings
-    # (ci_001 first, tg_001 first) must leave the graph clean and consistent.
+    # unregister root. Parametrised over both unregistration orderings to
+    # confirm no order-sensitivity in the cascade.
     graph = DependencyGraph()
     graph.register("pt_001", set())
     graph.register("ci_001", {"pt_001"})
     graph.register("tg_001", {"ci_001"})
 
     affected = graph.dependents_of("pt_001")
-    for obj_id in affected:
+    assert affected == {"ci_001", "tg_001"}
+    for obj_id in order:
         graph.unregister(obj_id)
     graph.unregister("pt_001")
 
