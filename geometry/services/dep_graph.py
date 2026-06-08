@@ -36,6 +36,8 @@ from geometry.models import GeoObject
 
 __all__ = ["DependencyGraph"]
 
+_EMPTY: frozenset[str] = frozenset()
+
 
 class DependencyGraph:
     """Reverse-reference graph for O(|affected|) cascade operations.
@@ -108,6 +110,10 @@ class DependencyGraph:
         Callers running a cascade delete should unregister every object returned
         by ``dependents_of`` as well, so their forward edges stay consistent
         with the remaining graph state.
+
+        Callers that guarantee exactly-once unregister should treat a no-op
+        here as a sign of a double-delete bug; consider adding an assertion or
+        logging at the call site.
         """
         # Remove forward edges out of obj_id and their mirrored reverse edges.
         for dep_id in self._deps.pop(obj_id, set()):
@@ -132,20 +138,21 @@ class DependencyGraph:
         """Return the transitive closure of objects that depend on ``obj_id``.
 
         Breadth-first walk over the reverse edges. The result is empty for an
-        unknown id or a leaf that nothing references. In the well-formed DAG
-        that the real domain always produces, ``obj_id`` itself will not appear
-        in the result; in a pathological cycle, ``obj_id`` may appear — the BFS
-        visited-guard halts the traversal but does not explicitly exclude the
-        queried node.
+        unknown id or a leaf that nothing references. To distinguish an unknown
+        id from a registered leaf with no dependents, use :meth:`is_registered`.
+        In the well-formed DAG that the real domain always produces, ``obj_id``
+        itself will not appear in the result; in a pathological cycle,
+        ``obj_id`` may appear — the BFS visited-guard halts the traversal but
+        does not explicitly exclude the queried node.
         """
         result: set[str] = set()
-        queue: deque[str] = deque(self._rdeps.get(obj_id, set()))
+        queue: deque[str] = deque(self._rdeps.get(obj_id, _EMPTY))
         while queue:
             current = queue.popleft()
             if current in result:
                 continue
             result.add(current)
-            queue.extend(self._rdeps.get(current, set()))
+            queue.extend(self._rdeps.get(current, _EMPTY))
         return result
 
     def is_registered(self, obj_id: str) -> bool:
@@ -196,14 +203,19 @@ class DependencyGraph:
         circle       ``{center_id}``
         ball         ``{center_id}``
         cylinder     ``{base_center_id}``
-        solid        ``set(layers)``
-        tangent      ``{shape_id, point_id}``
+        solid        ``set(layers)`` — ``layers`` is a sequence of Polygon or
+                     Point ids.
+        tangent      ``{shape_id, point_id}`` — ``shape_id`` is the id of a
+                     Circle or Ball.
         ===========  ===================================================
 
         Raises
         ------
         ValueError
             If ``obj.type`` is not one of the ten known object types.
+        AttributeError
+            If a correct type string reaches the wrong match arm (e.g. the
+            model instance is missing the expected attribute).
         """
         # Dispatch on the string discriminant ``obj.type`` — the same
         # discriminated-union key used by the JSON wire format — rather than

@@ -141,6 +141,7 @@ def test_reregister_replaces_old_edges():
     assert graph.dependents_of("pt_001") == set()
     assert graph.dependents_of("pt_002") == {"ln_001"}
     assert graph.dependents_of("pt_003") == {"ln_001"}
+    graph._assert_consistent()  # pylint: disable=protected-access
 
 
 def test_unregister_removes_node_as_a_dependent():
@@ -235,6 +236,7 @@ def test_unregister_middle_node_preserves_orphaned_dependent_presence():
     graph.register("tg_001", {"pt_002"})
     assert graph.dependents_of("pt_002") == {"tg_001"}
     assert graph.dependents_of("pt_001") == set()
+    graph._assert_consistent()  # pylint: disable=protected-access
 
 
 def test_unregister_bidirectional_cleanup():
@@ -246,6 +248,7 @@ def test_unregister_bidirectional_cleanup():
     assert graph.dependents_of("pt_001") == set()
     assert graph.dependents_of("tg_001") == set()
     assert graph.dependents_of("ci_001") == set()
+    graph._assert_consistent()  # pylint: disable=protected-access
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +435,7 @@ def test_cascade_point_circle_tangent_via_deps_for_type():
     assert graph.dependents_of("pt_001") == {"ci_001", "tg_001"}
     # The tangent's own point only reaches the tangent.
     assert graph.dependents_of("pt_002") == {"tg_001"}
+    graph._assert_consistent()  # pylint: disable=protected-access
 
 
 def test_deps_for_type_unknown_type_raises():
@@ -493,6 +497,7 @@ def test_add_cascade_point_circle_tangent():
     graph.add(ci)
     graph.add(tg)
     assert graph.dependents_of("pt_001") == {"ci_001", "tg_001"}
+    graph._assert_consistent()  # pylint: disable=protected-access
 
 
 def test_add_replaces_old_edges_on_readd():
@@ -505,6 +510,7 @@ def test_add_replaces_old_edges_on_readd():
     graph.add(ci_edited)
     assert graph.dependents_of("pt_001") == set()
     assert graph.dependents_of("pt_002") == {"ci_001"}
+    graph._assert_consistent()  # pylint: disable=protected-access
 
 
 def test_add_unknown_type_raises():
@@ -515,3 +521,63 @@ def test_add_unknown_type_raises():
     object.__setattr__(pt, "type", "bogus")
     with pytest.raises(ValueError):
         graph.add(pt)
+
+
+# ---------------------------------------------------------------------------
+# is_registered — presence-marker invariant
+# ---------------------------------------------------------------------------
+
+
+def test_is_registered_true_for_point_with_empty_deps():
+    graph = DependencyGraph()
+    graph.register("pt_001", set())
+    assert graph.is_registered("pt_001")
+
+
+def test_is_registered_false_for_never_registered_id():
+    graph = DependencyGraph()
+    assert not graph.is_registered("pt_999")
+
+
+def test_is_registered_false_after_unregister():
+    graph = DependencyGraph()
+    graph.register("pt_001", set())
+    graph.unregister("pt_001")
+    assert not graph.is_registered("pt_001")
+
+
+def test_is_registered_true_for_dependent_whose_dependency_was_unregistered():
+    # When a dependency is unregistered, the dependent object loses its forward
+    # edge but remains a registered object (empty _deps entry = presence marker).
+    graph = DependencyGraph()
+    graph.register("pt_001", set())
+    graph.register("ci_001", {"pt_001"})
+    graph.unregister("pt_001")
+    assert not graph.is_registered("pt_001")
+    assert graph.is_registered("ci_001")  # ci_001 still registered, just orphaned
+
+
+# ---------------------------------------------------------------------------
+# Full cascade delete workflow
+# ---------------------------------------------------------------------------
+
+
+def test_full_cascade_delete_leaves_graph_clean():
+    # Pin the three-step pattern: dependents_of → unregister each dependent →
+    # unregister root. Graph must be completely empty and consistent afterward.
+    graph = DependencyGraph()
+    graph.register("pt_001", set())
+    graph.register("ci_001", {"pt_001"})
+    graph.register("tg_001", {"ci_001"})
+
+    affected = graph.dependents_of("pt_001")
+    for obj_id in affected:
+        graph.unregister(obj_id)
+    graph.unregister("pt_001")
+
+    assert not graph.is_registered("pt_001")
+    assert not graph.is_registered("ci_001")
+    assert not graph.is_registered("tg_001")
+    graph._assert_consistent()  # pylint: disable=protected-access
+    assert not graph._deps  # pylint: disable=protected-access
+    assert not graph._rdeps  # pylint: disable=protected-access
