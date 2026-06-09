@@ -29,6 +29,7 @@ imports only the model dataclasses (:mod:`geometry.models`); no ``tkinter`` or
 ``matplotlib``.
 """
 
+import logging
 from collections import deque
 from collections.abc import Iterable
 
@@ -37,6 +38,8 @@ from geometry.models import GeoObject
 __all__ = ["DependencyGraph"]
 
 _EMPTY: frozenset[str] = frozenset()
+
+_logger = logging.getLogger(__name__)
 
 
 class DependencyGraph:
@@ -66,7 +69,9 @@ class DependencyGraph:
     """
 
     def __init__(self) -> None:
+        # key present iff registered; empty set = no deps (presence marker)
         self._deps: dict[str, set[str]] = {}
+        # key present iff >=1 dependent; empty sets are never retained here
         self._rdeps: dict[str, set[str]] = {}
 
     def add(self, obj: GeoObject) -> None:
@@ -80,6 +85,10 @@ class DependencyGraph:
         stays available for tests and for callers that already hold a result
         from :meth:`deps_for_type`.
 
+        The inverse operation is :meth:`unregister` called with ``obj.id``;
+        there is intentionally no ``remove(obj)`` method, since unregister only
+        needs the id.
+
         Parameters
         ----------
         obj : GeoObject
@@ -91,8 +100,24 @@ class DependencyGraph:
         ------
         ValueError
             If ``obj.type`` is not one of the ten known object types.
+        AttributeError
+            If ``obj.type`` is a known type but a required type-specific
+            attribute is missing on the instance (model dataclass inconsistent
+            with its type discriminant).
         """
-        self.register(obj.id, self.deps_for_type(obj))
+        # Read type/id into locals before the try block: if obj lacks these
+        # base attributes, evaluating them inside the except format string would
+        # raise a second AttributeError inside the handler (double traceback).
+        obj_type = obj.type
+        obj_id = obj.id
+        try:
+            dep_ids = self.deps_for_type(obj)
+        except AttributeError as exc:
+            raise AttributeError(
+                f"DependencyGraph.add: expected attributes for type {obj_type!r} "
+                f"missing on object {obj_id!r}: {exc}"
+            ) from exc
+        self.register(obj_id, dep_ids)
 
     def register(self, obj_id: str, dep_ids: Iterable[str]) -> None:
         """Record that ``obj_id`` depends on every id in ``dep_ids``.
@@ -116,10 +141,18 @@ class DependencyGraph:
         Raises
         ------
         ValueError
-            If ``obj_id`` is an empty string.
+            If ``obj_id`` is an empty string, or if any element of ``dep_ids``
+            is an empty string.
         """
+        # Materialise and FULLY validate the new dependency set BEFORE any
+        # mutation, so a bad input (empty obj_id or empty dep id) cannot leave
+        # the graph half-updated on a re-registration.
         if not obj_id:
             raise ValueError("DependencyGraph.register: obj_id must be a non-empty string")
+        dep_set = set(dep_ids)
+        if "" in dep_set:
+            raise ValueError("DependencyGraph.register: dep_ids must not contain empty strings")
+
         # Drop stale forward edges before re-adding, so re-registration with a
         # changed dependency set does not leave orphaned reverse edges behind.
         for old_dep in self._deps.get(obj_id, _EMPTY):
@@ -129,7 +162,6 @@ class DependencyGraph:
                 if not reverse:
                     del self._rdeps[old_dep]
 
-        dep_set = set(dep_ids)
         self._deps[obj_id] = dep_set
         for dep_id in dep_set:
             self._rdeps.setdefault(dep_id, set()).add(obj_id)
@@ -158,9 +190,13 @@ class DependencyGraph:
 
         Raises
         ------
+        ValueError
+            If ``obj_id`` is an empty string.
         KeyError
             If ``strict`` is ``True`` and ``obj_id`` is not registered.
         """
+        if not obj_id:
+            raise ValueError("DependencyGraph.unregister: obj_id must be a non-empty string")
         if strict and obj_id not in self._deps:
             raise KeyError(obj_id)
         # Remove forward edges out of obj_id and their mirrored reverse edges.
@@ -176,9 +212,20 @@ class DependencyGraph:
         for dependent in self._rdeps.pop(obj_id, _EMPTY):
             forward = self._deps.get(dependent)
             if forward is None:
-                # forward is None when the dependent registered obj_id as a
-                # dependency before obj_id itself was registered (forward
-                # reference). No forward edge exists to prune.
+                # Defensive backstop that cannot fire via the public API: any
+                # *dependent* listed in _rdeps[obj_id] was placed there by that
+                # dependent's own register() call, which always creates its
+                # matching _deps entry in the same call. So a missing forward
+                # set here means the bidirectional invariant has already been
+                # violated by some out-of-band corruption. Log it at ERROR (the
+                # asserts in _assert_consistent() are inert under -O and give no
+                # production signal) and skip the dangling reverse edge.
+                _logger.error(
+                    "DependencyGraph.unregister: _rdeps[%r] lists dependent %r with no _deps "
+                    "entry; bidirectional invariant violated.",
+                    obj_id,
+                    dependent,
+                )
                 continue
             # Intentionally do NOT delete an emptied forward set: a
             # dependent that loses its last edge is still a registered
@@ -187,7 +234,7 @@ class DependencyGraph:
             # map that must stay free of empty sets; see the class docstring.
             forward.discard(obj_id)
 
-    def dependents_of(self, obj_id: str) -> set[str]:
+    def dependents_of(self, obj_id: str) -> frozenset[str]:
         """Return the transitive closure of objects that depend on ``obj_id``.
 
         Breadth-first walk over the reverse edges. The result is empty for an
@@ -195,7 +242,7 @@ class DependencyGraph:
         id from a registered leaf with no dependents, use :meth:`is_registered`.
         In the well-formed DAG that the real domain always produces, ``obj_id``
         itself will not appear in the result. In a pathological cycle,
-        ``obj_id`` may appear because the BFS seeds ``result`` from the
+        ``obj_id`` will appear because the BFS seeds ``result`` from the
         first-wave dependents only; ``obj_id`` is never pre-placed into the
         visited set, so a reverse path that leads back to it will collect it.
         The BFS terminates regardless because the visited-guard prevents
@@ -213,23 +260,23 @@ class DependencyGraph:
 
         Returns
         -------
-        set[str]
-            All object ids that transitively depend on ``obj_id``. The set is
-            a fresh copy; mutating it does not affect the graph.
+        frozenset[str]
+            All object ids that transitively depend on ``obj_id``. The
+            frozenset is a read-only snapshot; it cannot be mutated and does
+            not share state with the graph.
         """
         result: set[str] = set()
         queue: deque[str] = deque()
-        for node in self._rdeps.get(obj_id, _EMPTY):
-            if node not in result:
-                result.add(node)
-                queue.append(node)
+        first_wave = self._rdeps.get(obj_id, _EMPTY)
+        result.update(first_wave)
+        queue.extend(first_wave)
         while queue:
             current = queue.popleft()
             for node in self._rdeps.get(current, _EMPTY):
                 if node not in result:
                     result.add(node)
                     queue.append(node)
-        return result
+        return frozenset(result)
 
     def is_registered(self, obj_id: str) -> bool:
         """Return whether ``obj_id`` is currently tracked by the graph.
@@ -260,12 +307,19 @@ class DependencyGraph:
         never contain an empty set. Call this at the end of mutation-heavy
         test scenarios to catch any regression that silently breaks the mirror.
 
-        **Note on ``_rdeps`` keys:** A key in ``_rdeps`` need not be a
-        registered object (in ``_deps``) — callers may register a dependent
-        before its dependency (forward reference). The pruning logic in
+        **Note on ``_rdeps`` keys vs. values (the asymmetry):** An ``_rdeps``
+        *key* is a *dependency* that something references; it need not itself be
+        registered in ``_deps`` (callers may register a dependent before its
+        dependency, so the key is a forward reference and asserting its presence
+        in ``_deps`` would flag valid references, not bugs). By contrast, every
+        *member* of an ``_rdeps`` value set is a *dependent*, and a dependent
+        always has a ``_deps`` entry created by its own :meth:`register` call —
+        which is why the ``forward is None`` backstop in :meth:`unregister`
+        cannot fire via the public API. These two statements describe different
+        scenarios (an unregistered dependency-key versus a guaranteed-registered
+        dependent-member) and so do not conflict. The pruning logic in
         :meth:`unregister` ensures no stale ``_rdeps`` entries survive a
-        properly ordered cascade delete, so asserting presence in ``_deps``
-        would flag valid forward references, not actual bugs.
+        properly ordered cascade delete.
 
         **Warning:** This method uses ``assert`` statements and is silently
         inert when Python is run with ``-O`` or ``-OO``. It is for test-time
@@ -308,8 +362,9 @@ class DependencyGraph:
         ball         ``{center_id}``
         cylinder     ``{base_center_id}``
         solid        ``set(layers)`` — ``layers`` is a ``tuple[str, ...]`` of
-                     Polygon (``pg_``) or Point (``pt_``) ids, with at most
-                     one Point id (enforced by ``Solid.__post_init__``).
+                     Polygon (``pg_``) or Point (``pt_``) ids, with at most one
+                     Point id (apex/nadir -- must be first or last element;
+                     enforced by ``Solid.__post_init__``).
         tangent      ``{shape_id, point_id}`` — ``shape_id`` is the id of a
                      Circle or Ball.
         ===========  ===================================================

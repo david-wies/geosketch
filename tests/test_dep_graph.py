@@ -158,6 +158,30 @@ def test_reregister_empty_deps_node_does_not_break_rdep_pointing_at_it():
     graph._assert_consistent()  # pylint: disable=protected-access
 
 
+def test_reregister_to_empty_deps_removes_all_rdep_entries():
+    # Re-registering an object with an empty dep set must remove every former
+    # reverse edge. A stale _rdeps entry from the old registration would be
+    # invisible to dependents_of but would break the asymmetric invariant.
+    graph = DependencyGraph()
+    graph.register("ln_001", {"pt_001", "pt_002"})
+    graph.register("ln_001", set())
+    assert "pt_001" not in graph._rdeps  # pylint: disable=protected-access
+    assert "pt_002" not in graph._rdeps  # pylint: disable=protected-access
+    assert graph.is_registered("ln_001")
+    graph._assert_consistent()  # pylint: disable=protected-access
+
+
+def test_register_dependent_before_dependency_is_legal():
+    # Registering a dependent before its dependency is legal: the dependency
+    # appears only as an _rdeps key (not yet in _deps) until it registers.
+    graph = DependencyGraph()
+    graph.register("ci_001", {"pt_001"})  # pt_001 not yet registered
+    graph._assert_consistent()  # pylint: disable=protected-access
+    graph.register("pt_001", set())
+    assert graph.dependents_of("pt_001") == {"ci_001"}
+    graph._assert_consistent()  # pylint: disable=protected-access
+
+
 def test_unregister_removes_node_as_a_dependent():
     graph = DependencyGraph()
     graph.register("ln_001", {"pt_001"})
@@ -194,10 +218,49 @@ def test_unregister_strict_succeeds_for_registered_id():
     assert not graph.is_registered("pt_001")
 
 
+def test_unregister_strict_cleans_up_edges():
+    # strict=True is recommended in the cascade-delete path where nodes have
+    # edges; unregistering a non-leaf must prune both directions cleanly.
+    graph = DependencyGraph()
+    graph.register("pt_001", set())
+    graph.register("ci_001", {"pt_001"})
+    graph.unregister("ci_001", strict=True)
+    assert not graph.is_registered("ci_001")
+    assert graph.dependents_of("pt_001") == frozenset()
+    graph._assert_consistent()  # pylint: disable=protected-access
+
+
 def test_register_empty_obj_id_raises():
     graph = DependencyGraph()
     with pytest.raises(ValueError, match="non-empty"):
         graph.register("", {"pt_001"})
+
+
+def test_register_empty_dep_id_raises():
+    graph = DependencyGraph()
+    with pytest.raises(ValueError, match="dep_ids"):
+        graph.register("ln_001", {"pt_001", ""})
+
+
+def test_register_empty_dep_id_on_reregister_leaves_graph_consistent():
+    # Re-registering with a dep_ids set containing "" must validate before
+    # mutating: the ValueError fires, the prior registration is preserved
+    # intact, and the bidirectional invariant still holds.
+    graph = DependencyGraph()
+    graph.register("ln_001", {"pt_001"})
+    with pytest.raises(ValueError, match="dep_ids"):
+        graph.register("ln_001", {"pt_002", ""})
+    assert graph.is_registered("ln_001")
+    # The original edge survived; the bad re-registration was fully rejected.
+    assert graph.dependents_of("pt_001") == {"ln_001"}
+    assert graph.dependents_of("pt_002") == frozenset()
+    graph._assert_consistent()  # pylint: disable=protected-access
+
+
+def test_unregister_empty_obj_id_raises():
+    graph = DependencyGraph()
+    with pytest.raises(ValueError, match="non-empty"):
+        graph.unregister("")
 
 
 def test_dependents_of_terminates_on_a_two_node_cycle():
@@ -221,13 +284,16 @@ def test_dependents_of_terminates_on_a_self_loop():
     assert graph.dependents_of("x") == {"x"}
 
 
-def test_dependents_of_returns_a_fresh_set_callers_cannot_corrupt_state():
-    # Mutating a returned set must not bleed back into the graph's internals.
+def test_dependents_of_returns_a_fresh_frozenset():
+    # The returned frozenset is an immutable snapshot; it cannot be mutated
+    # and does not share state with the graph's internals.
     graph = DependencyGraph()
     graph.register("ln_001", {"pt_001"})
     result = graph.dependents_of("pt_001")
-    result.add("bogus")
-    assert graph.dependents_of("pt_001") == {"ln_001"}
+    assert isinstance(result, frozenset)
+    assert result == {"ln_001"}
+    # A second call returns a separate frozenset, not the same object.
+    assert graph.dependents_of("pt_001") is not result
 
 
 def test_register_copies_its_input_set():
@@ -281,6 +347,23 @@ def test_unregister_bidirectional_cleanup():
     assert graph.dependents_of("pt_001") == set()
     assert graph.dependents_of("tg_001") == set()
     assert graph.dependents_of("ci_001") == set()
+    graph._assert_consistent()  # pylint: disable=protected-access
+
+
+def test_unregister_node_with_multiple_dependents_prunes_all_forward_edges():
+    # Verify that unregistering a node whose _rdeps entry lists several
+    # dependents correctly prunes every dependent's forward edge. A bug
+    # that only prunes the first entry would pass the single-dependent
+    # test above.
+    graph = DependencyGraph()
+    graph.register("ci_001", {"pt_001"})
+    graph.register("tg_001", {"ci_001"})
+    graph.register("tg_002", {"ci_001"})
+    graph.unregister("ci_001")
+    assert "ci_001" not in graph._deps.get("tg_001", set())  # pylint: disable=protected-access
+    assert "ci_001" not in graph._deps.get("tg_002", set())  # pylint: disable=protected-access
+    assert graph.is_registered("tg_001")
+    assert graph.is_registered("tg_002")
     graph._assert_consistent()  # pylint: disable=protected-access
 
 
@@ -554,6 +637,16 @@ def test_add_unknown_type_raises():
     pt = Point(**_env("pt"), easting=0.0, northing=0.0, altitude=0.0, color="#ff0000")
     object.__setattr__(pt, "type", "bogus")
     with pytest.raises(ValueError):
+        graph.add(pt)
+
+
+def test_add_attribute_error_includes_object_context():
+    # When deps_for_type raises AttributeError (mismatched type/class),
+    # add() must re-raise with the object id and type in the message.
+    graph = DependencyGraph()
+    pt = Point(**_env("pt"), easting=0.0, northing=0.0, altitude=0.0, color="#ff0000")
+    object.__setattr__(pt, "type", "line")  # line arm reads point_a_id which Point lacks
+    with pytest.raises(AttributeError, match="pt_001"):
         graph.add(pt)
 
 
