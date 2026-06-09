@@ -150,7 +150,7 @@ def test_reregister_replaces_old_edges():
     assert graph.dependents_of("pt_001") == set()
     assert graph.dependents_of("pt_002") == {"ln_001"}
     assert graph.dependents_of("pt_003") == {"ln_001"}
-    graph._assert_consistent()  # pylint: disable=protected-access
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
 
 def test_reregister_empty_deps_node_does_not_break_rdep_pointing_at_it():
@@ -164,7 +164,7 @@ def test_reregister_empty_deps_node_does_not_break_rdep_pointing_at_it():
     graph.register("ln_001", {"pt_001"})
     graph.register("pt_001", set())  # re-register with same empty deps
     assert graph.dependents_of("pt_001") == {"ln_001"}
-    graph._assert_consistent()  # pylint: disable=protected-access
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
 
 def test_reregister_to_empty_deps_removes_all_rdep_entries():
@@ -176,10 +176,10 @@ def test_reregister_to_empty_deps_removes_all_rdep_entries():
     graph.register("ln_001", set())
     assert graph.dependents_of("pt_001") == frozenset()
     assert graph.dependents_of("pt_002") == frozenset()
-    assert "pt_001" not in graph._rdeps  # pylint: disable=protected-access
-    assert "pt_002" not in graph._rdeps  # pylint: disable=protected-access
+    assert not graph._rdep_key_exists("pt_001")
+    assert not graph._rdep_key_exists("pt_002")
     assert graph.is_registered("ln_001")
-    graph._assert_consistent()  # pylint: disable=protected-access
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
 
 def test_reregister_with_smaller_dep_set_removes_only_dropped_edges():
@@ -190,7 +190,7 @@ def test_reregister_with_smaller_dep_set_removes_only_dropped_edges():
     graph.register("ln_001", {"pt_001"})
     assert graph.dependents_of("pt_001") == {"ln_001"}
     assert graph.dependents_of("pt_002") == frozenset()
-    graph._assert_consistent()  # pylint: disable=protected-access
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
 
 def test_register_dependent_before_dependency_is_legal():
@@ -198,10 +198,10 @@ def test_register_dependent_before_dependency_is_legal():
     # appears only as an _rdeps key (not yet in _deps) until it registers.
     graph = DependencyGraph()
     graph.register("ci_001", {"pt_001"})  # pt_001 not yet registered
-    graph._assert_consistent()  # pylint: disable=protected-access
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
     graph.register("pt_001", set())
     assert graph.dependents_of("pt_001") == {"ci_001"}
-    graph._assert_consistent()  # pylint: disable=protected-access
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
 
 def test_unregister_removes_node_as_a_dependent():
@@ -249,7 +249,7 @@ def test_unregister_strict_cleans_up_edges():
     graph.unregister("ci_001", strict=True)
     assert not graph.is_registered("ci_001")
     assert graph.dependents_of("pt_001") == frozenset()
-    graph._assert_consistent()  # pylint: disable=protected-access
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
 
 def test_unregister_invariant_violation_logs_and_raises(caplog):
@@ -287,7 +287,7 @@ def test_register_empty_dep_id_on_reregister_leaves_graph_consistent():
     # The original edge survived; the bad re-registration was fully rejected.
     assert graph.dependents_of("pt_001") == {"ln_001"}
     assert graph.dependents_of("pt_002") == frozenset()
-    graph._assert_consistent()  # pylint: disable=protected-access
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
 
 def test_unregister_empty_obj_id_raises():
@@ -358,14 +358,14 @@ def test_reregister_prunes_stale_rdeps_entry():
     graph = DependencyGraph()
     graph.register("ln_001", {"pt_001"})
     graph.register("ln_001", {"pt_002"})  # replaces pt_001
-    assert "pt_001" not in graph._rdeps  # pylint: disable=protected-access
+    assert not graph._rdep_key_exists("pt_001")
 
 
 def test_unregister_prunes_rdeps_entry_for_former_deps():
     graph = DependencyGraph()
     graph.register("ln_001", {"pt_001"})
     graph.unregister("ln_001")
-    assert "pt_001" not in graph._rdeps  # pylint: disable=protected-access
+    assert not graph._rdep_key_exists("pt_001")
 
 
 def test_unregister_middle_node_preserves_orphaned_dependent_presence():
@@ -380,7 +380,7 @@ def test_unregister_middle_node_preserves_orphaned_dependent_presence():
     graph.register("tg_001", {"pt_002"})
     assert graph.dependents_of("pt_002") == {"tg_001"}
     assert graph.dependents_of("pt_001") == set()
-    graph._assert_consistent()  # pylint: disable=protected-access
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
 
 def test_unregister_bidirectional_cleanup():
@@ -392,7 +392,7 @@ def test_unregister_bidirectional_cleanup():
     assert graph.dependents_of("pt_001") == set()
     assert graph.dependents_of("tg_001") == set()
     assert graph.dependents_of("ci_001") == set()
-    graph._assert_consistent()  # pylint: disable=protected-access
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
 
 def test_unregister_node_with_multiple_dependents_prunes_all_forward_edges():
@@ -409,7 +409,7 @@ def test_unregister_node_with_multiple_dependents_prunes_all_forward_edges():
     assert "ci_001" not in graph._deps.get("tg_002", set())  # pylint: disable=protected-access
     assert graph.is_registered("tg_001")
     assert graph.is_registered("tg_002")
-    graph._assert_consistent()  # pylint: disable=protected-access
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +574,16 @@ def test_deps_for_type_solid_with_duplicate_layers_collapses():
     assert DependencyGraph.deps_for_type(so) == {"pg_001", "pt_010"}
 
 
+def test_deps_for_type_polygon_with_duplicate_points_collapses():
+    pg = Polygon(
+        **_env("pg"),
+        point_ids=["pt_001", "pt_002", "pt_001"],
+        is_convex=True,
+        **_colors(),
+    )
+    assert DependencyGraph.deps_for_type(pg) == {"pt_001", "pt_002"}
+
+
 # ---------------------------------------------------------------------------
 # Integration: deps_for_type feeding register, then a multi-hop cascade query
 # ---------------------------------------------------------------------------
@@ -596,7 +606,7 @@ def test_cascade_point_circle_tangent_via_deps_for_type():
     assert graph.dependents_of("pt_001") == {"ci_001", "tg_001"}
     # The tangent's own point only reaches the tangent.
     assert graph.dependents_of("pt_002") == {"tg_001"}
-    graph._assert_consistent()  # pylint: disable=protected-access
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
 
 def test_deps_for_type_unknown_type_raises():
@@ -659,7 +669,7 @@ def test_add_cascade_point_circle_tangent():
     graph.add(ci)
     graph.add(tg)
     assert graph.dependents_of("pt_001") == {"ci_001", "tg_001"}
-    graph._assert_consistent()  # pylint: disable=protected-access
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
 
 def test_add_replaces_old_edges_on_readd():
@@ -672,7 +682,7 @@ def test_add_replaces_old_edges_on_readd():
     graph.add(ci_edited)
     assert graph.dependents_of("pt_001") == set()
     assert graph.dependents_of("pt_002") == {"ci_001"}
-    graph._assert_consistent()  # pylint: disable=protected-access
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
 
 def test_add_unknown_type_raises():
@@ -737,6 +747,28 @@ def test_is_registered_true_for_dependent_whose_dependency_was_unregistered():
 # ---------------------------------------------------------------------------
 
 
+def test_full_cascade_delete_multi_branch():
+    graph = DependencyGraph()
+    # Shared root pt_001
+    # Branch 1: circle + tangent
+    # Branch 2: line + polygon
+    graph.register("pt_001", set())
+    graph.register("ci_001", {"pt_001"})
+    graph.register("tg_001", {"ci_001"})
+    graph.register("ln_001", {"pt_001"})
+    graph.register("pg_001", {"ln_001"})
+
+    affected = graph.cascade_unregister("pt_001")
+    assert affected == {"ci_001", "tg_001", "ln_001", "pg_001"}
+
+    assert not graph.is_registered("pt_001")
+    assert not graph.is_registered("ci_001")
+    assert not graph.is_registered("tg_001")
+    assert not graph.is_registered("ln_001")
+    assert not graph.is_registered("pg_001")
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
+
+
 @pytest.mark.parametrize(
     "order",
     [["ci_001", "tg_001"], ["tg_001", "ci_001"]],
@@ -760,6 +792,6 @@ def test_full_cascade_delete_leaves_graph_clean(order):
     assert not graph.is_registered("pt_001")
     assert not graph.is_registered("ci_001")
     assert not graph.is_registered("tg_001")
-    graph._assert_consistent()  # pylint: disable=protected-access
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
     assert not graph._deps  # pylint: disable=protected-access
     assert not graph._rdeps  # pylint: disable=protected-access

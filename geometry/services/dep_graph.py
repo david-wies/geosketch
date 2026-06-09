@@ -121,6 +121,7 @@ class DependencyGraph:
         obj_id = obj.id
         try:
             dep_ids = self.deps_for_type(obj)
+            self.register(obj_id, dep_ids)
         except AttributeError as exc:
             raise AttributeError(
                 f"DependencyGraph.add: expected attributes for type {obj_type!r} "
@@ -128,10 +129,9 @@ class DependencyGraph:
             ) from exc
         except ValueError as exc:
             raise ValueError(
-                f"DependencyGraph.add: cannot derive deps for type {obj_type!r} "
+                f"DependencyGraph.add: cannot register type {obj_type!r} "
                 f"on object {obj_id!r}: {exc}"
             ) from exc
-        self.register(obj_id, dep_ids)
 
     def register(self, obj_id: str, dep_ids: Iterable[str]) -> None:
         """Record that ``obj_id`` depends on every id in ``dep_ids``.
@@ -216,7 +216,9 @@ class DependencyGraph:
         if not obj_id:
             raise ValueError("DependencyGraph.unregister: obj_id must be a non-empty string")
         if strict and obj_id not in self._deps:
-            raise KeyError(obj_id)
+            raise KeyError(
+                f"DependencyGraph.unregister: {obj_id!r} is not registered (strict=True)"
+            )
         # Remove forward edges out of obj_id and their mirrored reverse edges.
         # No-op if obj_id was never registered (pop returns the empty default).
         for dep_id in self._deps.pop(obj_id, _EMPTY):
@@ -237,7 +239,8 @@ class DependencyGraph:
                 # set here means the bidirectional invariant has already been
                 # violated by some out-of-band corruption. Raise immediately
                 # rather than continuing with a dirty graph; the caller should
-                # treat this as a programming error and investigate.
+                # treat this as a programming error and investigate. Note that
+                # _deps has already been mutated if this fires.
                 _logger.error(
                     "DependencyGraph.unregister: _rdeps[%r] lists dependent %r "
                     "with no _deps entry; bidirectional invariant violated.",
@@ -254,6 +257,18 @@ class DependencyGraph:
             # (identical to a freshly registered Point). ``_rdeps`` is the
             # map that must stay free of empty sets; see the class docstring.
             forward.discard(obj_id)
+
+    def cascade_unregister(self, obj_id: str) -> frozenset[str]:
+        """Unregister obj_id and every transitively dependent object.
+
+        Returns the set of all unregistered dependents (not including obj_id)
+        so the command layer can remove them from the object store.
+        """
+        affected = self.dependents_of(obj_id)
+        for dep in affected:
+            self.unregister(dep)
+        self.unregister(obj_id)
+        return affected
 
     def dependents_of(self, obj_id: str) -> frozenset[str]:
         """Return the transitive closure of objects that depend on ``obj_id``.
@@ -335,7 +350,14 @@ class DependencyGraph:
             raise ValueError("DependencyGraph.is_registered: obj_id must be a non-empty string")
         return obj_id in self._deps
 
-    def _assert_consistent(self) -> None:
+    def _rdep_key_exists(self, dep_id: str) -> bool:
+        """Return whether dep_id is tracked as a dependency in the reverse edges.
+        
+        Test-only predicate to avoid protected-attribute access warnings.
+        """
+        return dep_id in self._rdeps
+
+    def _test_only_assert_consistent(self) -> None:
         """Assert the bidirectional mirror invariant holds on both maps.
 
         Every forward edge ``(obj_id, dep_id)`` in ``_deps`` must have a
@@ -437,25 +459,55 @@ class DependencyGraph:
             case "point":
                 return set()
             case "line":
+                if not obj.point_a_id or not obj.point_b_id:
+                    raise ValueError(
+                        f"deps_for_type: line {obj.id!r} has empty point reference "
+                        f"(point_a_id={obj.point_a_id!r}, point_b_id={obj.point_b_id!r})"
+                    )
                 return {obj.point_a_id, obj.point_b_id}
             case "polygon":
+                if "" in obj.point_ids:
+                    raise ValueError(
+                        f"deps_for_type: polygon {obj.id!r} has empty point reference "
+                        f"in point_ids={obj.point_ids!r}"
+                    )
                 return set(obj.point_ids)
             case "ray":
+                if not obj.origin_id:
+                    raise ValueError(f"deps_for_type: ray {obj.id!r} has empty origin reference")
                 return {obj.origin_id}
             case "vector":
+                if not obj.origin_id:
+                    raise ValueError(f"deps_for_type: vector {obj.id!r} has empty origin reference")
                 deps = {obj.origin_id}
                 if obj.endpoint_id is not None:
+                    if not obj.endpoint_id:
+                        raise ValueError(f"deps_for_type: vector {obj.id!r} has empty endpoint reference")
                     deps.add(obj.endpoint_id)
                 return deps
             case "circle" | "ball":
+                if not obj.center_id:
+                    raise ValueError(f"deps_for_type: {obj.type} {obj.id!r} has empty center reference")
                 return {obj.center_id}
             case "cylinder":
+                if not obj.base_center_id:
+                    raise ValueError(f"deps_for_type: cylinder {obj.id!r} has empty base center reference")
                 return {obj.base_center_id}
             case "solid":
+                if "" in obj.layers:
+                    raise ValueError(
+                        f"deps_for_type: solid {obj.id!r} has empty layer reference "
+                        f"in layers={obj.layers!r}"
+                    )
                 # Duplicate layer ids collapse intentionally: cascade semantics
                 # only need whether a dependency is referenced at least once.
                 return set(obj.layers)
             case "tangent":
+                if not obj.shape_id or not obj.point_id:
+                    raise ValueError(
+                        f"deps_for_type: tangent {obj.id!r} has empty reference "
+                        f"(shape_id={obj.shape_id!r}, point_id={obj.point_id!r})"
+                    )
                 return {obj.shape_id, obj.point_id}
             case _:
                 raise ValueError(f"deps_for_type: unknown object type {obj.type!r}")
