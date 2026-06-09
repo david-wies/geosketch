@@ -110,6 +110,14 @@ def test_dependents_of_collects_transitive_closure():
     assert graph.dependents_of("pt_001") == {"ci_001", "tg_001"}
 
 
+def test_dependents_of_collects_three_hop_transitive_closure():
+    graph = DependencyGraph()
+    graph.register("ci_001", {"pt_001"})
+    graph.register("tg_001", {"ci_001"})
+    graph.register("so_001", {"tg_001"})
+    assert graph.dependents_of("pt_001") == {"ci_001", "tg_001", "so_001"}
+
+
 def test_dependents_of_fan_out_multiple_direct_dependents():
     graph = DependencyGraph()
     graph.register("ln_001", {"pt_001"})
@@ -120,7 +128,8 @@ def test_dependents_of_fan_out_multiple_direct_dependents():
 
 def test_dependents_of_diamond_deduplicates():
     graph = DependencyGraph()
-    # pt_001 feeds ln_001 and ln_002; pg_001 depends on both lines.
+    # Arbitrary ids for topology testing: pt_001 feeds ln_001 and ln_002;
+    # pg_001 depends on both lines.
     graph.register("ln_001", {"pt_001"})
     graph.register("ln_002", {"pt_001"})
     graph.register("pg_001", {"ln_001", "ln_002"})
@@ -165,6 +174,8 @@ def test_reregister_to_empty_deps_removes_all_rdep_entries():
     graph = DependencyGraph()
     graph.register("ln_001", {"pt_001", "pt_002"})
     graph.register("ln_001", set())
+    assert graph.dependents_of("pt_001") == frozenset()
+    assert graph.dependents_of("pt_002") == frozenset()
     assert "pt_001" not in graph._rdeps  # pylint: disable=protected-access
     assert "pt_002" not in graph._rdeps  # pylint: disable=protected-access
     assert graph.is_registered("ln_001")
@@ -239,6 +250,17 @@ def test_unregister_strict_cleans_up_edges():
     assert not graph.is_registered("ci_001")
     assert graph.dependents_of("pt_001") == frozenset()
     graph._assert_consistent()  # pylint: disable=protected-access
+
+
+def test_unregister_invariant_violation_logs_and_raises(caplog):
+    graph = DependencyGraph()
+    graph._rdeps["pt_001"] = {"ci_001"}  # pylint: disable=protected-access
+
+    with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="invariant"):
+        graph.unregister("pt_001")
+
+    assert "ci_001" in caplog.text
+    assert "pt_001" in caplog.text
 
 
 def test_register_empty_obj_id_raises():
@@ -655,12 +677,15 @@ def test_add_replaces_old_edges_on_readd():
 
 def test_add_unknown_type_raises():
     # add() must propagate the ValueError from deps_for_type rather than
-    # silently registering with a wrong edge set.
+    # silently registering with a wrong edge set, and it must include object
+    # context just like the AttributeError path.
     graph = DependencyGraph()
     pt = Point(**_env("pt"), easting=0.0, northing=0.0, altitude=0.0, color="#ff0000")
     object.__setattr__(pt, "type", "bogus")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as exc_info:
         graph.add(pt)
+    assert "pt_001" in str(exc_info.value)
+    assert "bogus" in str(exc_info.value)
 
 
 def test_add_attribute_error_includes_object_context():

@@ -29,19 +29,23 @@ derives the correct dependency set from the object's type automatically. Call
 
 The graph stores only IDs — it never holds model instances — so it cannot leak
 references and stays valid across save/load as long as the create/delete
-commands keep it in sync via :meth:`register` and :meth:`unregister`. It
-imports only the model dataclasses (:mod:`geometry.models`); no ``tkinter`` or
-``matplotlib``.
+commands keep it in sync via :meth:`DependencyGraph.add` and
+:meth:`DependencyGraph.unregister`. It imports only the model dataclasses
+(:mod:`geometry.models`); no ``tkinter`` or ``matplotlib``.
 """
 
+import logging
 from collections import deque
 from collections.abc import Iterable
+from typing import AbstractSet
 
 from geometry.models import GeoObject
 
 __all__ = ["DependencyGraph"]
 
-_EMPTY: frozenset[str] = frozenset()
+_logger = logging.getLogger(__name__)
+
+_EMPTY: AbstractSet[str] = frozenset()
 
 
 class DependencyGraph:
@@ -63,7 +67,7 @@ class DependencyGraph:
         or an object whose every dependency has since been unregistered): the
         empty set is a deliberate presence marker, not noise.
     _rdeps : dict[str, set[str]]
-        Reverse edges: ``obj_id`` -> set of IDs that depend on it. Empty sets
+        Reverse edges: ``dep_id`` -> set of IDs that depend on it. Empty sets
         are never retained here — a key is dropped the moment its last reverse
         edge is pruned — so the two maps are intentionally asymmetric. Only
         ``_rdeps`` is walked by :meth:`dependents_of`, so its emptiness is what
@@ -102,8 +106,9 @@ class DependencyGraph:
         ------
         ValueError
             If ``obj.type`` is not one of the ten known object types, or if
-            ``deps_for_type`` raises for any other reason (propagated with
-            context identifying the object id and type).
+            ``obj.id`` is an empty string, any derived dependency id is an
+            empty string, or ``deps_for_type`` raises for any other reason
+            (propagated with context identifying the object id and type).
         AttributeError
             If ``obj.type`` is a known type but a required type-specific
             attribute is missing on the instance (model dataclass inconsistent
@@ -183,9 +188,10 @@ class DependencyGraph:
         deleted object. No-op if ``obj_id`` was never registered (unless
         ``strict`` is set).
 
-        Callers running a cascade delete must unregister every object returned
-        by :meth:`dependents_of` as well, so their forward edges stay consistent
-        with the remaining graph state.
+        Callers running a cascade delete must query :meth:`dependents_of`,
+        unregister every returned dependent, and then unregister the root
+        ``obj_id`` separately so all forward edges stay consistent with the
+        remaining graph state.
 
         Parameters
         ----------
@@ -232,6 +238,12 @@ class DependencyGraph:
                 # violated by some out-of-band corruption. Raise immediately
                 # rather than continuing with a dirty graph; the caller should
                 # treat this as a programming error and investigate.
+                _logger.error(
+                    "DependencyGraph.unregister: _rdeps[%r] lists dependent %r "
+                    "with no _deps entry; bidirectional invariant violated.",
+                    obj_id,
+                    dependent,
+                )
                 raise RuntimeError(
                     f"DependencyGraph.unregister: _rdeps[{obj_id!r}] lists dependent "
                     f"{dependent!r} with no _deps entry; bidirectional invariant violated."
@@ -345,9 +357,10 @@ class DependencyGraph:
         :meth:`unregister` ensures no stale ``_rdeps`` entries survive a
         properly ordered cascade delete.
 
-        **Warning:** This method uses ``assert`` statements and is silently
-        inert when Python is run with ``-O`` or ``-OO``. It is for test-time
-        invariant verification only; do not call it as a production guard.
+        **Warning:** This protected helper is not part of the public API. It
+        uses ``assert`` statements and is silently inert when Python is run with
+        ``-O`` or ``-OO``. It is for test-time invariant verification only; do
+        not call it as a production guard.
 
         Raises
         ------
@@ -439,6 +452,8 @@ class DependencyGraph:
             case "cylinder":
                 return {obj.base_center_id}
             case "solid":
+                # Duplicate layer ids collapse intentionally: cascade semantics
+                # only need whether a dependency is referenced at least once.
                 return set(obj.layers)
             case "tangent":
                 return {obj.shape_id, obj.point_id}
