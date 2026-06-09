@@ -171,6 +171,17 @@ def test_reregister_to_empty_deps_removes_all_rdep_entries():
     graph._assert_consistent()  # pylint: disable=protected-access
 
 
+def test_reregister_with_smaller_dep_set_removes_only_dropped_edges():
+    # Re-registering with a subset of original deps must drop only the removed
+    # edges; edges to deps still in the set must be preserved.
+    graph = DependencyGraph()
+    graph.register("ln_001", {"pt_001", "pt_002"})
+    graph.register("ln_001", {"pt_001"})
+    assert graph.dependents_of("pt_001") == {"ln_001"}
+    assert graph.dependents_of("pt_002") == frozenset()
+    graph._assert_consistent()  # pylint: disable=protected-access
+
+
 def test_register_dependent_before_dependency_is_legal():
     # Registering a dependent before its dependency is legal: the dependency
     # appears only as an _rdeps key (not yet in _deps) until it registers.
@@ -261,6 +272,18 @@ def test_unregister_empty_obj_id_raises():
     graph = DependencyGraph()
     with pytest.raises(ValueError, match="non-empty"):
         graph.unregister("")
+
+
+def test_dependents_of_empty_obj_id_raises():
+    graph = DependencyGraph()
+    with pytest.raises(ValueError, match="non-empty"):
+        graph.dependents_of("")
+
+
+def test_is_registered_empty_obj_id_raises():
+    graph = DependencyGraph()
+    with pytest.raises(ValueError, match="non-empty"):
+        graph.is_registered("")
 
 
 def test_dependents_of_terminates_on_a_two_node_cycle():

@@ -22,6 +22,11 @@ recomputed or removed. Scanning the whole object store for each such operation
 is O(|all objects|); this graph reduces it to O(|affected|) by maintaining the
 reverse edges explicitly and walking them with a breadth-first traversal.
 
+The preferred entry point for command code is :meth:`DependencyGraph.add`, which
+derives the correct dependency set from the object's type automatically. Call
+:meth:`DependencyGraph.register` directly only when you have already called
+:meth:`DependencyGraph.deps_for_type` yourself and are passing its result in.
+
 The graph stores only IDs — it never holds model instances — so it cannot leak
 references and stays valid across save/load as long as the create/delete
 commands keep it in sync via :meth:`register` and :meth:`unregister`. It
@@ -29,7 +34,6 @@ imports only the model dataclasses (:mod:`geometry.models`); no ``tkinter`` or
 ``matplotlib``.
 """
 
-import logging
 from collections import deque
 from collections.abc import Iterable
 
@@ -38,8 +42,6 @@ from geometry.models import GeoObject
 __all__ = ["DependencyGraph"]
 
 _EMPTY: frozenset[str] = frozenset()
-
-_logger = logging.getLogger(__name__)
 
 
 class DependencyGraph:
@@ -99,7 +101,9 @@ class DependencyGraph:
         Raises
         ------
         ValueError
-            If ``obj.type`` is not one of the ten known object types.
+            If ``obj.type`` is not one of the ten known object types, or if
+            ``deps_for_type`` raises for any other reason (propagated with
+            context identifying the object id and type).
         AttributeError
             If ``obj.type`` is a known type but a required type-specific
             attribute is missing on the instance (model dataclass inconsistent
@@ -116,6 +120,11 @@ class DependencyGraph:
             raise AttributeError(
                 f"DependencyGraph.add: expected attributes for type {obj_type!r} "
                 f"missing on object {obj_id!r}: {exc}"
+            ) from exc
+        except ValueError as exc:
+            raise ValueError(
+                f"DependencyGraph.add: cannot derive deps for type {obj_type!r} "
+                f"on object {obj_id!r}: {exc}"
             ) from exc
         self.register(obj_id, dep_ids)
 
@@ -174,7 +183,7 @@ class DependencyGraph:
         deleted object. No-op if ``obj_id`` was never registered (unless
         ``strict`` is set).
 
-        Callers running a cascade delete should unregister every object returned
+        Callers running a cascade delete must unregister every object returned
         by :meth:`dependents_of` as well, so their forward edges stay consistent
         with the remaining graph state.
 
@@ -194,6 +203,9 @@ class DependencyGraph:
             If ``obj_id`` is an empty string.
         KeyError
             If ``strict`` is ``True`` and ``obj_id`` is not registered.
+        RuntimeError
+            If an internal bidirectional invariant violation is detected during
+            unregistration (indicates out-of-band corruption of the graph).
         """
         if not obj_id:
             raise ValueError("DependencyGraph.unregister: obj_id must be a non-empty string")
@@ -217,16 +229,13 @@ class DependencyGraph:
                 # dependent's own register() call, which always creates its
                 # matching _deps entry in the same call. So a missing forward
                 # set here means the bidirectional invariant has already been
-                # violated by some out-of-band corruption. Log it at ERROR (the
-                # asserts in _assert_consistent() are inert under -O and give no
-                # production signal) and skip the dangling reverse edge.
-                _logger.error(
-                    "DependencyGraph.unregister: _rdeps[%r] lists dependent %r with no _deps "
-                    "entry; bidirectional invariant violated.",
-                    obj_id,
-                    dependent,
+                # violated by some out-of-band corruption. Raise immediately
+                # rather than continuing with a dirty graph; the caller should
+                # treat this as a programming error and investigate.
+                raise RuntimeError(
+                    f"DependencyGraph.unregister: _rdeps[{obj_id!r}] lists dependent "
+                    f"{dependent!r} with no _deps entry; bidirectional invariant violated."
                 )
-                continue
             # Intentionally do NOT delete an emptied forward set: a
             # dependent that loses its last edge is still a registered
             # object, and an empty ``_deps`` entry is its presence marker
@@ -256,7 +265,8 @@ class DependencyGraph:
         Parameters
         ----------
         obj_id : str
-            The object whose transitive dependents to collect.
+            The object whose transitive dependents to collect. Must be a
+            non-empty string.
 
         Returns
         -------
@@ -264,7 +274,14 @@ class DependencyGraph:
             All object ids that transitively depend on ``obj_id``. The
             frozenset is a read-only snapshot; it cannot be mutated and does
             not share state with the graph.
+
+        Raises
+        ------
+        ValueError
+            If ``obj_id`` is an empty string.
         """
+        if not obj_id:
+            raise ValueError("DependencyGraph.dependents_of: obj_id must be a non-empty string")
         result: set[str] = set()
         queue: deque[str] = deque()
         first_wave = self._rdeps.get(obj_id, _EMPTY)
@@ -289,14 +306,21 @@ class DependencyGraph:
         Parameters
         ----------
         obj_id : str
-            The object id to query.
+            The object id to query. Must be a non-empty string.
 
         Returns
         -------
         bool
             ``True`` if ``obj_id`` has an entry in ``_deps``; ``False``
             otherwise.
+
+        Raises
+        ------
+        ValueError
+            If ``obj_id`` is an empty string.
         """
+        if not obj_id:
+            raise ValueError("DependencyGraph.is_registered: obj_id must be a non-empty string")
         return obj_id in self._deps
 
     def _assert_consistent(self) -> None:
