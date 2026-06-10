@@ -80,6 +80,36 @@ class DependencyGraph:
         # key present iff >=1 dependent; empty sets are never retained here
         self._rdeps: dict[str, set[str]] = {}
 
+    @staticmethod
+    def _validate_obj_id(obj_id: str, method: str) -> None:
+        """Reject a non-``str`` or empty ``obj_id`` before any other work.
+
+        Shared by every public method that takes an ``obj_id`` so the type
+        guard (``TypeError``, covering ``None``) always fires before the
+        empty-string guard (``ValueError``), with a message naming the
+        calling method.
+
+        Parameters
+        ----------
+        obj_id : str
+            The candidate identifier to validate.
+        method : str
+            Public method name to embed in the error message.
+
+        Raises
+        ------
+        TypeError
+            If ``obj_id`` is not a ``str`` (including ``None``).
+        ValueError
+            If ``obj_id`` is an empty string.
+        """
+        if not isinstance(obj_id, str):
+            raise TypeError(
+                f"DependencyGraph.{method}: obj_id must be a str, got {type(obj_id).__name__}"
+            )
+        if not obj_id:
+            raise ValueError(f"DependencyGraph.{method}: obj_id must be a non-empty string")
+
     def add(self, obj: GeoObject) -> None:
         """Register ``obj`` using the dependency set derived from its own type.
 
@@ -154,16 +184,24 @@ class DependencyGraph:
 
         Raises
         ------
+        TypeError
+            If ``obj_id`` is not a ``str`` (including ``None``), or if any
+            element of ``dep_ids`` is not a ``str``.
         ValueError
             If ``obj_id`` is an empty string, or if any element of ``dep_ids``
             is an empty string.
         """
         # Materialise and FULLY validate the new dependency set BEFORE any
-        # mutation, so a bad input (empty obj_id or empty dep id) cannot leave
-        # the graph half-updated on a re-registration.
-        if not obj_id:
-            raise ValueError("DependencyGraph.register: obj_id must be a non-empty string")
+        # mutation, so a bad input (None/empty obj_id or None/empty dep id)
+        # cannot leave the graph half-updated on a re-registration.
+        self._validate_obj_id(obj_id, "register")
         dep_set = set(dep_ids)
+        for dep_id in dep_set:
+            if not isinstance(dep_id, str):
+                raise TypeError(
+                    f"DependencyGraph.register: dep_ids must contain only str, "
+                    f"got {type(dep_id).__name__}"
+                )
         if "" in dep_set:
             raise ValueError("DependencyGraph.register: dep_ids must not contain empty strings")
 
@@ -188,10 +226,24 @@ class DependencyGraph:
         deleted object. No-op if ``obj_id`` was never registered (unless
         ``strict`` is set).
 
-        Callers running a cascade delete must query :meth:`dependents_of`,
-        unregister every returned dependent, and then unregister the root
-        ``obj_id`` separately so all forward edges stay consistent with the
-        remaining graph state.
+        For cascade deletes, prefer :meth:`cascade_unregister` — it bundles
+        the whole protocol (closure query, dependent removal, root removal)
+        into one call and reports exactly what it removed. Note that
+        :meth:`cascade_unregister` calls this method with ``strict=False``
+        internally, so hand-rolling the protocol with ``strict=True`` is not
+        equivalent: the strict variant raises ``KeyError`` on a double-delete
+        that the convenience wrapper would silently absorb.
+
+        See Also
+        --------
+        cascade_unregister : Preferred cascade-delete entry point.
+
+        Notes
+        -----
+        Advanced path — callers hand-rolling a cascade delete must query
+        :meth:`dependents_of`, unregister every returned dependent, and then
+        unregister the root ``obj_id`` separately so all forward edges stay
+        consistent with the remaining graph state.
 
         Parameters
         ----------
@@ -200,11 +252,14 @@ class DependencyGraph:
         strict : bool, optional
             If ``True`` and ``obj_id`` is not currently registered, raise
             ``KeyError`` instead of silently ignoring the call. Use
-            ``strict=True`` in the cascade-delete command path to surface
-            double-delete bugs rather than hiding them. Default is ``False``.
+            ``strict=True`` to surface double-delete bugs rather than hiding
+            them (but see above — :meth:`cascade_unregister` deliberately
+            uses ``strict=False``). Default is ``False``.
 
         Raises
         ------
+        TypeError
+            If ``obj_id`` is not a ``str`` (including ``None``).
         ValueError
             If ``obj_id`` is an empty string.
         KeyError
@@ -213,8 +268,7 @@ class DependencyGraph:
             If an internal bidirectional invariant violation is detected during
             unregistration (indicates out-of-band corruption of the graph).
         """
-        if not obj_id:
-            raise ValueError("DependencyGraph.unregister: obj_id must be a non-empty string")
+        self._validate_obj_id(obj_id, "unregister")
         if strict and obj_id not in self._deps:
             raise KeyError(
                 f"DependencyGraph.unregister: {obj_id!r} is not registered (strict=True)"
@@ -273,36 +327,58 @@ class DependencyGraph:
         Convenience wrapper around the three-step cascade-delete protocol:
         collect the transitive closure, unregister each dependent (in an
         arbitrary order, since all dependents are removed together), and then
-        unregister ``obj_id`` itself.  The command layer should use this
-        instead of hand-rolling the three steps so the order invariant cannot
-        be violated accidentally.
+        unregister ``obj_id`` itself if — and only if — it was registered.
+        The command layer should use this instead of hand-rolling the three
+        steps so the order invariant cannot be violated accidentally.
+
+        The return set contains **exactly** the IDs that were actually
+        unregistered by this call, so the command layer can mirror the graph
+        mutation onto the project store one-to-one:
+
+        * ``obj_id`` registered, with dependents — all dependents plus
+          ``obj_id``.
+        * ``obj_id`` registered, no dependents — ``frozenset({obj_id})``.
+        * ``obj_id`` not registered, but referenced by registered dependents
+          (a forward reference: others were registered naming it before it
+          registered itself) — the dependents only; ``obj_id`` is excluded
+          because it had no ``_deps`` entry to remove.
+        * ``obj_id`` completely unknown — ``frozenset()``; no mutation occurs.
 
         Parameters
         ----------
         obj_id : str
             The root object to delete.  Must be a non-empty string.  Need not
-            be currently registered; if it is not, only the empty frozenset is
-            returned and no mutations occur (``dependents_of`` and ``unregister``
-            are both no-ops for unknown IDs by default).
+            be currently registered; see the case table above for what is
+            returned and unregistered in each situation.
 
         Returns
         -------
         frozenset[str]
-            The frozenset of **all** IDs that were unregistered, including
-            ``obj_id`` itself.  The command layer can use this set to remove
-            the corresponding objects from the project store in one pass.
+            Exactly the IDs that were unregistered by this call.  Includes
+            ``obj_id`` itself only when ``obj_id`` was registered at the time
+            of the call.  Empty when ``obj_id`` is unknown to the graph.
 
         Raises
         ------
+        TypeError
+            If ``obj_id`` is not a ``str`` (propagated from
+            :meth:`dependents_of`).
         ValueError
             If ``obj_id`` is an empty string (propagated from
             :meth:`dependents_of`).
+        RuntimeError
+            If an internal bidirectional invariant violation is detected
+            (propagated from the pre-mutation check in :meth:`unregister`);
+            the graph was already corrupted out-of-band before this call.
         """
         affected = self.dependents_of(obj_id)
+        root_registered = self.is_registered(obj_id)
         for dep in affected:
             self.unregister(dep)
-        self.unregister(obj_id)
-        return affected | frozenset({obj_id})
+        if root_registered:
+            self.unregister(obj_id)
+            return affected | frozenset({obj_id})
+        return affected
 
     def dependents_of(self, obj_id: str) -> frozenset[str]:
         """Return the transitive closure of objects that depend on ``obj_id``.
@@ -310,18 +386,12 @@ class DependencyGraph:
         Breadth-first walk over the reverse edges. The result is empty for an
         unknown id or a leaf that nothing references. To distinguish an unknown
         id from a registered leaf with no dependents, use :meth:`is_registered`.
-        In the well-formed DAG that the real domain always produces, ``obj_id``
-        itself will not appear in the result. In a pathological cycle,
-        ``obj_id`` will appear because the BFS seeds ``result`` from the
-        first-wave dependents only; ``obj_id`` is never pre-placed into the
-        visited set, so a reverse path that leads back to it will collect it.
-        The BFS terminates regardless because the visited-guard prevents
-        re-enqueueing any already-collected node.
 
         Callers performing a cascade delete must also call
         ``unregister(obj_id)`` after unregistering all returned dependents —
         the queried object is excluded from the result set but must be pruned
-        separately to fully clean the graph.
+        separately to fully clean the graph (or use :meth:`cascade_unregister`,
+        which does all of this in one call).
 
         Parameters
         ----------
@@ -334,15 +404,23 @@ class DependencyGraph:
         frozenset[str]
             All object ids that transitively depend on ``obj_id``. The
             frozenset is a read-only snapshot; it cannot be mutated and does
-            not share state with the graph.
+            not share state with the graph. In the well-formed DAG that the
+            real domain always produces, ``obj_id`` itself never appears in
+            the result. In a pathological cycle, however, ``obj_id`` **will**
+            appear: the BFS seeds the result from the first-wave dependents
+            only and never pre-places ``obj_id`` into the visited set, so a
+            reverse path leading back to it collects it. The BFS terminates
+            regardless because the visited-guard prevents re-enqueueing any
+            already-collected node.
 
         Raises
         ------
+        TypeError
+            If ``obj_id`` is not a ``str`` (including ``None``).
         ValueError
             If ``obj_id`` is an empty string.
         """
-        if not obj_id:
-            raise ValueError("DependencyGraph.dependents_of: obj_id must be a non-empty string")
+        self._validate_obj_id(obj_id, "dependents_of")
         result: set[str] = set()
         queue: deque[str] = deque()
         first_wave = self._rdeps.get(obj_id, _EMPTY)
@@ -377,19 +455,55 @@ class DependencyGraph:
 
         Raises
         ------
+        TypeError
+            If ``obj_id`` is not a ``str`` (including ``None``).
         ValueError
             If ``obj_id`` is an empty string.
         """
-        if not obj_id:
-            raise ValueError("DependencyGraph.is_registered: obj_id must be a non-empty string")
+        self._validate_obj_id(obj_id, "is_registered")
         return obj_id in self._deps
 
-    def _rdep_key_exists(self, dep_id: str) -> bool:
-        """Return whether dep_id is tracked as a dependency in the reverse edges.
+    def _test_only_rdep_key_exists(self, dep_id: str) -> bool:
+        """Return whether ``dep_id`` is tracked as a dependency in the reverse edges.
 
-        Test-only predicate to avoid protected-attribute access warnings.
+        Test-only predicate so the test suite can assert ``_rdeps``-key pruning
+        without reaching into the protected map directly (avoids
+        protected-attribute access warnings at every call site). Not part of
+        the public API; production code must not call it.
+
+        Parameters
+        ----------
+        dep_id : str
+            The candidate dependency id to look up in ``_rdeps``.
+
+        Returns
+        -------
+        bool
+            ``True`` if ``dep_id`` is currently a key in ``_rdeps``.
         """
         return dep_id in self._rdeps
+
+    def _test_only_dep_ids_of(self, obj_id: str) -> frozenset[str]:
+        """Return a read-only snapshot of ``obj_id``'s forward-edge set.
+
+        Test-only accessor so the test suite can assert per-object forward-edge
+        pruning without poking ``_deps`` directly. Returns an empty frozenset
+        for an unregistered id (no distinction from a registered object whose
+        dependency set is empty — use :meth:`is_registered` for that). Not part
+        of the public API; production code must not call it.
+
+        Parameters
+        ----------
+        obj_id : str
+            The object whose direct dependencies to snapshot.
+
+        Returns
+        -------
+        frozenset[str]
+            The ids ``obj_id`` directly depends on; empty if unregistered or
+            registered with no dependencies.
+        """
+        return frozenset(self._deps.get(obj_id, _EMPTY))
 
     def _test_only_assert_consistent(self) -> None:
         """Assert the bidirectional mirror invariant holds on both maps.
@@ -414,9 +528,10 @@ class DependencyGraph:
         properly ordered cascade delete.
 
         **Warning:** This protected helper is not part of the public API. It
-        uses ``assert`` statements and is silently inert when Python is run with
-        ``-O`` or ``-OO``. It is for test-time invariant verification only; do
-        not call it as a production guard.
+        raises ``AssertionError`` explicitly (no ``assert`` statements), so it
+        is **not** disabled by running Python with ``-O``/``-OO``. It is still
+        intended for test-time invariant verification only — its O(|edges|)
+        full-graph scan makes it unsuitable as a production guard.
 
         Raises
         ------
@@ -426,15 +541,18 @@ class DependencyGraph:
         """
         for obj_id, fwd in self._deps.items():
             for dep_id in fwd:
-                assert obj_id in self._rdeps.get(dep_id, _EMPTY), (
-                    f"forward edge {obj_id!r}→{dep_id!r} has no matching reverse edge"
-                )
+                if obj_id not in self._rdeps.get(dep_id, _EMPTY):
+                    raise AssertionError(
+                        f"forward edge {obj_id!r}→{dep_id!r} has no matching reverse edge"
+                    )
         for dep_id, rev in self._rdeps.items():
-            assert rev, f"_rdeps must not contain empty sets; found key {dep_id!r}"
+            if not rev:
+                raise AssertionError(f"_rdeps must not contain empty sets; found key {dep_id!r}")
             for obj_id in rev:
-                assert dep_id in self._deps.get(obj_id, _EMPTY), (
-                    f"reverse edge {dep_id!r}→{obj_id!r} has no matching forward edge"
-                )
+                if dep_id not in self._deps.get(obj_id, _EMPTY):
+                    raise AssertionError(
+                        f"reverse edge {dep_id!r}→{obj_id!r} has no matching forward edge"
+                    )
 
     @staticmethod
     def deps_for_type(obj: GeoObject) -> set[str]:  # pylint: disable=too-many-branches
@@ -457,7 +575,12 @@ class DependencyGraph:
         solid        ``set(layers)`` — ``layers`` is a ``tuple[str, ...]`` of
                      Polygon (``pg_``) or Point (``pt_``) ids, with at most one
                      Point id (apex/nadir -- must be first or last element;
-                     enforced by ``Solid.__post_init__``).
+                     enforced by ``Solid.__post_init__``). That structural
+                     validation (minimum two layers, ``pg_``/``pt_`` prefix
+                     rules) lives in ``Solid.__post_init__``; this method
+                     adds only its own empty-string reference guard, which
+                     defends against instances built outside the dataclass
+                     constructor.
         tangent      ``{shape_id, point_id}`` — ``shape_id`` is the id of a
                      Circle or Ball.
         ===========  ===================================================
@@ -502,6 +625,12 @@ class DependencyGraph:
                     )
                 return {obj.point_a_id, obj.point_b_id}
             case "polygon":
+                # Polygon.__post_init__ does not enforce a minimum vertex
+                # count, so an empty point_ids list would otherwise register
+                # the polygon with no edges — indistinguishable from a Point
+                # and invisible to every cascade. Reject it here.
+                if not obj.point_ids:
+                    raise ValueError(f"deps_for_type: polygon {obj.id!r} has no point references")
                 if "" in obj.point_ids:
                     raise ValueError(
                         f"deps_for_type: polygon {obj.id!r} has empty point reference "

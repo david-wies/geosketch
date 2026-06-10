@@ -176,8 +176,8 @@ def test_reregister_to_empty_deps_removes_all_rdep_entries():
     graph.register("ln_001", set())
     assert graph.dependents_of("pt_001") == frozenset()
     assert graph.dependents_of("pt_002") == frozenset()
-    assert not graph._rdep_key_exists("pt_001")  # pylint: disable=protected-access
-    assert not graph._rdep_key_exists("pt_002")  # pylint: disable=protected-access
+    assert not graph._test_only_rdep_key_exists("pt_001")  # pylint: disable=protected-access
+    assert not graph._test_only_rdep_key_exists("pt_002")  # pylint: disable=protected-access
     assert graph.is_registered("ln_001")
     graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
@@ -358,14 +358,14 @@ def test_reregister_prunes_stale_rdeps_entry():
     graph = DependencyGraph()
     graph.register("ln_001", {"pt_001"})
     graph.register("ln_001", {"pt_002"})  # replaces pt_001
-    assert not graph._rdep_key_exists("pt_001")  # pylint: disable=protected-access
+    assert not graph._test_only_rdep_key_exists("pt_001")  # pylint: disable=protected-access
 
 
 def test_unregister_prunes_rdeps_entry_for_former_deps():
     graph = DependencyGraph()
     graph.register("ln_001", {"pt_001"})
     graph.unregister("ln_001")
-    assert not graph._rdep_key_exists("pt_001")  # pylint: disable=protected-access
+    assert not graph._test_only_rdep_key_exists("pt_001")  # pylint: disable=protected-access
 
 
 def test_unregister_middle_node_preserves_orphaned_dependent_presence():
@@ -405,8 +405,8 @@ def test_unregister_node_with_multiple_dependents_prunes_all_forward_edges():
     graph.register("tg_001", {"ci_001"})
     graph.register("tg_002", {"ci_001"})
     graph.unregister("ci_001")
-    assert "ci_001" not in graph._deps.get("tg_001", set())  # pylint: disable=protected-access
-    assert "ci_001" not in graph._deps.get("tg_002", set())  # pylint: disable=protected-access
+    assert "ci_001" not in graph._test_only_dep_ids_of("tg_001")  # pylint: disable=protected-access
+    assert "ci_001" not in graph._test_only_dep_ids_of("tg_002")  # pylint: disable=protected-access
     assert graph.is_registered("tg_001")
     assert graph.is_registered("tg_002")
     graph._test_only_assert_consistent()  # pylint: disable=protected-access
@@ -582,6 +582,142 @@ def test_deps_for_type_polygon_with_duplicate_points_collapses():
         **_colors(),
     )
     assert DependencyGraph.deps_for_type(pg) == {"pt_001", "pt_002"}
+
+
+# ---------------------------------------------------------------------------
+# deps_for_type — empty-reference rejection, one test per raise path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("point_a_id", "point_b_id"),
+    [("", "pt_002"), ("pt_001", ""), ("", "")],
+    ids=["a-empty", "b-empty", "both-empty"],
+)
+def test_deps_for_type_line_with_empty_point_reference_raises(point_a_id, point_b_id):
+    ln = Line(
+        **_env("ln"),
+        point_a_id=point_a_id,
+        point_b_id=point_b_id,
+        **_BEARING,
+        **_colors(),
+    )
+    with pytest.raises(ValueError, match="line 'ln_001' has empty point reference"):
+        DependencyGraph.deps_for_type(ln)
+
+
+def test_deps_for_type_polygon_with_empty_point_reference_raises():
+    # An empty string inside a non-empty point_ids list — distinct from the
+    # empty-list case below, which has its own message.
+    pg = Polygon(
+        **_env("pg"),
+        point_ids=["pt_001", "", "pt_003"],
+        is_convex=True,
+        **_colors(),
+    )
+    with pytest.raises(ValueError, match="polygon 'pg_001' has empty point reference"):
+        DependencyGraph.deps_for_type(pg)
+
+
+def test_deps_for_type_polygon_with_no_points_raises():
+    # Polygon.__post_init__ does not enforce a minimum vertex count, so the
+    # empty list constructs cleanly; deps_for_type must reject it rather than
+    # silently registering an edgeless polygon.
+    pg = Polygon(**_env("pg"), point_ids=[], is_convex=True, **_colors())
+    with pytest.raises(ValueError, match="polygon 'pg_001' has no point references"):
+        DependencyGraph.deps_for_type(pg)
+
+
+def test_deps_for_type_ray_with_empty_origin_reference_raises():
+    ry = Ray(**_env("ry"), origin_id="", **_BEARING, **_colors())
+    with pytest.raises(ValueError, match="ray 'ry_001' has empty origin reference"):
+        DependencyGraph.deps_for_type(ry)
+
+
+def test_deps_for_type_vector_with_empty_origin_reference_raises():
+    vc = Vector(
+        **_env("vc"),
+        origin_id="",
+        length=10.0,
+        endpoint_id=None,
+        **_BEARING,
+        **_colors(),
+    )
+    with pytest.raises(ValueError, match="vector 'vc_001' has empty origin reference"):
+        DependencyGraph.deps_for_type(vc)
+
+
+def test_deps_for_type_vector_with_empty_endpoint_reference_raises():
+    # endpoint_id="" is NOT the no-endpoint case (that is endpoint_id=None,
+    # which is legal); an empty string is a corrupt reference and must raise.
+    vc = Vector(
+        **_env("vc"),
+        origin_id="pt_001",
+        length=10.0,
+        endpoint_id="",
+        **_BEARING,
+        **_colors(),
+    )
+    with pytest.raises(ValueError, match="vector 'vc_001' has empty endpoint reference"):
+        DependencyGraph.deps_for_type(vc)
+
+
+def test_deps_for_type_circle_with_empty_center_reference_raises():
+    ci = Circle(**_env("ci"), center_id="", radius=5.0, **_colors())
+    with pytest.raises(ValueError, match="circle 'ci_001' has empty center reference"):
+        DependencyGraph.deps_for_type(ci)
+
+
+def test_deps_for_type_ball_with_empty_center_reference_raises():
+    ba = Ball(**_env("ba"), center_id="", radius=5.0, **_colors())
+    with pytest.raises(ValueError, match="ball 'ba_001' has empty center reference"):
+        DependencyGraph.deps_for_type(ba)
+
+
+def test_deps_for_type_cylinder_with_empty_base_center_reference_raises():
+    cy = Cylinder(
+        **_env("cy"),
+        base_center_id="",
+        radius=5.0,
+        height=10.0,
+        axis_mode="vertical",
+        axis_azimuth=0.0,
+        axis_elevation=1.5707963267948966,
+        direction_mode=DirectionMode.AZIMUTH,
+        direction_units=DirectionUnits.RADIANS,
+        **_colors(),
+    )
+    with pytest.raises(ValueError, match="cylinder 'cy_001' has empty base center reference"):
+        DependencyGraph.deps_for_type(cy)
+
+
+def test_deps_for_type_solid_with_empty_layer_reference_raises():
+    # Solid.__post_init__ already rejects an empty string at construction (the
+    # prefix rule), so bypass it — the same way the unknown-type tests rewrite
+    # ``type`` — to reach deps_for_type's own empty-string guard, which defends
+    # against instances built outside the dataclass constructor.
+    so = Solid(**_env("so"), layers=["pg_001", "pg_002"], **_colors())
+    object.__setattr__(so, "layers", ("pg_001", ""))
+    with pytest.raises(ValueError, match="solid 'so_001' has empty layer reference"):
+        DependencyGraph.deps_for_type(so)
+
+
+@pytest.mark.parametrize(
+    ("shape_id", "point_id"),
+    [("", "pt_001"), ("ci_001", ""), ("", "")],
+    ids=["shape-empty", "point-empty", "both-empty"],
+)
+def test_deps_for_type_tangent_with_empty_reference_raises(shape_id, point_id):
+    tg = Tangent(
+        **_env("tg"),
+        shape_id=shape_id,
+        shape_type="circle",
+        point_id=point_id,
+        **_BEARING,
+        **_colors(),
+    )
+    with pytest.raises(ValueError, match="tangent 'tg_001' has empty reference"):
+        DependencyGraph.deps_for_type(tg)
 
 
 # ---------------------------------------------------------------------------
@@ -847,11 +983,48 @@ def test_cascade_unregister_leaf_only_removes_itself():
     graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
 
-def test_cascade_unregister_unknown_id_returns_frozenset_with_only_root():
-    # An unknown obj_id has no dependents; the return set contains just obj_id.
+def test_cascade_unregister_unknown_id_returns_empty_frozenset():
+    # A completely unknown obj_id: nothing was unregistered, so the return
+    # set is empty and the graph is left untouched.
     graph = DependencyGraph()
+    graph.register("pt_001", set())
+    graph.register("ci_001", {"pt_001"})
     result = graph.cascade_unregister("pt_999")
-    assert result == frozenset({"pt_999"})
+    assert result == frozenset()
+    assert graph.is_registered("pt_001")
+    assert graph.is_registered("ci_001")
+    assert graph.dependents_of("pt_001") == {"ci_001"}
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
+
+
+def test_cascade_unregister_unregistered_root_with_dependents_returns_dependents_only():
+    # pt_001 never registered itself, but ln_001 was registered naming it
+    # (a legal forward reference). The cascade removes the dependents and
+    # returns only them — the root is excluded because it had no _deps entry
+    # to remove.
+    graph = DependencyGraph()
+    graph.register("ln_001", {"pt_001"})  # pt_001 itself never registered
+    result = graph.cascade_unregister("pt_001")
+    assert result == frozenset({"ln_001"})
+    assert not graph.is_registered("ln_001")
+    assert not graph._test_only_rdep_key_exists("pt_001")  # pylint: disable=protected-access
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
+
+
+def test_cascade_unregister_diamond_returns_all_four_and_empties_graph():
+    # Diamond: pt_001 feeds ln_001 and ln_002, both feeding pg_001. The
+    # cascade must return all four IDs exactly once and leave both internal
+    # maps completely empty.
+    graph = DependencyGraph()
+    graph.register("pt_001", set())
+    graph.register("ln_001", {"pt_001"})
+    graph.register("ln_002", {"pt_001"})
+    graph.register("pg_001", {"ln_001", "ln_002"})
+    result = graph.cascade_unregister("pt_001")
+    assert result == frozenset({"pt_001", "ln_001", "ln_002", "pg_001"})
+    assert not graph._deps  # pylint: disable=protected-access
+    assert not graph._rdeps  # pylint: disable=protected-access
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
 
 def test_cascade_unregister_empty_id_raises():
@@ -869,4 +1042,50 @@ def test_cascade_unregister_preserves_unrelated_objects():
     graph.cascade_unregister("ci_001")
     assert graph.is_registered("pt_001")
     assert graph.is_registered("pt_002")
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
+
+
+# ---------------------------------------------------------------------------
+# None guards — TypeError fires before the empty-string ValueError, on every
+# public method that takes an obj_id
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [
+        ("register", (None, set())),
+        ("unregister", (None,)),
+        ("dependents_of", (None,)),
+        ("is_registered", (None,)),
+        ("cascade_unregister", (None,)),
+    ],
+)
+def test_none_obj_id_raises_type_error(method, args):
+    graph = DependencyGraph()
+    with pytest.raises(TypeError, match="obj_id must be a str"):
+        getattr(graph, method)(*args)
+
+
+def test_register_none_dep_id_raises_type_error_and_does_not_register():
+    graph = DependencyGraph()
+    with pytest.raises(TypeError, match="dep_ids must contain only str"):
+        graph.register("ln_001", {"pt_001", None})
+    # validate-before-mutate: nothing was registered, no edges were created.
+    assert not graph.is_registered("ln_001")
+    assert not graph._deps  # pylint: disable=protected-access
+    assert not graph._rdeps  # pylint: disable=protected-access
+
+
+def test_register_none_dep_id_on_reregister_leaves_graph_consistent():
+    # Re-registering with a dep_ids set containing None must validate before
+    # mutating, exactly like the empty-string case: the TypeError fires, the
+    # prior registration is preserved intact, and the invariant still holds.
+    graph = DependencyGraph()
+    graph.register("ln_001", {"pt_001"})
+    with pytest.raises(TypeError, match="dep_ids must contain only str"):
+        graph.register("ln_001", {"pt_002", None})
+    assert graph.is_registered("ln_001")
+    assert graph.dependents_of("pt_001") == {"ln_001"}
+    assert graph.dependents_of("pt_002") == frozenset()
     graph._test_only_assert_consistent()  # pylint: disable=protected-access
