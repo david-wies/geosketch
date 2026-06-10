@@ -290,6 +290,18 @@ def test_register_empty_dep_id_on_reregister_leaves_graph_consistent():
     graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
 
+def test_register_bare_str_dep_ids_raises_and_leaves_graph_unmutated():
+    # A bare str is Iterable[str], so without the guard set("pt_001") would
+    # shatter into single-character "deps" and corrupt the graph.
+    graph = DependencyGraph()
+    with pytest.raises(TypeError, match="bare str"):
+        graph.register("ln_001", "pt_001")
+    assert not graph.is_registered("ln_001")
+    # No mutation at all: both maps must still be empty.
+    assert not graph._deps  # pylint: disable=protected-access
+    assert not graph._rdeps  # pylint: disable=protected-access
+
+
 def test_unregister_empty_obj_id_raises():
     graph = DependencyGraph()
     with pytest.raises(ValueError, match="non-empty"):
@@ -841,6 +853,16 @@ def test_add_attribute_error_includes_object_context():
     pt = Point(**_env("pt"), easting=0.0, northing=0.0, altitude=0.0, color="#ff0000")
     object.__setattr__(pt, "type", "line")  # line arm reads point_a_id which Point lacks
     with pytest.raises(AttributeError, match="pt_001"):
+        graph.add(pt)
+
+
+def test_add_none_id_raises_type_error_naming_add():
+    # add() validates obj.id itself so the TypeError blames add, not the
+    # internal delegation to register.
+    graph = DependencyGraph()
+    pt = Point(**_env("pt"), easting=0.0, northing=0.0, altitude=0.0, color="#ff0000")
+    object.__setattr__(pt, "id", None)
+    with pytest.raises(TypeError, match=r"DependencyGraph\.add"):
         graph.add(pt)
 
 

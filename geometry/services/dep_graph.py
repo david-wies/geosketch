@@ -134,6 +134,9 @@ class DependencyGraph:
 
         Raises
         ------
+        TypeError
+            If ``obj.id`` is not a ``str`` (including ``None``). Validated up
+            front so the error names ``add``, not ``register``.
         ValueError
             If ``obj.type`` is not one of the ten known object types, or if
             ``obj.id`` is an empty string, any derived dependency id is an
@@ -149,6 +152,10 @@ class DependencyGraph:
         # raise a second AttributeError inside the handler (double traceback).
         obj_type = obj.type
         obj_id = obj.id
+        # Validate the id here, before delegating: register() runs the same
+        # guard, but its error message would blame register for what is an
+        # add() caller's mistake.
+        self._validate_obj_id(obj_id, "add")
         try:
             dep_ids = self.deps_for_type(obj)
             self.register(obj_id, dep_ids)
@@ -181,11 +188,14 @@ class DependencyGraph:
             Non-empty string identifier of the object being registered.
         dep_ids : Iterable[str]
             IDs of objects that ``obj_id`` directly depends on. May be empty.
+            A bare ``str`` is rejected (``TypeError``) — it would otherwise
+            iterate into single-character ids.
 
         Raises
         ------
         TypeError
-            If ``obj_id`` is not a ``str`` (including ``None``), or if any
+            If ``obj_id`` is not a ``str`` (including ``None``), if ``dep_ids``
+            is a bare ``str`` rather than an iterable of ``str``, or if any
             element of ``dep_ids`` is not a ``str``.
         ValueError
             If ``obj_id`` is an empty string, or if any element of ``dep_ids``
@@ -195,6 +205,13 @@ class DependencyGraph:
         # mutation, so a bad input (None/empty obj_id or None/empty dep id)
         # cannot leave the graph half-updated on a re-registration.
         self._validate_obj_id(obj_id, "register")
+        # A bare str IS Iterable[str], so set(dep_ids) would silently shatter
+        # it into single-character "deps" that pass every element guard — the
+        # most likely command-layer mistake. Reject it before materialisation.
+        if isinstance(dep_ids, str):
+            raise TypeError(
+                "DependencyGraph.register: dep_ids must be an iterable of str, not a bare str"
+            )
         dep_set = set(dep_ids)
         for dep_id in dep_set:
             if not isinstance(dep_id, str):
