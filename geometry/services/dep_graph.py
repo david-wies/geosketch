@@ -37,7 +37,7 @@ commands keep it in sync via :meth:`DependencyGraph.add` and
 import logging
 from collections import deque
 from collections.abc import Iterable
-from typing import AbstractSet
+from collections.abc import Set as AbstractSet
 
 from geometry.models import GeoObject
 
@@ -219,6 +219,27 @@ class DependencyGraph:
             raise KeyError(
                 f"DependencyGraph.unregister: {obj_id!r} is not registered (strict=True)"
             )
+
+        # Pre-check: scan the reverse edges about to be processed and verify
+        # the bidirectional invariant BEFORE touching _deps or _rdeps.  Any
+        # dependent listed in _rdeps[obj_id] must have a matching _deps entry;
+        # if one is missing the graph is already corrupted and we must raise
+        # now — before any mutation — so the caller can see a clean error
+        # without a partially-updated graph as a side-effect.
+        pending_dependents = self._rdeps.get(obj_id, _EMPTY)
+        for dependent in pending_dependents:
+            if dependent not in self._deps:
+                _logger.error(
+                    "DependencyGraph.unregister: _rdeps[%r] lists dependent %r "
+                    "with no _deps entry; bidirectional invariant violated.",
+                    obj_id,
+                    dependent,
+                )
+                raise RuntimeError(
+                    f"DependencyGraph.unregister: _rdeps[{obj_id!r}] lists dependent "
+                    f"{dependent!r} with no _deps entry; bidirectional invariant violated."
+                )
+
         # Remove forward edges out of obj_id and their mirrored reverse edges.
         # No-op if obj_id was never registered (pop returns the empty default).
         for dep_id in self._deps.pop(obj_id, _EMPTY):
@@ -229,24 +250,12 @@ class DependencyGraph:
                     del self._rdeps[dep_id]
 
         # Remove reverse edges into obj_id and their mirrored forward edges.
+        # The pre-check above guarantees every dependent has a _deps entry, so
+        # the ``forward is None`` branch below is now a true unreachable
+        # backstop (left in place for belt-and-suspenders defence).
         for dependent in self._rdeps.pop(obj_id, _EMPTY):
             forward = self._deps.get(dependent)
-            if forward is None:
-                # Defensive backstop that cannot fire via the public API: any
-                # *dependent* listed in _rdeps[obj_id] was placed there by that
-                # dependent's own register() call, which always creates its
-                # matching _deps entry in the same call. So a missing forward
-                # set here means the bidirectional invariant has already been
-                # violated by some out-of-band corruption. Raise immediately
-                # rather than continuing with a dirty graph; the caller should
-                # treat this as a programming error and investigate. Note that
-                # _deps has already been mutated if this fires.
-                _logger.error(
-                    "DependencyGraph.unregister: _rdeps[%r] lists dependent %r "
-                    "with no _deps entry; bidirectional invariant violated.",
-                    obj_id,
-                    dependent,
-                )
+            if forward is None:  # pragma: no cover — caught by pre-check above
                 raise RuntimeError(
                     f"DependencyGraph.unregister: _rdeps[{obj_id!r}] lists dependent "
                     f"{dependent!r} with no _deps entry; bidirectional invariant violated."
@@ -259,16 +268,41 @@ class DependencyGraph:
             forward.discard(obj_id)
 
     def cascade_unregister(self, obj_id: str) -> frozenset[str]:
-        """Unregister obj_id and every transitively dependent object.
+        """Unregister ``obj_id`` and every transitively dependent object.
 
-        Returns the set of all unregistered dependents (not including obj_id)
-        so the command layer can remove them from the object store.
+        Convenience wrapper around the three-step cascade-delete protocol:
+        collect the transitive closure, unregister each dependent (in an
+        arbitrary order, since all dependents are removed together), and then
+        unregister ``obj_id`` itself.  The command layer should use this
+        instead of hand-rolling the three steps so the order invariant cannot
+        be violated accidentally.
+
+        Parameters
+        ----------
+        obj_id : str
+            The root object to delete.  Must be a non-empty string.  Need not
+            be currently registered; if it is not, only the empty frozenset is
+            returned and no mutations occur (``dependents_of`` and ``unregister``
+            are both no-ops for unknown IDs by default).
+
+        Returns
+        -------
+        frozenset[str]
+            The frozenset of **all** IDs that were unregistered, including
+            ``obj_id`` itself.  The command layer can use this set to remove
+            the corresponding objects from the project store in one pass.
+
+        Raises
+        ------
+        ValueError
+            If ``obj_id`` is an empty string (propagated from
+            :meth:`dependents_of`).
         """
         affected = self.dependents_of(obj_id)
         for dep in affected:
             self.unregister(dep)
         self.unregister(obj_id)
-        return affected
+        return affected | frozenset({obj_id})
 
     def dependents_of(self, obj_id: str) -> frozenset[str]:
         """Return the transitive closure of objects that depend on ``obj_id``.
@@ -352,7 +386,7 @@ class DependencyGraph:
 
     def _rdep_key_exists(self, dep_id: str) -> bool:
         """Return whether dep_id is tracked as a dependency in the reverse edges.
-        
+
         Test-only predicate to avoid protected-attribute access warnings.
         """
         return dep_id in self._rdeps
@@ -403,7 +437,7 @@ class DependencyGraph:
                 )
 
     @staticmethod
-    def deps_for_type(obj: GeoObject) -> set[str]:
+    def deps_for_type(obj: GeoObject) -> set[str]:  # pylint: disable=too-many-branches
         """Derive the forward-edge set (direct dependencies) for any object.
 
         Centralises the per-type edge table so command code never has to
@@ -455,6 +489,8 @@ class DependencyGraph:
         # ``isinstance``. Deliberate trade-off: a static checker cannot verify
         # the subtype-only attribute reads in each arm, so the exhaustive
         # per-type tests plus the ``case _`` guard are the safety net.
+        # The ten-arm match plus per-arm validation exceeds pylint's default
+        # branch limit; the disable is on the method signature above.
         match obj.type:
             case "point":
                 return set()
@@ -482,16 +518,22 @@ class DependencyGraph:
                 deps = {obj.origin_id}
                 if obj.endpoint_id is not None:
                     if not obj.endpoint_id:
-                        raise ValueError(f"deps_for_type: vector {obj.id!r} has empty endpoint reference")
+                        raise ValueError(
+                            f"deps_for_type: vector {obj.id!r} has empty endpoint reference"
+                        )
                     deps.add(obj.endpoint_id)
                 return deps
             case "circle" | "ball":
                 if not obj.center_id:
-                    raise ValueError(f"deps_for_type: {obj.type} {obj.id!r} has empty center reference")
+                    raise ValueError(
+                        f"deps_for_type: {obj.type} {obj.id!r} has empty center reference"
+                    )
                 return {obj.center_id}
             case "cylinder":
                 if not obj.base_center_id:
-                    raise ValueError(f"deps_for_type: cylinder {obj.id!r} has empty base center reference")
+                    raise ValueError(
+                        f"deps_for_type: cylinder {obj.id!r} has empty base center reference"
+                    )
                 return {obj.base_center_id}
             case "solid":
                 if "" in obj.layers:

@@ -176,8 +176,8 @@ def test_reregister_to_empty_deps_removes_all_rdep_entries():
     graph.register("ln_001", set())
     assert graph.dependents_of("pt_001") == frozenset()
     assert graph.dependents_of("pt_002") == frozenset()
-    assert not graph._rdep_key_exists("pt_001")
-    assert not graph._rdep_key_exists("pt_002")
+    assert not graph._rdep_key_exists("pt_001")  # pylint: disable=protected-access
+    assert not graph._rdep_key_exists("pt_002")  # pylint: disable=protected-access
     assert graph.is_registered("ln_001")
     graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
@@ -358,14 +358,14 @@ def test_reregister_prunes_stale_rdeps_entry():
     graph = DependencyGraph()
     graph.register("ln_001", {"pt_001"})
     graph.register("ln_001", {"pt_002"})  # replaces pt_001
-    assert not graph._rdep_key_exists("pt_001")
+    assert not graph._rdep_key_exists("pt_001")  # pylint: disable=protected-access
 
 
 def test_unregister_prunes_rdeps_entry_for_former_deps():
     graph = DependencyGraph()
     graph.register("ln_001", {"pt_001"})
     graph.unregister("ln_001")
-    assert not graph._rdep_key_exists("pt_001")
+    assert not graph._rdep_key_exists("pt_001")  # pylint: disable=protected-access
 
 
 def test_unregister_middle_node_preserves_orphaned_dependent_presence():
@@ -758,8 +758,9 @@ def test_full_cascade_delete_multi_branch():
     graph.register("ln_001", {"pt_001"})
     graph.register("pg_001", {"ln_001"})
 
+    # cascade_unregister returns ALL unregistered IDs, including obj_id itself.
     affected = graph.cascade_unregister("pt_001")
-    assert affected == {"ci_001", "tg_001", "ln_001", "pg_001"}
+    assert affected == {"pt_001", "ci_001", "tg_001", "ln_001", "pg_001"}
 
     assert not graph.is_registered("pt_001")
     assert not graph.is_registered("ci_001")
@@ -795,3 +796,77 @@ def test_full_cascade_delete_leaves_graph_clean(order):
     graph._test_only_assert_consistent()  # pylint: disable=protected-access
     assert not graph._deps  # pylint: disable=protected-access
     assert not graph._rdeps  # pylint: disable=protected-access
+
+
+# ---------------------------------------------------------------------------
+# cascade_unregister — convenience method
+# ---------------------------------------------------------------------------
+
+
+def test_cascade_unregister_returns_frozenset_including_root():
+    # cascade_unregister must return ALL unregistered IDs including obj_id.
+    graph = DependencyGraph()
+    graph.register("pt_001", set())
+    graph.register("ci_001", {"pt_001"})
+    result = graph.cascade_unregister("pt_001")
+    assert isinstance(result, frozenset)
+    assert result == frozenset({"pt_001", "ci_001"})
+
+
+def test_cascade_unregister_removes_all_from_graph():
+    # Every ID in the returned set must no longer be registered.
+    graph = DependencyGraph()
+    graph.register("pt_001", set())
+    graph.register("ci_001", {"pt_001"})
+    graph.register("tg_001", {"ci_001"})
+    result = graph.cascade_unregister("pt_001")
+    for obj_id in result:
+        assert not graph.is_registered(obj_id)
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
+
+
+def test_cascade_unregister_graph_is_empty_when_all_objects_removed():
+    graph = DependencyGraph()
+    graph.register("pt_001", set())
+    graph.register("ci_001", {"pt_001"})
+    graph.cascade_unregister("pt_001")
+    assert not graph._deps  # pylint: disable=protected-access
+    assert not graph._rdeps  # pylint: disable=protected-access
+
+
+def test_cascade_unregister_leaf_only_removes_itself():
+    # A leaf with no dependents: return set contains only the root.
+    graph = DependencyGraph()
+    graph.register("pt_001", set())
+    graph.register("ci_001", {"pt_001"})
+    result = graph.cascade_unregister("ci_001")
+    assert result == frozenset({"ci_001"})
+    assert not graph.is_registered("ci_001")
+    # pt_001 is unaffected.
+    assert graph.is_registered("pt_001")
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
+
+
+def test_cascade_unregister_unknown_id_returns_frozenset_with_only_root():
+    # An unknown obj_id has no dependents; the return set contains just obj_id.
+    graph = DependencyGraph()
+    result = graph.cascade_unregister("pt_999")
+    assert result == frozenset({"pt_999"})
+
+
+def test_cascade_unregister_empty_id_raises():
+    graph = DependencyGraph()
+    with pytest.raises(ValueError, match="non-empty"):
+        graph.cascade_unregister("")
+
+
+def test_cascade_unregister_preserves_unrelated_objects():
+    # Objects not in the transitive closure of obj_id must remain registered.
+    graph = DependencyGraph()
+    graph.register("pt_001", set())
+    graph.register("pt_002", set())
+    graph.register("ci_001", {"pt_001"})
+    graph.cascade_unregister("ci_001")
+    assert graph.is_registered("pt_001")
+    assert graph.is_registered("pt_002")
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
