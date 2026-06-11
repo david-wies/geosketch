@@ -156,6 +156,7 @@ class DependencyGraph:
         # guard, but its error message would blame register for what is an
         # add() caller's mistake.
         self._validate_obj_id(obj_id, "add")
+        _logger.debug("add: registering %r (type=%r)", obj_id, obj_type)
         try:
             dep_ids = self.deps_for_type(obj)
             self.register(obj_id, dep_ids)
@@ -234,6 +235,7 @@ class DependencyGraph:
         self._deps[obj_id] = dep_set
         for dep_id in dep_set:
             self._rdeps.setdefault(dep_id, set()).add(obj_id)
+        _logger.debug("register: %r → %d dep(s)", obj_id, len(dep_set))
 
     def unregister(self, obj_id: str, *, strict: bool = False) -> None:
         """Remove ``obj_id`` from both maps and prune every edge involving it.
@@ -290,6 +292,7 @@ class DependencyGraph:
             raise KeyError(
                 f"DependencyGraph.unregister: {obj_id!r} is not registered (strict=True)"
             )
+        _logger.debug("unregister: %r", obj_id)
 
         # Pre-check: scan the reverse edges about to be processed and verify
         # the bidirectional invariant BEFORE touching _deps or _rdeps.  Any
@@ -388,13 +391,19 @@ class DependencyGraph:
             (propagated from the pre-mutation check in :meth:`unregister`);
             the graph was already corrupted out-of-band before this call.
         """
+        _logger.debug("cascade_unregister: root %r", obj_id)
         affected = self.dependents_of(obj_id)
         root_registered = self.is_registered(obj_id)
         for dep in affected:
             self.unregister(dep)
         if root_registered:
             self.unregister(obj_id)
-            return affected | frozenset({obj_id})
+            result = affected | frozenset({obj_id})
+            _logger.debug(
+                "cascade_unregister: removed %d object(s) for root %r", len(result), obj_id
+            )
+            return result
+        _logger.debug("cascade_unregister: removed %d object(s) for root %r", len(affected), obj_id)
         return affected
 
     def dependents_of(self, obj_id: str) -> frozenset[str]:
@@ -648,6 +657,11 @@ class DependencyGraph:
                 # and invisible to every cascade. Reject it here.
                 if not obj.point_ids:
                     raise ValueError(f"deps_for_type: polygon {obj.id!r} has no point references")
+                if any(not isinstance(p, str) for p in obj.point_ids):
+                    raise ValueError(
+                        f"deps_for_type: polygon {obj.id!r} has non-str point reference "
+                        f"in point_ids={obj.point_ids!r}"
+                    )
                 if "" in obj.point_ids:
                     raise ValueError(
                         f"deps_for_type: polygon {obj.id!r} has empty point reference "
@@ -682,6 +696,11 @@ class DependencyGraph:
                     )
                 return {obj.base_center_id}
             case "solid":
+                if any(not isinstance(layer, str) for layer in obj.layers):
+                    raise ValueError(
+                        f"deps_for_type: solid {obj.id!r} has non-str layer reference "
+                        f"in layers={obj.layers!r}"
+                    )
                 if "" in obj.layers:
                     raise ValueError(
                         f"deps_for_type: solid {obj.id!r} has empty layer reference "

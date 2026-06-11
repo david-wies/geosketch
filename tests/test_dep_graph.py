@@ -631,6 +631,29 @@ def test_deps_for_type_polygon_with_empty_point_reference_raises():
         DependencyGraph.deps_for_type(pg)
 
 
+def test_deps_for_type_polygon_with_none_point_reference_raises():
+    # None in point_ids must raise ValueError (not TypeError): the "" guard
+    # alone passes for None (None != ""), so without the non-str check the
+    # set() call propagates None to register(), which raises TypeError that
+    # add()'s except clause cannot catch.
+    pg = Polygon(**_env("pg"), point_ids=["pt_001", "pt_002"], is_convex=True, **_colors())
+    object.__setattr__(pg, "point_ids", ["pt_001", None])
+    with pytest.raises(ValueError, match="polygon 'pg_001' has non-str point reference"):
+        DependencyGraph.deps_for_type(pg)
+
+
+def test_add_polygon_with_none_point_id_raises_value_error():
+    # Regression: None in point_ids previously escaped add() as TypeError
+    # because deps_for_type let it through and register() raised TypeError,
+    # which add() did not catch.  Now deps_for_type raises ValueError so
+    # add() wraps it with object context.
+    graph = DependencyGraph()
+    pg = Polygon(**_env("pg"), point_ids=["pt_001", "pt_002"], is_convex=True, **_colors())
+    object.__setattr__(pg, "point_ids", ["pt_001", None])
+    with pytest.raises(ValueError, match="pg_001"):
+        graph.add(pg)
+
+
 def test_deps_for_type_polygon_with_no_points_raises():
     # Polygon.__post_init__ does not enforce a minimum vertex count, so the
     # empty list constructs cleanly; deps_for_type must reject it rather than
@@ -711,6 +734,15 @@ def test_deps_for_type_solid_with_empty_layer_reference_raises():
     so = Solid(**_env("so"), layers=["pg_001", "pg_002"], **_colors())
     object.__setattr__(so, "layers", ("pg_001", ""))
     with pytest.raises(ValueError, match="solid 'so_001' has empty layer reference"):
+        DependencyGraph.deps_for_type(so)
+
+
+def test_deps_for_type_solid_with_none_layer_reference_raises():
+    # Same pattern as the polygon None test: the "" guard alone passes for None,
+    # so the non-str check is required to raise ValueError before set() is called.
+    so = Solid(**_env("so"), layers=["pg_001", "pg_002"], **_colors())
+    object.__setattr__(so, "layers", ("pg_001", None))
+    with pytest.raises(ValueError, match="solid 'so_001' has non-str layer reference"):
         DependencyGraph.deps_for_type(so)
 
 
