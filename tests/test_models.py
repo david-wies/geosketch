@@ -191,7 +191,7 @@ def test_polygon_point_ids_defensively_copied():
         line_color="#000000",
         fill_color="#ffffff",
     )
-    assert pg.point_ids == shared
+    assert pg.point_ids == tuple(shared)
     assert pg.point_ids is not shared
     shared.append("pt_999")
     assert "pt_999" not in pg.point_ids
@@ -229,7 +229,7 @@ def test_polygon_instantiation():
         fill_color="#ffffcc",
     )
     assert pg.type == "polygon"
-    assert pg.point_ids == ["pt_001", "pt_002", "pt_003"]
+    assert pg.point_ids == ("pt_001", "pt_002", "pt_003")
     assert pg.is_convex is True
 
 

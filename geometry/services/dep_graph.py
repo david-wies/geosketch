@@ -41,7 +41,7 @@ from collections.abc import Set as AbstractSet
 
 from geometry.models import GeoObject
 
-__all__ = ["DependencyGraph"]
+__all__ = ["DependencyGraph", "deps_for_type"]
 
 _logger = logging.getLogger(__name__)
 
@@ -135,8 +135,9 @@ class DependencyGraph:
         Raises
         ------
         TypeError
-            If ``obj.id`` is not a ``str`` (including ``None``). Validated up
-            front so the error names ``add``, not ``register``.
+            If ``obj.id`` is not a ``str`` (including ``None``), or if
+            ``deps_for_type``/``register`` raises any other ``TypeError``
+            while deriving or recording dependencies.
         ValueError
             If ``obj.type`` is not one of the ten known object types, or if
             ``obj.id`` is an empty string, any derived dependency id is an
@@ -158,15 +159,38 @@ class DependencyGraph:
         self._validate_obj_id(obj_id, "add")
         _logger.debug("add: registering %r (type=%r)", obj_id, obj_type)
         try:
-            dep_ids = self.deps_for_type(obj)
+            dep_ids = deps_for_type(obj)
             self.register(obj_id, dep_ids)
         except AttributeError as exc:
+            _logger.error(
+                "DependencyGraph.add: AttributeError for type %r on object %r: %s",
+                obj_type,
+                obj_id,
+                exc,
+            )
             raise AttributeError(
                 f"DependencyGraph.add: expected attributes for type {obj_type!r} "
                 f"missing on object {obj_id!r}: {exc}"
             ) from exc
         except ValueError as exc:
+            _logger.error(
+                "DependencyGraph.add: ValueError for type %r on object %r: %s",
+                obj_type,
+                obj_id,
+                exc,
+            )
             raise ValueError(
+                f"DependencyGraph.add: cannot register type {obj_type!r} "
+                f"on object {obj_id!r}: {exc}"
+            ) from exc
+        except TypeError as exc:
+            _logger.error(
+                "DependencyGraph.add: TypeError for type %r on object %r: %s",
+                obj_type,
+                obj_id,
+                exc,
+            )
+            raise TypeError(
                 f"DependencyGraph.add: cannot register type {obj_type!r} "
                 f"on object {obj_id!r}: {exc}"
             ) from exc
@@ -294,12 +318,12 @@ class DependencyGraph:
             )
         _logger.debug("unregister: %r", obj_id)
 
-        # Pre-check: scan the reverse edges about to be processed and verify
-        # the bidirectional invariant BEFORE touching _deps or _rdeps.  Any
-        # dependent listed in _rdeps[obj_id] must have a matching _deps entry;
-        # if one is missing the graph is already corrupted and we must raise
-        # now — before any mutation — so the caller can see a clean error
-        # without a partially-updated graph as a side-effect.
+        # Pre-check: verify the bidirectional invariant in BOTH directions
+        # BEFORE touching _deps or _rdeps, so any corruption is surfaced as a
+        # clean error with no partially-updated graph as a side-effect.
+        #
+        # Direction 1 (reverse → forward): every dependent listed in
+        # _rdeps[obj_id] must have a matching _deps entry.
         pending_dependents = self._rdeps.get(obj_id, _EMPTY)
         for dependent in pending_dependents:
             if dependent not in self._deps:
@@ -313,6 +337,25 @@ class DependencyGraph:
                     f"DependencyGraph.unregister: _rdeps[{obj_id!r}] lists dependent "
                     f"{dependent!r} with no _deps entry; bidirectional invariant violated."
                 )
+        # Direction 2 (forward → reverse): every dep_id that obj_id lists as a
+        # dependency must have obj_id in _rdeps[dep_id]. A forward-only orphan
+        # edge (present in _deps[obj_id] but missing from _rdeps[dep_id]) goes
+        # undetected by the reverse-direction check and would be silently
+        # discarded, violating the mirror invariant.
+        for dep_id in self._deps.get(obj_id, _EMPTY):
+            if obj_id not in self._rdeps.get(dep_id, _EMPTY):
+                _logger.error(
+                    "DependencyGraph.unregister: _deps[%r] lists dep %r "
+                    "but _rdeps[%r] has no back-edge; bidirectional invariant violated.",
+                    obj_id,
+                    dep_id,
+                    dep_id,
+                )
+                raise RuntimeError(
+                    f"DependencyGraph.unregister: _deps[{obj_id!r}] lists dep "
+                    f"{dep_id!r} but _rdeps[{dep_id!r}] has no back-edge; "
+                    f"bidirectional invariant violated."
+                )
 
         # Remove forward edges out of obj_id and their mirrored reverse edges.
         # No-op if obj_id was never registered (pop returns the empty default).
@@ -324,21 +367,9 @@ class DependencyGraph:
                     del self._rdeps[dep_id]
 
         # Remove reverse edges into obj_id and their mirrored forward edges.
-        # The pre-check above guarantees every dependent has a _deps entry, so
-        # the ``forward is None`` branch below is now a true unreachable
-        # backstop (left in place for belt-and-suspenders defence).
         for dependent in self._rdeps.pop(obj_id, _EMPTY):
             forward = self._deps.get(dependent)
-            if forward is None:  # pragma: no cover — caught by pre-check above
-                raise RuntimeError(
-                    f"DependencyGraph.unregister: _rdeps[{obj_id!r}] lists dependent "
-                    f"{dependent!r} with no _deps entry; bidirectional invariant violated."
-                )
-            # Intentionally do NOT delete an emptied forward set: a
-            # dependent that loses its last edge is still a registered
-            # object, and an empty ``_deps`` entry is its presence marker
-            # (identical to a freshly registered Point). ``_rdeps`` is the
-            # map that must stay free of empty sets; see the class docstring.
+            # The pre-check above guarantees every dependent has a _deps entry.
             forward.discard(obj_id)
 
     def cascade_unregister(self, obj_id: str) -> frozenset[str]:
@@ -389,15 +420,30 @@ class DependencyGraph:
         RuntimeError
             If an internal bidirectional invariant violation is detected
             (propagated from the pre-mutation check in :meth:`unregister`);
-            the graph was already corrupted out-of-band before this call.
+            the graph was already corrupted out-of-band before this call. The
+            failure is logged with cascade context before being re-raised.
         """
         _logger.debug("cascade_unregister: root %r", obj_id)
         affected = self.dependents_of(obj_id)
         root_registered = self.is_registered(obj_id)
-        for dep in affected:
-            self.unregister(dep)
+        removed: set[str] = set()
+        try:
+            for dep in affected:
+                self.unregister(dep)
+                removed.add(dep)
+            if root_registered:
+                self.unregister(obj_id)
+                removed.add(obj_id)
+        except RuntimeError:
+            _logger.error(
+                "DependencyGraph.cascade_unregister: failed while unregistering cascade "
+                "for root %r; affected_count=%d; removed_ids_so_far=%r",
+                obj_id,
+                len(affected),
+                sorted(removed),
+            )
+            raise
         if root_registered:
-            self.unregister(obj_id)
             result = affected | frozenset({obj_id})
             _logger.debug(
                 "cascade_unregister: removed %d object(s) for root %r", len(result), obj_id
@@ -489,25 +535,29 @@ class DependencyGraph:
         self._validate_obj_id(obj_id, "is_registered")
         return obj_id in self._deps
 
-    def _test_only_rdep_key_exists(self, dep_id: str) -> bool:
-        """Return whether ``dep_id`` is tracked as a dependency in the reverse edges.
-
-        Test-only predicate so the test suite can assert ``_rdeps``-key pruning
-        without reaching into the protected map directly (avoids
-        protected-attribute access warnings at every call site). Not part of
-        the public API; production code must not call it.
+    def has_dependents(self, obj_id: str) -> bool:
+        """Return whether ``obj_id`` has any dependents in the reverse edges.
 
         Parameters
         ----------
-        dep_id : str
-            The candidate dependency id to look up in ``_rdeps``.
+        obj_id : str
+            The object id to query. Must be a non-empty string.
 
         Returns
         -------
         bool
-            ``True`` if ``dep_id`` is currently a key in ``_rdeps``.
+            ``True`` if ``obj_id`` is tracked as a key in the reverse edges
+            (meaning it has one or more dependents); ``False`` otherwise.
+
+        Raises
+        ------
+        TypeError
+            If ``obj_id`` is not a ``str`` (including ``None``).
+        ValueError
+            If ``obj_id`` is an empty string.
         """
-        return dep_id in self._rdeps
+        self._validate_obj_id(obj_id, "has_dependents")
+        return obj_id in self._rdeps
 
     def _test_only_dep_ids_of(self, obj_id: str) -> frozenset[str]:
         """Return a read-only snapshot of ``obj_id``'s forward-edge set.
@@ -581,140 +631,199 @@ class DependencyGraph:
                     )
 
     @staticmethod
-    def deps_for_type(obj: GeoObject) -> set[str]:  # pylint: disable=too-many-branches
-        """Derive the forward-edge set (direct dependencies) for any object.
+    def deps_for_type(obj: GeoObject) -> set[str]:
+        """Derive the forward-edge set (direct dependencies) for ``obj``.
 
-        Centralises the per-type edge table so command code never has to
-        pattern-match on type names. The table, keyed on ``obj.type``:
+        Thin alias for the module-level :func:`deps_for_type` function so that
+        callers using the ``DependencyGraph.deps_for_type(obj)`` or
+        ``graph.deps_for_type(obj)`` call patterns continue to work without
+        change. New code should prefer calling the module-level function
+        directly, which separates type-dispatch from graph mechanics.
 
-        ===========  ===================================================
-        Type         Direct dependencies
-        ===========  ===================================================
-        point        none
-        line         ``{point_a_id, point_b_id}``
-        polygon      ``set(point_ids)``
-        ray          ``{origin_id}``
-        vector       ``{origin_id}`` plus ``{endpoint_id}`` when set
-        circle       ``{center_id}``
-        ball         ``{center_id}``
-        cylinder     ``{base_center_id}``
-        solid        ``set(layers)`` — ``layers`` is a ``tuple[str, ...]`` of
-                     Polygon (``pg_``) or Point (``pt_``) ids, with at most one
-                     Point id (apex/nadir -- must be first or last element;
-                     enforced by ``Solid.__post_init__``). That structural
-                     validation (minimum two layers, ``pg_``/``pt_`` prefix
-                     rules) lives in ``Solid.__post_init__``; this method
-                     adds only its own empty-string reference guard, which
-                     defends against instances built outside the dataclass
-                     constructor.
-        tangent      ``{shape_id, point_id}`` — ``shape_id`` is the id of a
-                     Circle or Ball.
-        ===========  ===================================================
-
-        Parameters
-        ----------
-        obj : GeoObject
-            The object whose forward-edge set to derive. ``obj.type`` must be
-            one of the ten known type strings; all type-specific reference
-            attributes must be present on the instance.
-
-        Returns
-        -------
-        set[str]
-            A fresh set of IDs that ``obj`` directly depends on. Empty for a
-            Point.
-
-        Raises
-        ------
-        ValueError
-            If ``obj.type`` is not one of the ten known object types.
-        AttributeError
-            If a known type string is present but the expected type-specific
-            attribute is missing on the instance (programming error — the
-            model dataclass is inconsistent with its type discriminant).
+        See :func:`deps_for_type` for full documentation.
         """
-        # Dispatch on the string discriminant ``obj.type`` — the same
-        # discriminated-union key used by the JSON wire format — rather than
-        # ``isinstance``. Deliberate trade-off: a static checker cannot verify
-        # the subtype-only attribute reads in each arm, so the exhaustive
-        # per-type tests plus the ``case _`` guard are the safety net.
-        # The ten-arm match plus per-arm validation exceeds pylint's default
-        # branch limit; the disable is on the method signature above.
-        match obj.type:
-            case "point":
-                return set()
-            case "line":
-                if not obj.point_a_id or not obj.point_b_id:
-                    raise ValueError(
-                        f"deps_for_type: line {obj.id!r} has empty point reference "
-                        f"(point_a_id={obj.point_a_id!r}, point_b_id={obj.point_b_id!r})"
+        return deps_for_type(obj)
+
+
+def deps_for_type(obj: GeoObject) -> set[str]:  # pylint: disable=too-many-branches
+    """Derive the forward-edge set (direct dependencies) for any ``GeoObject``.
+
+    Centralises the per-type edge table so command code never has to
+    pattern-match on type names. The table, keyed on ``obj.type``:
+
+    ===========  ===================================================
+    Type         Direct dependencies
+    ===========  ===================================================
+    point        none
+    line         ``{point_a_id, point_b_id}``
+    polygon      ``set(point_ids)``
+    ray          ``{origin_id}``
+    vector       ``{origin_id}`` plus ``{endpoint_id}`` when set
+    circle       ``{center_id}``
+    ball         ``{center_id}``
+    cylinder     ``{base_center_id}``
+    solid        ``set(layers)`` — ``layers`` is a ``tuple[str, ...]`` of
+                 Polygon (``pg_``) or Point (``pt_``) ids, with at most one
+                 Point id (apex/nadir -- must be first or last element;
+                 enforced by ``Solid.__post_init__``). That structural
+                 validation (minimum two layers, ``pg_``/``pt_`` prefix
+                 rules) lives in ``Solid.__post_init__``; this function
+                 adds its own no-layer, non-string, and empty-string
+                 reference guards, which defend against instances built
+                 outside the dataclass constructor.
+    tangent      ``{shape_id, point_id}`` — ``shape_id`` is the id of a
+                 Circle or Ball.
+    ===========  ===================================================
+
+    Parameters
+    ----------
+    obj : GeoObject
+        The object whose forward-edge set to derive. ``obj.type`` must be
+        one of the ten known type strings; all type-specific reference
+        attributes must be present on the instance.
+
+    Returns
+    -------
+    set[str]
+        A fresh set of IDs that ``obj`` directly depends on. Empty for a
+        Point.
+
+    Raises
+    ------
+    TypeError
+        If a type-specific scalar reference field contains a non-``str``
+        truthy value that passes the truthiness guard but would corrupt the
+        dependency set (e.g. ``point_a_id=42``). The message names the
+        bad attribute and its value so callers can identify the source.
+    ValueError
+        If ``obj.type`` is not one of the ten known object types, or if
+        a required reference field contains an empty string or an invalid
+        sequence value.
+    AttributeError
+        If a known type string is present but the expected type-specific
+        attribute is missing on the instance (programming error — the
+        model dataclass is inconsistent with its type discriminant).
+    """
+    # Dispatch on the string discriminant ``obj.type`` — the same
+    # discriminated-union key used by the JSON wire format — rather than
+    # ``isinstance``. Deliberate trade-off: a static checker cannot verify
+    # the subtype-only attribute reads in each arm, so the exhaustive
+    # per-type tests plus the ``case _`` guard are the safety net.
+    # The ten-arm match plus per-arm validation exceeds pylint's default
+    # branch limit; the disable is on the function signature above.
+    match obj.type:
+        case "point":
+            return set()
+        case "line":
+            if not isinstance(obj.point_a_id, str):
+                raise TypeError(
+                    f"deps_for_type: line {obj.id!r} has non-str point_a_id={obj.point_a_id!r}"
+                )
+            if not isinstance(obj.point_b_id, str):
+                raise TypeError(
+                    f"deps_for_type: line {obj.id!r} has non-str point_b_id={obj.point_b_id!r}"
+                )
+            if not obj.point_a_id or not obj.point_b_id:
+                raise ValueError(
+                    f"deps_for_type: line {obj.id!r} has empty point reference "
+                    f"(point_a_id={obj.point_a_id!r}, point_b_id={obj.point_b_id!r})"
+                )
+            return {obj.point_a_id, obj.point_b_id}
+        case "polygon":
+            # Polygon.__post_init__ does not enforce a minimum vertex
+            # count, so an empty point_ids list would otherwise register
+            # the polygon with no edges — indistinguishable from a Point
+            # and invisible to every cascade. Reject it here.
+            if not obj.point_ids:
+                raise ValueError(f"deps_for_type: polygon {obj.id!r} has no point references")
+            if any(not isinstance(p, str) for p in obj.point_ids):
+                raise ValueError(
+                    f"deps_for_type: polygon {obj.id!r} has non-str point reference "
+                    f"in point_ids={obj.point_ids!r}"
+                )
+            if "" in obj.point_ids:
+                raise ValueError(
+                    f"deps_for_type: polygon {obj.id!r} has empty point reference "
+                    f"in point_ids={obj.point_ids!r}"
+                )
+            return set(obj.point_ids)
+        case "ray":
+            if not isinstance(obj.origin_id, str):
+                raise TypeError(
+                    f"deps_for_type: ray {obj.id!r} has non-str origin_id={obj.origin_id!r}"
+                )
+            if not obj.origin_id:
+                raise ValueError(f"deps_for_type: ray {obj.id!r} has empty origin reference")
+            return {obj.origin_id}
+        case "vector":
+            if not isinstance(obj.origin_id, str):
+                raise TypeError(
+                    f"deps_for_type: vector {obj.id!r} has non-str origin_id={obj.origin_id!r}"
+                )
+            if not obj.origin_id:
+                raise ValueError(f"deps_for_type: vector {obj.id!r} has empty origin reference")
+            deps = {obj.origin_id}
+            if obj.endpoint_id is not None:
+                if not isinstance(obj.endpoint_id, str):
+                    raise TypeError(
+                        f"deps_for_type: vector {obj.id!r} has non-str "
+                        f"endpoint_id={obj.endpoint_id!r}"
                     )
-                return {obj.point_a_id, obj.point_b_id}
-            case "polygon":
-                # Polygon.__post_init__ does not enforce a minimum vertex
-                # count, so an empty point_ids list would otherwise register
-                # the polygon with no edges — indistinguishable from a Point
-                # and invisible to every cascade. Reject it here.
-                if not obj.point_ids:
-                    raise ValueError(f"deps_for_type: polygon {obj.id!r} has no point references")
-                if any(not isinstance(p, str) for p in obj.point_ids):
+                if not obj.endpoint_id:
                     raise ValueError(
-                        f"deps_for_type: polygon {obj.id!r} has non-str point reference "
-                        f"in point_ids={obj.point_ids!r}"
+                        f"deps_for_type: vector {obj.id!r} has empty endpoint reference"
                     )
-                if "" in obj.point_ids:
-                    raise ValueError(
-                        f"deps_for_type: polygon {obj.id!r} has empty point reference "
-                        f"in point_ids={obj.point_ids!r}"
-                    )
-                return set(obj.point_ids)
-            case "ray":
-                if not obj.origin_id:
-                    raise ValueError(f"deps_for_type: ray {obj.id!r} has empty origin reference")
-                return {obj.origin_id}
-            case "vector":
-                if not obj.origin_id:
-                    raise ValueError(f"deps_for_type: vector {obj.id!r} has empty origin reference")
-                deps = {obj.origin_id}
-                if obj.endpoint_id is not None:
-                    if not obj.endpoint_id:
-                        raise ValueError(
-                            f"deps_for_type: vector {obj.id!r} has empty endpoint reference"
-                        )
-                    deps.add(obj.endpoint_id)
-                return deps
-            case "circle" | "ball":
-                if not obj.center_id:
-                    raise ValueError(
-                        f"deps_for_type: {obj.type} {obj.id!r} has empty center reference"
-                    )
-                return {obj.center_id}
-            case "cylinder":
-                if not obj.base_center_id:
-                    raise ValueError(
-                        f"deps_for_type: cylinder {obj.id!r} has empty base center reference"
-                    )
-                return {obj.base_center_id}
-            case "solid":
-                if any(not isinstance(layer, str) for layer in obj.layers):
-                    raise ValueError(
-                        f"deps_for_type: solid {obj.id!r} has non-str layer reference "
-                        f"in layers={obj.layers!r}"
-                    )
-                if "" in obj.layers:
-                    raise ValueError(
-                        f"deps_for_type: solid {obj.id!r} has empty layer reference "
-                        f"in layers={obj.layers!r}"
-                    )
-                # Duplicate layer ids collapse intentionally: cascade semantics
-                # only need whether a dependency is referenced at least once.
-                return set(obj.layers)
-            case "tangent":
-                if not obj.shape_id or not obj.point_id:
-                    raise ValueError(
-                        f"deps_for_type: tangent {obj.id!r} has empty reference "
-                        f"(shape_id={obj.shape_id!r}, point_id={obj.point_id!r})"
-                    )
-                return {obj.shape_id, obj.point_id}
-            case _:
-                raise ValueError(f"deps_for_type: unknown object type {obj.type!r}")
+                deps.add(obj.endpoint_id)
+            return deps
+        case "circle" | "ball":
+            if not isinstance(obj.center_id, str):
+                raise TypeError(
+                    f"deps_for_type: {obj.type} {obj.id!r} has non-str center_id={obj.center_id!r}"
+                )
+            if not obj.center_id:
+                raise ValueError(f"deps_for_type: {obj.type} {obj.id!r} has empty center reference")
+            return {obj.center_id}
+        case "cylinder":
+            if not isinstance(obj.base_center_id, str):
+                raise TypeError(
+                    f"deps_for_type: cylinder {obj.id!r} has non-str "
+                    f"base_center_id={obj.base_center_id!r}"
+                )
+            if not obj.base_center_id:
+                raise ValueError(
+                    f"deps_for_type: cylinder {obj.id!r} has empty base center reference"
+                )
+            return {obj.base_center_id}
+        case "solid":
+            if not obj.layers:
+                raise ValueError(f"deps_for_type: solid {obj.id!r} has no layer references")
+            if any(not isinstance(layer, str) for layer in obj.layers):
+                raise ValueError(
+                    f"deps_for_type: solid {obj.id!r} has non-str layer reference "
+                    f"in layers={obj.layers!r}"
+                )
+            if "" in obj.layers:
+                raise ValueError(
+                    f"deps_for_type: solid {obj.id!r} has empty layer reference "
+                    f"in layers={obj.layers!r}"
+                )
+            # Duplicate layer ids collapse intentionally: cascade semantics
+            # only need whether a dependency is referenced at least once.
+            return set(obj.layers)
+        case "tangent":
+            if not isinstance(obj.shape_id, str):
+                raise TypeError(
+                    f"deps_for_type: tangent {obj.id!r} has non-str shape_id={obj.shape_id!r}"
+                )
+            if not isinstance(obj.point_id, str):
+                raise TypeError(
+                    f"deps_for_type: tangent {obj.id!r} has non-str point_id={obj.point_id!r}"
+                )
+            if not obj.shape_id or not obj.point_id:
+                raise ValueError(
+                    f"deps_for_type: tangent {obj.id!r} has empty reference "
+                    f"(shape_id={obj.shape_id!r}, point_id={obj.point_id!r})"
+                )
+            return {obj.shape_id, obj.point_id}
+        case _:
+            raise ValueError(f"deps_for_type: unknown object type {obj.type!r}")
