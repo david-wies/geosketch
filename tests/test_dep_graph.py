@@ -275,6 +275,26 @@ def test_unregister_invariant_violation_reverse_direction_logs_and_raises(caplog
     assert "pt_001" in caplog.text
 
 
+def test_unregister_forward_is_none_backstop_logs_and_raises(caplog):
+    # Out-of-band corruption: a dependent listed in _rdeps[obj_id] has a _deps
+    # KEY (so the pre-check passes) whose VALUE is None (not a set). The
+    # reverse-edge cleanup loop's ``forward is None`` backstop must route this
+    # through RuntimeError rather than letting ``None.discard`` raise a bare
+    # AttributeError, so cascade callers' error handlers fire.
+    graph = DependencyGraph()
+    # pt_001 has no forward deps; ci_001 "depends on" pt_001 via _rdeps only,
+    # and its _deps entry is corrupted to None.
+    graph._deps["pt_001"] = set()  # pylint: disable=protected-access
+    graph._deps["ci_001"] = None  # type: ignore[assignment]  # pylint: disable=protected-access
+    graph._rdeps["pt_001"] = {"ci_001"}  # pylint: disable=protected-access
+
+    with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="invariant"):
+        graph.unregister("pt_001")
+
+    assert "ci_001" in caplog.text
+    assert "pt_001" in caplog.text
+
+
 def test_register_empty_obj_id_raises():
     graph = DependencyGraph()
     with pytest.raises(ValueError, match="non-empty"):
@@ -650,25 +670,26 @@ def test_deps_for_type_polygon_with_empty_point_reference_raises():
 
 
 def test_deps_for_type_polygon_with_none_point_reference_raises():
-    # None in point_ids must raise ValueError (not TypeError): the "" guard
-    # alone passes for None (None != ""), so without the non-str check the
-    # set() call propagates None to register(), which raises TypeError that
-    # add()'s except clause cannot catch.
+    # None in point_ids must raise TypeError — consistent with the non-str
+    # scalar-field guards (e.g. line.point_a_id). The "" guard alone passes for
+    # None (None != ""), so the non-str element check is what fires here; raising
+    # TypeError (not ValueError) keeps command code that catches TypeError to
+    # detect model corruption from silently missing the polygon case.
     pg = Polygon(**_env("pg"), point_ids=["pt_001", "pt_002"], is_convex=True, **_colors())
     object.__setattr__(pg, "point_ids", ["pt_001", None])
-    with pytest.raises(ValueError, match="polygon 'pg_001' has non-str point reference"):
+    with pytest.raises(TypeError, match="polygon 'pg_001' has non-str point reference"):
         DependencyGraph.deps_for_type(pg)
 
 
-def test_add_polygon_with_none_point_id_raises_value_error():
-    # Regression: None in point_ids previously escaped add() as TypeError
-    # because deps_for_type let it through and register() raised TypeError,
-    # which add() did not catch.  Now deps_for_type raises ValueError so
-    # add() wraps it with object context.
+def test_add_polygon_with_none_point_id_raises_type_error():
+    # Regression: None in point_ids must escape add() as TypeError (wrapped with
+    # object context). deps_for_type raises TypeError for the non-str element,
+    # and add()'s except TypeError branch re-raises it with the object id/type so
+    # command code catching TypeError to detect corruption sees the polygon case.
     graph = DependencyGraph()
     pg = Polygon(**_env("pg"), point_ids=["pt_001", "pt_002"], is_convex=True, **_colors())
     object.__setattr__(pg, "point_ids", ["pt_001", None])
-    with pytest.raises(ValueError, match="pg_001"):
+    with pytest.raises(TypeError, match="pg_001"):
         graph.add(pg)
 
 
@@ -766,10 +787,12 @@ def test_deps_for_type_solid_with_empty_layers_raises():
 
 def test_deps_for_type_solid_with_none_layer_reference_raises():
     # Same pattern as the polygon None test: the "" guard alone passes for None,
-    # so the non-str check is required to raise ValueError before set() is called.
+    # so the non-str check is what fires. It raises TypeError (consistent with
+    # the non-str scalar-field guards) so command code catching TypeError sees
+    # the solid case too.
     so = Solid(**_env("so"), layers=["pg_001", "pg_002"], **_colors())
     object.__setattr__(so, "layers", ("pg_001", None))
-    with pytest.raises(ValueError, match="solid 'so_001' has non-str layer reference"):
+    with pytest.raises(TypeError, match="solid 'so_001' has non-str layer reference"):
         DependencyGraph.deps_for_type(so)
 
 
@@ -789,6 +812,125 @@ def test_deps_for_type_tangent_with_empty_reference_raises(shape_id, point_id):
     )
     with pytest.raises(ValueError, match="tangent 'tg_001' has empty reference"):
         DependencyGraph.deps_for_type(tg)
+
+
+# ---------------------------------------------------------------------------
+# deps_for_type — non-str scalar reference rejection (TypeError), one per arm.
+# A truthy non-str (e.g. 42) passes the empty-reference guard, so the dedicated
+# non-str check is what must fire. object.__setattr__ bypasses the dataclass
+# constructor to exercise the deps_for_type guard directly.
+# ---------------------------------------------------------------------------
+
+
+def test_deps_for_type_ray_with_non_str_origin_raises_type_error():
+    ry = Ray(**_env("ry"), origin_id="pt_001", **_BEARING, **_colors())
+    object.__setattr__(ry, "origin_id", 42)
+    with pytest.raises(TypeError, match="ray 'ry_001' has non-str origin_id=42"):
+        DependencyGraph.deps_for_type(ry)
+
+
+def test_deps_for_type_vector_with_non_str_origin_raises_type_error():
+    vc = Vector(
+        **_env("vc"),
+        origin_id="pt_001",
+        length=10.0,
+        endpoint_id=None,
+        **_BEARING,
+        **_colors(),
+    )
+    object.__setattr__(vc, "origin_id", 42)
+    with pytest.raises(TypeError, match="vector 'vc_001' has non-str origin_id=42"):
+        DependencyGraph.deps_for_type(vc)
+
+
+def test_deps_for_type_vector_with_non_str_endpoint_raises_type_error():
+    vc = Vector(
+        **_env("vc"),
+        origin_id="pt_001",
+        length=10.0,
+        endpoint_id="pt_002",
+        **_BEARING,
+        **_colors(),
+    )
+    object.__setattr__(vc, "endpoint_id", 42)
+    with pytest.raises(TypeError, match="vector 'vc_001' has non-str endpoint_id=42"):
+        DependencyGraph.deps_for_type(vc)
+
+
+def test_deps_for_type_circle_with_non_str_center_raises_type_error():
+    ci = Circle(**_env("ci"), center_id="pt_001", radius=5.0, **_colors())
+    object.__setattr__(ci, "center_id", 42)
+    with pytest.raises(TypeError, match="circle 'ci_001' has non-str center_id=42"):
+        DependencyGraph.deps_for_type(ci)
+
+
+def test_deps_for_type_ball_with_non_str_center_raises_type_error():
+    ba = Ball(**_env("ba"), center_id="pt_001", radius=5.0, **_colors())
+    object.__setattr__(ba, "center_id", 42)
+    with pytest.raises(TypeError, match="ball 'ba_001' has non-str center_id=42"):
+        DependencyGraph.deps_for_type(ba)
+
+
+def test_deps_for_type_cylinder_with_non_str_base_center_raises_type_error():
+    cy = Cylinder(
+        **_env("cy"),
+        base_center_id="pt_001",
+        radius=5.0,
+        height=10.0,
+        axis_mode="vertical",
+        axis_azimuth=0.0,
+        axis_elevation=1.5707963267948966,
+        direction_mode=DirectionMode.AZIMUTH,
+        direction_units=DirectionUnits.RADIANS,
+        **_colors(),
+    )
+    object.__setattr__(cy, "base_center_id", 42)
+    with pytest.raises(TypeError, match="cylinder 'cy_001' has non-str base_center_id=42"):
+        DependencyGraph.deps_for_type(cy)
+
+
+def test_deps_for_type_tangent_with_non_str_shape_raises_type_error():
+    tg = Tangent(
+        **_env("tg"),
+        shape_id="ci_001",
+        shape_type="circle",
+        point_id="pt_001",
+        **_BEARING,
+        **_colors(),
+    )
+    object.__setattr__(tg, "shape_id", 42)
+    with pytest.raises(TypeError, match="tangent 'tg_001' has non-str shape_id=42"):
+        DependencyGraph.deps_for_type(tg)
+
+
+def test_deps_for_type_tangent_with_non_str_point_raises_type_error():
+    tg = Tangent(
+        **_env("tg"),
+        shape_id="ci_001",
+        shape_type="circle",
+        point_id="pt_001",
+        **_BEARING,
+        **_colors(),
+    )
+    object.__setattr__(tg, "point_id", 42)
+    with pytest.raises(TypeError, match="tangent 'tg_001' has non-str point_id=42"):
+        DependencyGraph.deps_for_type(tg)
+
+
+def test_deps_for_type_polygon_with_non_str_element_raises_type_error():
+    # A non-str element in a non-empty point_ids list raises TypeError (Item 2),
+    # consistent with the scalar-field guards.
+    pg = Polygon(**_env("pg"), point_ids=["pt_001", "pt_002"], is_convex=True, **_colors())
+    object.__setattr__(pg, "point_ids", ["pt_001", 42])
+    with pytest.raises(TypeError, match="polygon 'pg_001' has non-str point reference"):
+        DependencyGraph.deps_for_type(pg)
+
+
+def test_deps_for_type_solid_with_non_str_element_raises_type_error():
+    so = Solid(**_env("so"), layers=["pg_001", "pg_002"], **_colors())
+    object.__setattr__(so, "layers", ("pg_001", 42))
+    with pytest.raises(TypeError, match="solid 'so_001' has non-str layer reference"):
+        DependencyGraph.deps_for_type(so)
 
 
 # ---------------------------------------------------------------------------
@@ -1205,6 +1347,22 @@ def test_cascade_unregister_line_cleans_sibling_dependency_rdeps_entry():
     graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
 
+def test_cascade_unregister_invariant_violation_logs_cascade_context_and_raises(caplog):
+    # Out-of-band corruption surfaced during the cascade must route through
+    # cascade_unregister's RuntimeError handler, which logs cascade context
+    # before re-raising. pt_001 lists ci_001 as a dependency with no matching
+    # back-edge (Direction-2 pre-check violation); nothing depends on pt_001, so
+    # the cascade proceeds straight to unregister(pt_001) and trips the check.
+    graph = DependencyGraph()
+    graph._deps["pt_001"] = {"ci_001"}  # pylint: disable=protected-access
+
+    with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="invariant"):
+        graph.cascade_unregister("pt_001")
+
+    assert "cascade_unregister" in caplog.text
+    assert "pt_001" in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # None guards — TypeError fires before the empty-string ValueError, on every
 # public method that takes an obj_id
@@ -1233,6 +1391,18 @@ def test_register_none_dep_id_raises_type_error_and_does_not_register():
     with pytest.raises(TypeError, match="dep_ids must contain only str"):
         graph.register("ln_001", {"pt_001", None})
     # validate-before-mutate: nothing was registered, no edges were created.
+    assert not graph.is_registered("ln_001")
+    assert not graph._deps  # pylint: disable=protected-access
+    assert not graph._rdeps  # pylint: disable=protected-access
+
+
+def test_register_unhashable_dep_id_raises_type_error_with_clear_message():
+    # An unhashable element (e.g. a list) makes set(dep_ids) raise a TypeError
+    # about unhashability; register() must re-raise it with the same
+    # "must contain only str" wording the per-element guard uses.
+    graph = DependencyGraph()
+    with pytest.raises(TypeError, match="dep_ids must contain only str"):
+        graph.register("ln_001", ["pt_001", ["nested"]])
     assert not graph.is_registered("ln_001")
     assert not graph._deps  # pylint: disable=protected-access
     assert not graph._rdeps  # pylint: disable=protected-access

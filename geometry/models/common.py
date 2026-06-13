@@ -93,7 +93,14 @@ class GeoObject:
             raise ValueError(f"GeoObject.alpha must be in [0.0, 1.0]; got {self.alpha!r}")
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if name in ("type", "id") and name in self.__dict__:
+        # ``hasattr`` — not ``name in self.__dict__`` — because ``type`` lives as
+        # a class attribute (``field(init=False, default=...)``) and never enters
+        # the instance ``__dict__``; the ``__dict__`` membership test would never
+        # fire for it, leaving ``type`` silently mutable. ``id`` is a normal init
+        # param with no class-level default, so ``hasattr`` is False on its first
+        # assignment in ``__init__`` and True thereafter — construction still
+        # works while any post-init reassignment of either field raises.
+        if name in ("type", "id") and hasattr(self, name):
             raise AttributeError(f"{name!r} is read-only post-construction")
         super().__setattr__(name, value)
 

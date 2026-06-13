@@ -47,6 +47,16 @@ _logger = logging.getLogger(__name__)
 
 _EMPTY: AbstractSet[str] = frozenset()
 
+# Both maps are structurally ``dict[str, set[str]]`` but differ in their
+# emptiness policy, so the two aliases document the asymmetry at the field
+# declaration sites (see the field docstrings on ``DependencyGraph``):
+#   * ``_ForwardDeps`` retains an empty value set as a presence marker — a key
+#     exists iff the object is registered, even with zero dependencies.
+#   * ``_ReverseDeps`` never retains an empty value set — a key is dropped the
+#     moment its last reverse edge is pruned.
+_ForwardDeps = dict[str, set[str]]
+_ReverseDeps = dict[str, set[str]]
+
 
 class DependencyGraph:
     """Reverse-reference graph for O(|affected|) cascade operations.
@@ -76,9 +86,9 @@ class DependencyGraph:
 
     def __init__(self) -> None:
         # key present iff registered; empty set = no deps (presence marker)
-        self._deps: dict[str, set[str]] = {}
+        self._deps: _ForwardDeps = {}
         # key present iff >=1 dependent; empty sets are never retained here
-        self._rdeps: dict[str, set[str]] = {}
+        self._rdeps: _ReverseDeps = {}
 
     @staticmethod
     def _validate_obj_id(obj_id: str, method: str) -> None:
@@ -237,7 +247,17 @@ class DependencyGraph:
             raise TypeError(
                 "DependencyGraph.register: dep_ids must be an iterable of str, not a bare str"
             )
-        dep_set = set(dep_ids)
+        # Materialising into a set surfaces an unhashable element (e.g. a list)
+        # as a TypeError about unhashability — re-raise it with the same
+        # "must contain only str" wording the per-element guard uses, so the
+        # caller sees one consistent message regardless of which check trips.
+        try:
+            dep_set = set(dep_ids)
+        except TypeError as exc:
+            raise TypeError(
+                "DependencyGraph.register: dep_ids must contain only str "
+                "(got an unhashable element)"
+            ) from exc
         for dep_id in dep_set:
             if not isinstance(dep_id, str):
                 raise TypeError(
@@ -369,7 +389,24 @@ class DependencyGraph:
         # Remove reverse edges into obj_id and their mirrored forward edges.
         for dependent in self._rdeps.pop(obj_id, _EMPTY):
             forward = self._deps.get(dependent)
-            # The pre-check above guarantees every dependent has a _deps entry.
+            # The pre-check above guarantees every dependent has a _deps entry,
+            # so this backstop cannot fire via the public API. It exists only to
+            # route out-of-band corruption (a dependent with no _deps entry)
+            # through the documented RuntimeError handler — e.g. so
+            # cascade_unregister logs its cascade context — rather than letting a
+            # bare AttributeError from ``None.discard`` escape.
+            if forward is None:
+                _logger.error(
+                    "DependencyGraph.unregister: dependent %r of %r has no _deps "
+                    "entry during reverse-edge cleanup; bidirectional invariant violated.",
+                    dependent,
+                    obj_id,
+                )
+                raise RuntimeError(
+                    f"DependencyGraph.unregister: dependent {dependent!r} of {obj_id!r} "
+                    f"has no _deps entry during reverse-edge cleanup; "
+                    f"bidirectional invariant violated."
+                )
             forward.discard(obj_id)
 
     def cascade_unregister(self, obj_id: str) -> frozenset[str]:
@@ -443,14 +480,13 @@ class DependencyGraph:
                 sorted(removed),
             )
             raise
-        if root_registered:
-            result = affected | frozenset({obj_id})
-            _logger.debug(
-                "cascade_unregister: removed %d object(s) for root %r", len(result), obj_id
-            )
-            return result
-        _logger.debug("cascade_unregister: removed %d object(s) for root %r", len(affected), obj_id)
-        return affected
+        # Return exactly what was unregistered — the locally accumulated set —
+        # rather than reconstructing it from the pre-mutation snapshot. Under the
+        # invariant ``removed == affected | {obj_id if root_registered}`` the two
+        # agree, but returning ``removed`` makes the "exactly the IDs unregistered
+        # by this call" contract provably true rather than merely consistent.
+        _logger.debug("cascade_unregister: removed %d object(s) for root %r", len(removed), obj_id)
+        return frozenset(removed)
 
     def dependents_of(self, obj_id: str) -> frozenset[str]:
         """Return the transitive closure of objects that depend on ``obj_id``.
@@ -603,6 +639,18 @@ class DependencyGraph:
         :meth:`unregister` ensures no stale ``_rdeps`` entries survive a
         properly ordered cascade delete.
 
+        **How corruption surfaces:** :meth:`unregister` defends the mirror
+        invariant in two places, both raising ``RuntimeError`` (never a bare
+        ``AttributeError``) so corruption is reported cleanly: (a) a
+        pre-mutation bidirectional check that walks both directions before any
+        edge is touched, and (b) the defensive ``forward is None`` backstop in
+        the reverse-edge cleanup loop, which catches a dependent that lost its
+        ``_deps`` entry out-of-band. Because the pre-check guarantees every
+        dependent has a ``_deps`` entry, the backstop cannot fire via the public
+        API; it exists solely so out-of-band corruption routes through the
+        documented ``RuntimeError`` handler rather than escaping as
+        ``AttributeError``.
+
         **Warning:** This protected helper is not part of the public API. It
         raises ``AssertionError`` explicitly (no ``assert`` statements), so it
         is **not** disabled by running Python with ``-O``/``-OO``. It is still
@@ -693,12 +741,18 @@ def deps_for_type(obj: GeoObject) -> set[str]:  # pylint: disable=too-many-branc
     TypeError
         If a type-specific scalar reference field contains a non-``str``
         truthy value that passes the truthiness guard but would corrupt the
-        dependency set (e.g. ``point_a_id=42``). The message names the
-        bad attribute and its value so callers can identify the source.
+        dependency set (e.g. ``point_a_id=42``), or if a reference *sequence*
+        (``polygon.point_ids`` / ``solid.layers``) contains a non-``str``
+        element. The message names the bad attribute and its value so callers
+        can identify the source. The sequence-element checks raise ``TypeError``
+        (not ``ValueError``) to stay consistent with the scalar-field checks, so
+        command code catching ``TypeError`` to detect model corruption catches
+        the polygon/solid cases too.
     ValueError
-        If ``obj.type`` is not one of the ten known object types, or if
-        a required reference field contains an empty string or an invalid
-        sequence value.
+        If ``obj.type`` is not one of the ten known object types, if a required
+        reference field (scalar or sequence element) contains an empty string,
+        or if a reference collection (``polygon.point_ids`` / ``solid.layers``)
+        is empty.
     AttributeError
         If a known type string is present but the expected type-specific
         attribute is missing on the instance (programming error — the
@@ -737,7 +791,7 @@ def deps_for_type(obj: GeoObject) -> set[str]:  # pylint: disable=too-many-branc
             if not obj.point_ids:
                 raise ValueError(f"deps_for_type: polygon {obj.id!r} has no point references")
             if any(not isinstance(p, str) for p in obj.point_ids):
-                raise ValueError(
+                raise TypeError(
                     f"deps_for_type: polygon {obj.id!r} has non-str point reference "
                     f"in point_ids={obj.point_ids!r}"
                 )
@@ -798,7 +852,7 @@ def deps_for_type(obj: GeoObject) -> set[str]:  # pylint: disable=too-many-branc
             if not obj.layers:
                 raise ValueError(f"deps_for_type: solid {obj.id!r} has no layer references")
             if any(not isinstance(layer, str) for layer in obj.layers):
-                raise ValueError(
+                raise TypeError(
                     f"deps_for_type: solid {obj.id!r} has non-str layer reference "
                     f"in layers={obj.layers!r}"
                 )

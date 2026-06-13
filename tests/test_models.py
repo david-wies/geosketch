@@ -119,6 +119,39 @@ def test_geo_object_direct_instantiation_rejected():
         GeoObject(id="x_001", name="X", type="bogus", alpha=1.0, visibility=True)
 
 
+def test_type_is_read_only_post_construction():
+    # ``type`` lives as a class attribute (field(init=False, default=...)), so a
+    # ``name in self.__dict__`` guard would never fire for it; the guard uses
+    # ``hasattr`` instead so reassignment after construction raises.
+    pt = Point(
+        id="pt_001",
+        name="A",
+        alpha=1.0,
+        visibility=True,
+        easting=0.0,
+        northing=0.0,
+        color="#000000",
+    )
+    with pytest.raises(AttributeError, match="read-only post-construction"):
+        pt.type = "line"
+    assert pt.type == "point"
+
+
+def test_id_is_read_only_post_construction():
+    pt = Point(
+        id="pt_001",
+        name="A",
+        alpha=1.0,
+        visibility=True,
+        easting=0.0,
+        northing=0.0,
+        color="#000000",
+    )
+    with pytest.raises(AttributeError, match="read-only post-construction"):
+        pt.id = "pt_999"
+    assert pt.id == "pt_001"
+
+
 def test_alpha_out_of_range_rejected_via_subclass():
     # alpha is documented as [0.0, 1.0]; the guard lives in GeoObject so every
     # concrete subclass inherits it. nan and out-of-range values must raise.
