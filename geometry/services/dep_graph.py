@@ -230,8 +230,11 @@ class DependencyGraph:
         ------
         TypeError
             If ``obj_id`` is not a ``str`` (including ``None``), if ``dep_ids``
-            is a bare ``str`` rather than an iterable of ``str``, or if any
-            element of ``dep_ids`` is not a ``str``.
+            is a bare ``str`` rather than an iterable of ``str``, if ``dep_ids``
+            is not iterable at all (e.g. ``42`` or ``None`` — surfaced with an
+            accurate "must be an iterable" message, not the "unhashable element"
+            wording), if ``dep_ids`` contains an unhashable element (e.g. a
+            ``list``), or if any element of ``dep_ids`` is not a ``str``.
         ValueError
             If ``obj_id`` is an empty string, or if any element of ``dep_ids``
             is an empty string.
@@ -247,10 +250,22 @@ class DependencyGraph:
             raise TypeError(
                 "DependencyGraph.register: dep_ids must be an iterable of str, not a bare str"
             )
-        # Materialising into a set surfaces an unhashable element (e.g. a list)
-        # as a TypeError about unhashability — re-raise it with the same
-        # "must contain only str" wording the per-element guard uses, so the
-        # caller sees one consistent message regardless of which check trips.
+        # A non-iterable dep_ids (e.g. 42 or None) would make set(dep_ids) raise
+        # a TypeError about non-iterability. Catch it explicitly up front so the
+        # native, accurate message survives — rather than being masked by the
+        # "unhashable element" wording below, which would actively misdirect
+        # debugging. ``Iterable`` here is ``collections.abc.Iterable`` (imported
+        # for both the type hint and this runtime check).
+        if not isinstance(dep_ids, Iterable):
+            raise TypeError(
+                f"DependencyGraph.register: dep_ids must be an iterable of str, "
+                f"not {type(dep_ids).__name__}"
+            )
+        # With the iterability guard above, materialising into a set can now fail
+        # only on an unhashable element (e.g. a list inside the iterable); the
+        # non-iterable case can no longer reach here. Re-raise that TypeError with
+        # the same "must contain only str" wording the per-element guard uses, so
+        # the caller sees one consistent message regardless of which check trips.
         try:
             dep_set = set(dep_ids)
         except TypeError as exc:
@@ -329,7 +344,14 @@ class DependencyGraph:
             If ``strict`` is ``True`` and ``obj_id`` is not registered.
         RuntimeError
             If an internal bidirectional invariant violation is detected during
-            unregistration (indicates out-of-band corruption of the graph).
+            unregistration (indicates out-of-band corruption of the graph). The
+            pre-mutation check surfaces every corruption shape — a dependent with
+            no ``_deps`` entry, a ``None``-valued ``_deps``/``_rdeps`` entry for
+            ``obj_id``, or a forward edge missing its reverse back-edge — as a
+            ``RuntimeError`` before any edge is touched, so corruption never
+            escapes as a bare ``TypeError``/``AttributeError``. The
+            ``forward is None`` backstop in the reverse-cleanup loop is
+            defense-in-depth for the same guarantee.
         """
         self._validate_obj_id(obj_id, "unregister")
         if strict and obj_id not in self._deps:
@@ -342,10 +364,28 @@ class DependencyGraph:
         # BEFORE touching _deps or _rdeps, so any corruption is surfaced as a
         # clean error with no partially-updated graph as a side-effect.
         #
+        # First fetch obj_id's own forward/reverse entries once and reject a
+        # present-but-None value: a corrupted ``_deps[obj_id] = None`` (or the
+        # _rdeps mirror) would make the loops below iterate ``None`` — the key
+        # exists, so the ``_EMPTY`` default never applies — and escape as a bare
+        # TypeError, defeating the documented RuntimeError guarantee.
+        own_deps = self._deps.get(obj_id, _EMPTY)
+        own_rdeps = self._rdeps.get(obj_id, _EMPTY)
+        if own_deps is None or own_rdeps is None:
+            which = "_deps" if own_deps is None else "_rdeps"
+            _logger.error(
+                "DependencyGraph.unregister: %r has a None %s value; "
+                "bidirectional invariant violated.",
+                obj_id,
+                which,
+            )
+            raise RuntimeError(
+                f"DependencyGraph.unregister: {obj_id!r} has a None {which} value; "
+                f"bidirectional invariant violated."
+            )
         # Direction 1 (reverse → forward): every dependent listed in
         # _rdeps[obj_id] must have a matching _deps entry.
-        pending_dependents = self._rdeps.get(obj_id, _EMPTY)
-        for dependent in pending_dependents:
+        for dependent in own_rdeps:
             if dependent not in self._deps:
                 _logger.error(
                     "DependencyGraph.unregister: _rdeps[%r] lists dependent %r "
@@ -362,7 +402,7 @@ class DependencyGraph:
         # edge (present in _deps[obj_id] but missing from _rdeps[dep_id]) goes
         # undetected by the reverse-direction check and would be silently
         # discarded, violating the mirror invariant.
-        for dep_id in self._deps.get(obj_id, _EMPTY):
+        for dep_id in own_deps:
             if obj_id not in self._rdeps.get(dep_id, _EMPTY):
                 _logger.error(
                     "DependencyGraph.unregister: _deps[%r] lists dep %r "
@@ -457,8 +497,14 @@ class DependencyGraph:
         RuntimeError
             If an internal bidirectional invariant violation is detected
             (propagated from the pre-mutation check in :meth:`unregister`);
-            the graph was already corrupted out-of-band before this call. The
-            failure is logged with cascade context before being re-raised.
+            the graph was already corrupted out-of-band before this call. Every
+            corruption shape — a dependent with a missing ``_deps`` entry, a
+            ``None``-valued ``_deps``/``_rdeps`` entry, or a missing mirror
+            back-edge — is surfaced as ``RuntimeError`` by that pre-mutation
+            check before any mutation, so the cascade's ``except RuntimeError``
+            handler always fires and corruption never escapes as a bare
+            ``TypeError``/``AttributeError``. The failure is logged with cascade
+            context before being re-raised.
         """
         _logger.debug("cascade_unregister: root %r", obj_id)
         affected = self.dependents_of(obj_id)
@@ -641,15 +687,18 @@ class DependencyGraph:
 
         **How corruption surfaces:** :meth:`unregister` defends the mirror
         invariant in two places, both raising ``RuntimeError`` (never a bare
-        ``AttributeError``) so corruption is reported cleanly: (a) a
-        pre-mutation bidirectional check that walks both directions before any
+        ``AttributeError``/``TypeError``) so corruption is reported cleanly: (a)
+        a pre-mutation bidirectional check that walks both directions before any
         edge is touched, and (b) the defensive ``forward is None`` backstop in
-        the reverse-edge cleanup loop, which catches a dependent that lost its
-        ``_deps`` entry out-of-band. Because the pre-check guarantees every
-        dependent has a ``_deps`` entry, the backstop cannot fire via the public
-        API; it exists solely so out-of-band corruption routes through the
-        documented ``RuntimeError`` handler rather than escaping as
-        ``AttributeError``.
+        the reverse-edge cleanup loop. A dependent with *no* ``_deps`` entry (a
+        missing key) is caught by the Direction-1 pre-check (``dependent not in
+        self._deps``); the ``forward is None`` backstop instead fires only for a
+        dependent whose ``_deps`` *value* is ``None`` (a present key bound to
+        ``None`` rather than a set) — a distinct corruption shape. Because the
+        pre-check guarantees every dependent has a non-``None`` ``_deps`` entry,
+        the backstop cannot fire via the public API; it exists solely so
+        out-of-band corruption routes through the documented ``RuntimeError``
+        handler rather than escaping as ``AttributeError``.
 
         **Warning:** This protected helper is not part of the public API. It
         raises ``AssertionError`` explicitly (no ``assert`` statements), so it

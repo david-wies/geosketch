@@ -334,6 +334,32 @@ def test_register_bare_str_dep_ids_raises_and_leaves_graph_unmutated():
     assert not graph._rdeps  # pylint: disable=protected-access
 
 
+def test_register_unhashable_dep_element_raises_and_leaves_graph_unmutated():
+    # A list nested inside the iterable is unhashable, so set() raises a
+    # TypeError. It must be reworded to the clear "must contain only str"
+    # message (mentioning the unhashable element), and leave no partial mutation.
+    graph = DependencyGraph()
+    with pytest.raises(TypeError, match="must contain only str"):
+        graph.register("ln_001", ["pt_001", ["x"]])
+    assert not graph.is_registered("ln_001")
+    assert not graph._deps  # pylint: disable=protected-access
+    assert not graph._rdeps  # pylint: disable=protected-access
+
+
+@pytest.mark.parametrize("dep_ids", [42, None, 3.14])
+def test_register_non_iterable_dep_ids_raises_accurate_message(dep_ids):
+    # A non-iterable dep_ids must NOT be mislabeled as an "unhashable element":
+    # that wording actively misdirects debugging. The message must instead make
+    # clear the argument is not iterable, and no mutation may occur.
+    graph = DependencyGraph()
+    with pytest.raises(TypeError, match="iterable") as exc_info:
+        graph.register("ln_001", dep_ids)
+    assert "unhashable" not in str(exc_info.value)
+    assert not graph.is_registered("ln_001")
+    assert not graph._deps  # pylint: disable=protected-access
+    assert not graph._rdeps  # pylint: disable=protected-access
+
+
 def test_unregister_empty_obj_id_raises():
     graph = DependencyGraph()
     with pytest.raises(ValueError, match="non-empty"):
@@ -1361,6 +1387,51 @@ def test_cascade_unregister_invariant_violation_logs_cascade_context_and_raises(
 
     assert "cascade_unregister" in caplog.text
     assert "pt_001" in caplog.text
+
+
+def test_cascade_unregister_none_valued_dependent_deps_raises_runtime_error(caplog):
+    # Out-of-band corruption: a registered dependent's _deps entry is a present
+    # key bound to None (not a missing key). When cascade_unregister processes
+    # this dependent FIRST, unregister's Direction-2 pre-check loop would iterate
+    # None and escape as a bare TypeError, bypassing the RuntimeError guarantee
+    # and the cascade's except-RuntimeError handler. The pre-mutation None guard
+    # must surface it as a RuntimeError and the cascade context must be logged.
+    graph = DependencyGraph()
+    graph.register("ln_001", {"pt_001"})
+    graph._deps["ln_001"] = None  # type: ignore[assignment]  # pylint: disable=protected-access
+
+    with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="invariant"):
+        graph.cascade_unregister("pt_001")
+
+    assert "cascade_unregister" in caplog.text
+    assert "ln_001" in caplog.text
+
+
+def test_unregister_none_valued_deps_entry_raises_runtime_error(caplog):
+    # Direct unregister on an obj_id whose own _deps value is None must raise
+    # RuntimeError (not a bare TypeError) from the pre-mutation None guard.
+    graph = DependencyGraph()
+    graph._deps["ln_001"] = None  # type: ignore[assignment]  # pylint: disable=protected-access
+
+    with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="invariant"):
+        graph.unregister("ln_001")
+
+    assert "ln_001" in caplog.text
+    assert "_deps" in caplog.text
+
+
+def test_unregister_none_valued_rdeps_entry_raises_runtime_error(caplog):
+    # Direct unregister on an obj_id whose own _rdeps value is None must raise
+    # RuntimeError (not a bare TypeError) from the pre-mutation None guard.
+    graph = DependencyGraph()
+    graph._deps["pt_001"] = set()  # pylint: disable=protected-access
+    graph._rdeps["pt_001"] = None  # type: ignore[assignment]  # pylint: disable=protected-access
+
+    with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="invariant"):
+        graph.unregister("pt_001")
+
+    assert "pt_001" in caplog.text
+    assert "_rdeps" in caplog.text
 
 
 # ---------------------------------------------------------------------------
