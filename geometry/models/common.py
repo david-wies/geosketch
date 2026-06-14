@@ -93,13 +93,14 @@ class GeoObject:
             raise ValueError(f"GeoObject.alpha must be in [0.0, 1.0]; got {self.alpha!r}")
 
     def __setattr__(self, name: str, value: Any) -> None:
-        # ``hasattr`` — not ``name in self.__dict__`` — because ``type`` lives as
-        # a class attribute (``field(init=False, default=...)``) and never enters
-        # the instance ``__dict__``; the ``__dict__`` membership test would never
-        # fire for it, leaving ``type`` silently mutable. ``id`` is a normal init
-        # param with no class-level default, so ``hasattr`` is False on its first
-        # assignment in ``__init__`` and True thereafter — construction still
-        # works while any post-init reassignment of either field raises.
+        # ``hasattr`` works because ``@dataclass`` consumes the ``Field``
+        # descriptors during class creation: ``type`` is *not* retained as a
+        # class-level value, so before its first ``__init__`` assignment neither
+        # ``type`` nor ``id`` has an instance-``__dict__`` entry and ``hasattr``
+        # is False — construction proceeds. On any later assignment the
+        # instance-dict entry already exists, ``hasattr`` is True, and the guard
+        # fires. (``name in self.__dict__`` would behave identically here; the
+        # comment rationale, not the mechanism, was the bug being fixed.)
         if name in ("type", "id") and hasattr(self, name):
             raise AttributeError(f"{name!r} is read-only post-construction")
         super().__setattr__(name, value)

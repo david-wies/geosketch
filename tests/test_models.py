@@ -152,6 +152,21 @@ def test_id_is_read_only_post_construction():
     assert pt.id == "pt_001"
 
 
+def test_geo_object_rejects_non_str_id():
+    # ``GeoObject.__post_init__`` requires ``id`` to be a str; a non-str id (here
+    # an int) must raise ``TypeError`` at construction, not slip through.
+    with pytest.raises(TypeError, match="id must be a str"):
+        Point(
+            id=42,
+            name="A",
+            alpha=1.0,
+            visibility=True,
+            easting=0.0,
+            northing=0.0,
+            color="#000000",
+        )
+
+
 def test_alpha_out_of_range_rejected_via_subclass():
     # alpha is documented as [0.0, 1.0]; the guard lives in GeoObject so every
     # concrete subclass inherits it. nan and out-of-range values must raise.
@@ -996,6 +1011,91 @@ def test_tangent_circle_accepts_elevation_at_exact_tolerance_boundary():
 # ---------------------------------------------------------------------------
 # Layer discipline: no forbidden imports in models
 # ---------------------------------------------------------------------------
+
+
+def _point_kwargs(**overrides) -> dict:
+    base = {
+        "id": "pt_001",
+        "name": "A",
+        "alpha": 1.0,
+        "visibility": True,
+        "easting": 0.0,
+        "northing": 0.0,
+        "altitude": 0.0,
+        "color": "#000000",
+    }
+    base.update(overrides)
+    return base
+
+
+def _polygon_kwargs(**overrides) -> dict:
+    base = {
+        "id": "pg_001",
+        "name": "P",
+        "alpha": 1.0,
+        "visibility": True,
+        "point_ids": ["pt_001", "pt_002", "pt_003"],
+        "is_convex": True,
+        "line_color": "#000000",
+        "fill_color": "#ffffff",
+    }
+    base.update(overrides)
+    return base
+
+
+def _ray_kwargs(**overrides) -> dict:
+    base = {
+        "id": "ry_001",
+        "name": "R",
+        "alpha": 1.0,
+        "visibility": True,
+        "origin_id": "pt_001",
+        "direction": 0.0,
+        "elevation": 0.0,
+        "direction_mode": DirectionMode.AZIMUTH,
+        "direction_units": DirectionUnits.RADIANS,
+        "line_color": "#000000",
+        "fill_color": "#ffffff",
+    }
+    base.update(overrides)
+    return base
+
+
+# Maps each concrete subclass to a no-arg builder that returns valid kwargs,
+# so the construction smoke test can reuse the per-type kwargs helpers above
+# without duplicating their field lists.
+_SUBCLASS_BUILDERS = {
+    Point: _point_kwargs,
+    Line: _line_kwargs,
+    Polygon: _polygon_kwargs,
+    Ray: _ray_kwargs,
+    Vector: _vector_kwargs,
+    Circle: _circle_kwargs,
+    Ball: _ball_kwargs,
+    Cylinder: _cylinder_kwargs,
+    Solid: _solid_kwargs,
+    Tangent: _tangent_kwargs,
+}
+
+
+@pytest.mark.parametrize(("cls", "expected_type"), SUBCLASS_TYPES)
+def test_all_concrete_subclasses_construct(cls, expected_type):
+    # Construction must succeed for every one of the ten concrete subclasses,
+    # each yielding a GeoObject whose ``type`` matches its canonical literal.
+    # The read-only-ness tests cover ``type``/``id`` immutability but not that
+    # a valid instance can be built for all ten in the first place.
+    obj = cls(**_SUBCLASS_BUILDERS[cls]())
+    assert isinstance(obj, GeoObject)
+    assert obj.type == expected_type
+
+
+@pytest.mark.parametrize("count", [0, 1, 2])
+def test_polygon_rejects_fewer_than_three_vertices(count):
+    # Spec MVP.md defines a polygon as "3 or more points"; fewer than 3 vertices
+    # is degenerate and rejected at construction.
+    point_ids = [f"pt_{i:03d}" for i in range(1, count + 1)]
+    with pytest.raises(ValueError, match="at least 3 vertices"):
+        Polygon(**_polygon_kwargs(point_ids=point_ids))
 
 
 def test_no_forbidden_imports():

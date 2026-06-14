@@ -37,10 +37,12 @@ max-returns = 12
 
 [tool.pylint.format]
 max-line-length = 100
-# tests/test_geometry.py is a single cohesive known-input/known-output suite
-# for the geometry service and naturally runs long; splitting it would only
-# duplicate fixtures. 1500 leaves headroom above the default 1000.
-max-module-lines = 1500
+# tests/test_geometry.py and tests/test_dep_graph.py are each single cohesive
+# suites (known-input/known-output for the geometry service; one-test-per-path
+# edge-table + invariant coverage for the dependency graph) that naturally run
+# long; splitting either would only duplicate fixtures. 1600 leaves headroom
+# above the default 1000.
+max-module-lines = 1600
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

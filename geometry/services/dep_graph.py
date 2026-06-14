@@ -211,6 +211,9 @@ class DependencyGraph:
         Safe to call repeatedly: any previously registered edges for ``obj_id``
         are removed first, so re-registration replaces rather than accumulates.
         An empty ``dep_ids`` (e.g. a Point) records the object with no edges.
+        A self-edge (``obj_id`` present in ``dep_ids``) is rejected — the
+        domain has no self-referential objects, so it is always a programming
+        error.
 
         Prefer :meth:`add` over calling this directly unless you called
         :meth:`deps_for_type` yourself and are passing its result directly —
@@ -236,8 +239,16 @@ class DependencyGraph:
             wording), if ``dep_ids`` contains an unhashable element (e.g. a
             ``list``), or if any element of ``dep_ids`` is not a ``str``.
         ValueError
-            If ``obj_id`` is an empty string, or if any element of ``dep_ids``
-            is an empty string.
+            If ``obj_id`` is an empty string, if any element of ``dep_ids``
+            is an empty string, or if ``obj_id`` appears in ``dep_ids`` (a
+            self-edge).
+        RuntimeError
+            If ``obj_id`` already has a present-but-``None`` ``_deps`` entry
+            (out-of-band corruption: the key exists, so the ``_EMPTY`` default
+            never applies, and the stale-edge cleanup loop would otherwise
+            iterate ``None`` and escape as a bare ``TypeError``). Logged and
+            raised with the same "bidirectional invariant violated" wording
+            :meth:`unregister` uses, before any edge is touched.
         """
         # Materialise and FULLY validate the new dependency set BEFORE any
         # mutation, so a bad input (None/empty obj_id or None/empty dep id)
@@ -281,10 +292,35 @@ class DependencyGraph:
                 )
         if "" in dep_set:
             raise ValueError("DependencyGraph.register: dep_ids must not contain empty strings")
+        # Reject a self-edge: the domain has no self-referential objects, so
+        # ``obj_id`` depending on itself is always a programming error. Checked
+        # after the set is fully built and element-validated, but BEFORE any
+        # mutation, so a rejected call leaves the graph untouched.
+        if obj_id in dep_set:
+            raise ValueError(
+                f"DependencyGraph.register: {obj_id!r} cannot depend on itself (self-edge)"
+            )
+
+        # Fetch obj_id's own forward edges once and reject a present-but-None
+        # value before iterating: a corrupted ``_deps[obj_id] = None`` would make
+        # the stale-edge cleanup loop iterate ``None`` — the key exists, so the
+        # ``_EMPTY`` default never applies — and escape as a bare TypeError,
+        # mirroring the guarantee :meth:`unregister` already provides.
+        own_deps = self._deps.get(obj_id, _EMPTY)
+        if own_deps is None:
+            _logger.error(
+                "DependencyGraph.register: %r has a None _deps value; "
+                "bidirectional invariant violated.",
+                obj_id,
+            )
+            raise RuntimeError(
+                f"DependencyGraph.register: {obj_id!r} has a None _deps value; "
+                f"bidirectional invariant violated."
+            )
 
         # Drop stale forward edges before re-adding, so re-registration with a
         # changed dependency set does not leave orphaned reverse edges behind.
-        for old_dep in self._deps.get(obj_id, _EMPTY):
+        for old_dep in own_deps:
             reverse = self._rdeps.get(old_dep)
             if reverse is not None:
                 reverse.discard(obj_id)
@@ -504,7 +540,13 @@ class DependencyGraph:
             check before any mutation, so the cascade's ``except RuntimeError``
             handler always fires and corruption never escapes as a bare
             ``TypeError``/``AttributeError``. The failure is logged with cascade
-            context before being re-raised.
+            context before being re-raised. Because each dependent is
+            unregistered in turn with no surrounding transaction, if the graph
+            is corrupted out-of-band the first ``k`` of ``n`` dependent
+            unregistrations may have already mutated the graph before the
+            failing pre-check fires on dependent ``k+1`` — there is no rollback,
+            so the graph may be left partially mutated. In normal operation
+            (all mutation via the public API) this cannot arise.
         """
         _logger.debug("cascade_unregister: root %r", obj_id)
         affected = self.dependents_of(obj_id)
@@ -833,10 +875,13 @@ def deps_for_type(obj: GeoObject) -> set[str]:  # pylint: disable=too-many-branc
                 )
             return {obj.point_a_id, obj.point_b_id}
         case "polygon":
-            # Polygon.__post_init__ does not enforce a minimum vertex
-            # count, so an empty point_ids list would otherwise register
-            # the polygon with no edges — indistinguishable from a Point
-            # and invisible to every cascade. Reject it here.
+            # Polygon.__post_init__ now rejects fewer than three vertices, so
+            # an empty/short point_ids list is only reachable for instances
+            # built outside the normal constructor (e.g. via
+            # ``object.__setattr__``). This guard remains as defense-in-depth —
+            # same rationale as the non-str element guards below — so such a
+            # malformed polygon never registers with no edges, which would be
+            # indistinguishable from a Point and invisible to every cascade.
             if not obj.point_ids:
                 raise ValueError(f"deps_for_type: polygon {obj.id!r} has no point references")
             if any(not isinstance(p, str) for p in obj.point_ids):

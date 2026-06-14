@@ -34,10 +34,11 @@ class Polygon(GeoObject):
     Fields
     ------
     point_ids : tuple[str, ...]
-        Ordered point IDs in CCW winding order. The constructor defensively
-        converts the supplied sequence to an immutable tuple independent of the
-        caller's reference (see Notes).  Must only be replaced by
-        ``ModifyPolygonVerticesCommand``.
+        Ordered point IDs in CCW winding order. A polygon must have **at least
+        3 vertices**, fewer is rejected with ``ValueError`` at construction.
+        The constructor defensively converts the supplied sequence to an
+        immutable tuple independent of the caller's reference (see Notes).
+        Must only be replaced by ``ModifyPolygonVerticesCommand``.
     is_convex : bool
         True if the polygon is convex; cached by the services layer.
         Must only be updated by ``PolygonService.create()`` and by
@@ -60,6 +61,10 @@ class Polygon(GeoObject):
     ``PolygonService.create()`` is the only initial setter for ``is_convex``.
     The two fields must stay coherent (``is_convex`` always reflects the
     current ``point_ids``), so they are co-owned by the same command path.
+
+    ``__post_init__`` performs structural validation: it rejects any vertex
+    count below 3 with ``ValueError`` (a polygon needs at least 3 points),
+    mirroring the layer-count check ``Solid.__post_init__`` enforces.
     """
 
     point_ids: tuple[str, ...]
@@ -71,3 +76,7 @@ class Polygon(GeoObject):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.point_ids = tuple(self.point_ids)
+        if len(self.point_ids) < 3:
+            raise ValueError(
+                f"Polygon {self.id!r} requires at least 3 vertices; got {len(self.point_ids)}"
+            )

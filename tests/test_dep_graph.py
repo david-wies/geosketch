@@ -322,6 +322,36 @@ def test_register_empty_dep_id_on_reregister_leaves_graph_consistent():
     graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
 
+def test_register_rejects_self_edge():
+    # The domain has no self-referential objects, so an obj_id depending on
+    # itself is always a programming error. The guard fires before any mutation,
+    # so a rejected call (whether self-edge alone or mixed with real deps) leaves
+    # both maps empty.
+    graph = DependencyGraph()
+    with pytest.raises(ValueError, match="self-edge"):
+        graph.register("pt_001", {"pt_001"})
+    with pytest.raises(ValueError, match="self-edge"):
+        graph.register("ln_001", {"pt_001", "ln_001"})
+    assert not graph._deps  # pylint: disable=protected-access
+    assert not graph._rdeps  # pylint: disable=protected-access
+
+
+def test_register_with_none_deps_value_raises_runtime_error(caplog):
+    # Out-of-band corruption: an object's _deps value is a present key bound to
+    # None (not a set). The stale-edge cleanup loop would iterate None and
+    # escape as a bare TypeError; the pre-mutation None guard must surface it as
+    # a RuntimeError instead, mirroring unregister's guarantee.
+    graph = DependencyGraph()
+    graph.register("ln_001", {"pt_001"})
+    graph._deps["ln_001"] = None  # type: ignore[assignment]  # pylint: disable=protected-access
+
+    with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="invariant"):
+        graph.register("ln_001", {"pt_002"})
+
+    assert "ln_001" in caplog.text
+    assert "_deps" in caplog.text
+
+
 def test_register_bare_str_dep_ids_raises_and_leaves_graph_unmutated():
     # A bare str is Iterable[str], so without the guard set("pt_001") would
     # shatter into single-character "deps" and corrupt the graph.
@@ -399,9 +429,12 @@ def test_dependents_of_terminates_on_a_two_node_cycle():
 
 def test_dependents_of_terminates_on_a_self_loop():
     # Pin termination contract only — the queried node appears in the result
-    # in a cycle, which is expected and impossible in production.
+    # in a cycle, which is expected and impossible in production. register() now
+    # rejects a self-edge, so the self-loop can only be reached by corrupting the
+    # private maps directly (the BFS only ever reads _rdeps, so seeding it alone
+    # is enough to exercise the visited-guard against an infinite loop).
     graph = DependencyGraph()
-    graph.register("x", {"x"})
+    graph._rdeps["x"] = {"x"}  # pylint: disable=protected-access
     assert graph.dependents_of("x") == {"x"}
 
 
@@ -634,13 +667,13 @@ def test_deps_for_type_returns_a_fresh_set_callers_cannot_corrupt():
     graph = DependencyGraph()
     pg = Polygon(
         **_env("pg"),
-        point_ids=["pt_001", "pt_002"],
+        point_ids=["pt_001", "pt_002", "pt_003"],
         is_convex=True,
         **_colors(),
     )
     deps = graph.deps_for_type(pg)
     deps.add("bogus")
-    assert graph.deps_for_type(pg) == {"pt_001", "pt_002"}
+    assert graph.deps_for_type(pg) == {"pt_001", "pt_002", "pt_003"}
 
 
 def test_deps_for_type_solid_with_duplicate_layers_collapses():
@@ -701,7 +734,9 @@ def test_deps_for_type_polygon_with_none_point_reference_raises():
     # None (None != ""), so the non-str element check is what fires here; raising
     # TypeError (not ValueError) keeps command code that catches TypeError to
     # detect model corruption from silently missing the polygon case.
-    pg = Polygon(**_env("pg"), point_ids=["pt_001", "pt_002"], is_convex=True, **_colors())
+    pg = Polygon(
+        **_env("pg"), point_ids=["pt_001", "pt_002", "pt_003"], is_convex=True, **_colors()
+    )
     object.__setattr__(pg, "point_ids", ["pt_001", None])
     with pytest.raises(TypeError, match="polygon 'pg_001' has non-str point reference"):
         DependencyGraph.deps_for_type(pg)
@@ -713,17 +748,23 @@ def test_add_polygon_with_none_point_id_raises_type_error():
     # and add()'s except TypeError branch re-raises it with the object id/type so
     # command code catching TypeError to detect corruption sees the polygon case.
     graph = DependencyGraph()
-    pg = Polygon(**_env("pg"), point_ids=["pt_001", "pt_002"], is_convex=True, **_colors())
+    pg = Polygon(
+        **_env("pg"), point_ids=["pt_001", "pt_002", "pt_003"], is_convex=True, **_colors()
+    )
     object.__setattr__(pg, "point_ids", ["pt_001", None])
     with pytest.raises(TypeError, match="pg_001"):
         graph.add(pg)
 
 
 def test_deps_for_type_polygon_with_no_points_raises():
-    # Polygon.__post_init__ does not enforce a minimum vertex count, so the
-    # empty list constructs cleanly; deps_for_type must reject it rather than
-    # silently registering an edgeless polygon.
-    pg = Polygon(**_env("pg"), point_ids=[], is_convex=True, **_colors())
+    # Polygon.__post_init__ now rejects fewer than three vertices, so an empty
+    # list can no longer be constructed normally; bypass the constructor (as the
+    # solid empty-layers test does) to reach deps_for_type's own guard, which
+    # must reject it rather than silently registering an edgeless polygon.
+    pg = Polygon(
+        **_env("pg"), point_ids=["pt_001", "pt_002", "pt_003"], is_convex=True, **_colors()
+    )
+    object.__setattr__(pg, "point_ids", [])
     with pytest.raises(ValueError, match="polygon 'pg_001' has no point references"):
         DependencyGraph.deps_for_type(pg)
 
@@ -848,6 +889,32 @@ def test_deps_for_type_tangent_with_empty_reference_raises(shape_id, point_id):
 # ---------------------------------------------------------------------------
 
 
+def test_deps_for_type_line_with_non_str_point_a_id_raises_type_error():
+    ln = Line(
+        **_env("ln"),
+        point_a_id="pt_001",
+        point_b_id="pt_002",
+        **_BEARING,
+        **_colors(),
+    )
+    object.__setattr__(ln, "point_a_id", 42)
+    with pytest.raises(TypeError, match="line 'ln_001' has non-str point_a_id"):
+        DependencyGraph.deps_for_type(ln)
+
+
+def test_deps_for_type_line_with_non_str_point_b_id_raises_type_error():
+    ln = Line(
+        **_env("ln"),
+        point_a_id="pt_001",
+        point_b_id="pt_002",
+        **_BEARING,
+        **_colors(),
+    )
+    object.__setattr__(ln, "point_b_id", 42)
+    with pytest.raises(TypeError, match="line 'ln_001' has non-str point_b_id"):
+        DependencyGraph.deps_for_type(ln)
+
+
 def test_deps_for_type_ray_with_non_str_origin_raises_type_error():
     ry = Ray(**_env("ry"), origin_id="pt_001", **_BEARING, **_colors())
     object.__setattr__(ry, "origin_id", 42)
@@ -946,7 +1013,9 @@ def test_deps_for_type_tangent_with_non_str_point_raises_type_error():
 def test_deps_for_type_polygon_with_non_str_element_raises_type_error():
     # A non-str element in a non-empty point_ids list raises TypeError (Item 2),
     # consistent with the scalar-field guards.
-    pg = Polygon(**_env("pg"), point_ids=["pt_001", "pt_002"], is_convex=True, **_colors())
+    pg = Polygon(
+        **_env("pg"), point_ids=["pt_001", "pt_002", "pt_003"], is_convex=True, **_colors()
+    )
     object.__setattr__(pg, "point_ids", ["pt_001", 42])
     with pytest.raises(TypeError, match="polygon 'pg_001' has non-str point reference"):
         DependencyGraph.deps_for_type(pg)
@@ -1278,6 +1347,22 @@ def test_cascade_unregister_unregistered_root_with_dependents_returns_dependents
     assert result == frozenset({"ln_001"})
     assert not graph.is_registered("ln_001")
     assert not graph.has_dependents("pt_001")
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
+
+
+def test_cascade_unregister_unregistered_root_with_transitive_dependents():
+    # pt_x never registered itself, but a transitive chain hangs off it via
+    # forward references: ln_1 depends on pt_x, and tg_1 depends on ln_1. The
+    # cascade must return the FULL transitive closure (both dependents), with
+    # the unregistered root excluded because it had no _deps entry to remove.
+    graph = DependencyGraph()
+    graph.register("ln_1", {"pt_x"})  # pt_x itself never registered
+    graph.register("tg_1", {"ln_1"})
+    result = graph.cascade_unregister("pt_x")
+    assert result == frozenset({"ln_1", "tg_1"})
+    assert not graph.is_registered("ln_1")
+    assert not graph.is_registered("tg_1")
+    assert not graph.has_dependents("pt_x")
     graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
 
