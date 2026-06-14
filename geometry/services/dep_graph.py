@@ -156,13 +156,31 @@ class DependencyGraph:
         AttributeError
             If ``obj.type`` is a known type but a required type-specific
             attribute is missing on the instance (model dataclass inconsistent
-            with its type discriminant).
+            with its type discriminant), or if ``obj`` is not a ``GeoObject`` at
+            all and lacks ``type``/``id`` — the latter is logged and re-raised
+            unchanged, naming ``add`` as the source.
+        RuntimeError
+            If :meth:`register` detects out-of-band corruption (a
+            present-but-``None`` ``_deps`` entry for ``obj.id``). Logged with the
+            object id and type for debugging context, then re-raised unchanged
+            (it signals graph corruption, not a caller input error).
         """
-        # Read type/id into locals before the try block: if obj lacks these
-        # base attributes, evaluating them inside the except format string would
-        # raise a second AttributeError inside the handler (double traceback).
-        obj_type = obj.type
-        obj_id = obj.id
+        # Read type/id into locals before the deps-derivation try block: if obj
+        # lacks these base attributes, evaluating them inside that block's except
+        # format strings would raise a second AttributeError inside the handler
+        # (double traceback). Guard the reads themselves so a caller passing a
+        # non-GeoObject surfaces a logged AttributeError that names add() as the
+        # source, rather than a bare one with no context.
+        try:
+            obj_type = obj.type
+            obj_id = obj.id
+        except AttributeError as exc:
+            _logger.error(
+                "DependencyGraph.add: obj missing 'type' or 'id'; expected GeoObject, got %s: %s",
+                type(obj).__name__,
+                exc,
+            )
+            raise
         # Validate the id here, before delegating: register() runs the same
         # guard, but its error message would blame register for what is an
         # add() caller's mistake.
@@ -204,6 +222,18 @@ class DependencyGraph:
                 f"DependencyGraph.add: cannot register type {obj_type!r} "
                 f"on object {obj_id!r}: {exc}"
             ) from exc
+        except RuntimeError as exc:
+            # register() raises RuntimeError only on out-of-band corruption (a
+            # present-but-None _deps[obj_id]); preserve it unchanged — it is not
+            # a caller input error like the branches above — but log the object
+            # id/type first so the failure carries the same debugging context.
+            _logger.error(
+                "DependencyGraph.add: RuntimeError for type %r on object %r: %s",
+                obj_type,
+                obj_id,
+                exc,
+            )
+            raise
 
     def register(self, obj_id: str, dep_ids: Iterable[str]) -> None:
         """Record that ``obj_id`` depends on every id in ``dep_ids``.
@@ -576,6 +606,46 @@ class DependencyGraph:
         _logger.debug("cascade_unregister: removed %d object(s) for root %r", len(removed), obj_id)
         return frozenset(removed)
 
+    def _reverse_dependents(self, key: str) -> AbstractSet[str]:
+        """Return ``_rdeps[key]`` (or empty), raising on a present-but-``None`` value.
+
+        Centralises the corruption guard that :meth:`dependents_of` needs at
+        both its seed fetch and every BFS hop. A corrupted ``_rdeps[key] = None``
+        (the key exists, so the ``_EMPTY`` default never applies) would otherwise
+        be iterated as ``None`` and escape as a bare ``TypeError`` — defeating
+        the module-wide guarantee that corruption surfaces as a logged
+        ``RuntimeError``, the same one :meth:`register` and :meth:`unregister`
+        provide.
+
+        Parameters
+        ----------
+        key : str
+            The id whose reverse edges to fetch.
+
+        Returns
+        -------
+        AbstractSet[str]
+            The dependents of ``key``; an empty frozenset when ``key`` has no
+            reverse edges.
+
+        Raises
+        ------
+        RuntimeError
+            If ``_rdeps[key]`` is present but bound to ``None``.
+        """
+        edges = self._rdeps.get(key, _EMPTY)
+        if edges is None:
+            _logger.error(
+                "DependencyGraph.dependents_of: %r has a None _rdeps value; "
+                "bidirectional invariant violated.",
+                key,
+            )
+            raise RuntimeError(
+                f"DependencyGraph.dependents_of: {key!r} has a None _rdeps value; "
+                f"bidirectional invariant violated."
+            )
+        return edges
+
     def dependents_of(self, obj_id: str) -> frozenset[str]:
         """Return the transitive closure of objects that depend on ``obj_id``.
 
@@ -615,16 +685,24 @@ class DependencyGraph:
             If ``obj_id`` is not a ``str`` (including ``None``).
         ValueError
             If ``obj_id`` is an empty string.
+        RuntimeError
+            If a reverse-edge entry (the seed ``_rdeps[obj_id]`` or any node
+            reached during the walk) is present but bound to ``None`` —
+            out-of-band corruption surfaced as a logged ``RuntimeError`` rather
+            than a bare ``TypeError``, consistent with :meth:`register` and
+            :meth:`unregister`. Because :meth:`cascade_unregister` calls this
+            before its ``try`` block, the same ``RuntimeError`` propagates from
+            there too (logged here, at the point of detection).
         """
         self._validate_obj_id(obj_id, "dependents_of")
         result: set[str] = set()
         queue: deque[str] = deque()
-        first_wave = self._rdeps.get(obj_id, _EMPTY)
+        first_wave = self._reverse_dependents(obj_id)
         result.update(first_wave)
         queue.extend(first_wave)
         while queue:
             current = queue.popleft()
-            for node in self._rdeps.get(current, _EMPTY):
+            for node in self._reverse_dependents(current):
                 if node not in result:
                     result.add(node)
                     queue.append(node)

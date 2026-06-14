@@ -42,7 +42,7 @@ from geometry.models import (
     Tangent,
     Vector,
 )
-from geometry.services.dep_graph import DependencyGraph
+from geometry.services.dep_graph import DependencyGraph, deps_for_type
 
 
 # ---------------------------------------------------------------------------
@@ -674,6 +674,21 @@ def test_deps_for_type_returns_a_fresh_set_callers_cannot_corrupt():
     deps = graph.deps_for_type(pg)
     deps.add("bogus")
     assert graph.deps_for_type(pg) == {"pt_001", "pt_002", "pt_003"}
+
+
+def test_module_level_deps_for_type_export_matches_static_alias():
+    # __all__ exports the module-level deps_for_type, but every other test reaches
+    # it through the DependencyGraph.deps_for_type alias. Exercise the bare import
+    # here so the export contract is pinned and the alias stays a pass-through.
+    ln = Line(
+        **_env("ln"),
+        point_a_id="pt_001",
+        point_b_id="pt_002",
+        **_BEARING,
+        **_colors(),
+    )
+    assert deps_for_type(ln) == {"pt_001", "pt_002"}
+    assert deps_for_type(ln) == DependencyGraph.deps_for_type(ln)
 
 
 def test_deps_for_type_solid_with_duplicate_layers_collapses():
@@ -1488,6 +1503,28 @@ def test_cascade_unregister_none_valued_dependent_deps_raises_runtime_error(capl
     with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="invariant"):
         graph.cascade_unregister("pt_001")
 
+    assert "cascade_unregister" in caplog.text
+    assert "ln_001" in caplog.text
+
+
+def test_cascade_unregister_partial_mutation_has_no_rollback(caplog):
+    # The cascade unregisters in turn with no transaction, so a RuntimeError
+    # mid-cascade leaves the graph partially mutated ("no rollback" per the
+    # docstring). Deterministic because dependents are always processed before
+    # the root: clean ln_001 is removed first, then the root pt_001 — whose _deps
+    # is corrupted to None — trips unregister's pre-mutation guard. ln_001 must
+    # stay removed; a future change adding rollback would restore it and fail.
+    graph = DependencyGraph()
+    graph.register("ln_001", {"pt_001"})
+    # pt_001 registered-but-corrupted (present key bound to None); _rdeps[pt_001]
+    # is left intact so the cascade reaches the corrupted root.
+    graph._deps["pt_001"] = None  # type: ignore[assignment]  # pylint: disable=protected-access
+
+    with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="invariant"):
+        graph.cascade_unregister("pt_001")
+
+    assert not graph.is_registered("ln_001")  # removed, not rolled back
+    assert graph.is_registered("pt_001")  # cascade aborted before clearing root
     assert "cascade_unregister" in caplog.text
     assert "ln_001" in caplog.text
 

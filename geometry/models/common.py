@@ -93,14 +93,27 @@ class GeoObject:
             raise ValueError(f"GeoObject.alpha must be in [0.0, 1.0]; got {self.alpha!r}")
 
     def __setattr__(self, name: str, value: Any) -> None:
-        # ``hasattr`` works because ``@dataclass`` consumes the ``Field``
-        # descriptors during class creation: ``type`` is *not* retained as a
-        # class-level value, so before its first ``__init__`` assignment neither
-        # ``type`` nor ``id`` has an instance-``__dict__`` entry and ``hasattr``
-        # is False — construction proceeds. On any later assignment the
-        # instance-dict entry already exists, ``hasattr`` is True, and the guard
-        # fires. (``name in self.__dict__`` would behave identically here; the
-        # comment rationale, not the mechanism, was the bug being fixed.)
+        # Construction safety: this guard must not fire when @dataclass sets the
+        # fields during __init__. The two guarded fields reach that point by
+        # different routes, so the reason the guard stays silent differs:
+        #
+        # * ``id`` (init=True, no default) — the generated __init__ runs
+        #   ``self.id = <arg>``, which DOES call __setattr__. At that moment
+        #   ``hasattr(self, 'id')`` is False: there is no class-level default and
+        #   no prior instance assignment, so the guard does not fire. A later
+        #   reassignment finds the instance-dict entry, ``hasattr`` is True, and
+        #   the guard fires.
+        # * ``type`` (init=False, default=<literal> on each concrete subclass) —
+        #   the dataclass stores that literal as a CLASS-level attribute, so
+        #   ``hasattr(self, 'type')`` is already True before __init__ even runs.
+        #   The guard still does not fire, but for a different reason: for an
+        #   init=False field with a plain default the generated __init__ emits
+        #   NO assignment at all, so __setattr__ is simply never called for
+        #   ``type`` during construction. The class-level literal serves every
+        #   instance. (Note: ``name in self.__dict__`` would NOT be equivalent
+        #   for ``type`` — it is False both during and after construction since
+        #   ``type`` lives on the class, never the instance — so ``hasattr`` is
+        #   the correct probe here, not an interchangeable one.)
         if name in ("type", "id") and hasattr(self, name):
             raise AttributeError(f"{name!r} is read-only post-construction")
         super().__setattr__(name, value)
