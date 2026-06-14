@@ -414,6 +414,16 @@ def test_has_dependents_empty_obj_id_raises():
         graph.has_dependents("")
 
 
+def test_has_dependents_true_when_dependent_exists():
+    # Positive path: an object that something depends on reports True, while the
+    # dependent itself (a leaf nothing references) reports False.
+    graph = DependencyGraph()
+    graph.register("pt_001", set())
+    graph.register("ci_001", {"pt_001"})
+    assert graph.has_dependents("pt_001")
+    assert not graph.has_dependents("ci_001")
+
+
 def test_dependents_of_terminates_on_a_two_node_cycle():
     # The real domain is a DAG, but the BFS visited-guard is the only thing
     # preventing an infinite loop should a cyclic reverse edge ever exist.

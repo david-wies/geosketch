@@ -30,7 +30,8 @@ derives the correct dependency set from the object's type automatically. Call
 The graph stores only IDs — it never holds model instances — so it cannot leak
 references and stays valid across save/load as long as the create/delete
 commands keep it in sync via :meth:`DependencyGraph.add` and
-:meth:`DependencyGraph.unregister`. It imports only the model dataclasses
+:meth:`DependencyGraph.cascade_unregister` (or :meth:`DependencyGraph.unregister`
+for a single already-isolated object). It imports only the model dataclasses
 (:mod:`geometry.models`); no ``tkinter`` or ``matplotlib``.
 """
 
@@ -186,9 +187,14 @@ class DependencyGraph:
         # add() caller's mistake.
         self._validate_obj_id(obj_id, "add")
         _logger.debug("add: registering %r (type=%r)", obj_id, obj_type)
+        # Two separate try blocks: deps_for_type can raise AttributeError (a
+        # known type whose type-specific attribute is missing), ValueError, or
+        # TypeError, whereas register never raises AttributeError. Keeping the
+        # AttributeError handler scoped to deps_for_type alone makes it
+        # structurally impossible to mislabel a register failure as an
+        # attribute-derivation failure.
         try:
             dep_ids = deps_for_type(obj)
-            self.register(obj_id, dep_ids)
         except AttributeError as exc:
             _logger.error(
                 "DependencyGraph.add: AttributeError for type %r on object %r: %s",
@@ -200,6 +206,31 @@ class DependencyGraph:
                 f"DependencyGraph.add: expected attributes for type {obj_type!r} "
                 f"missing on object {obj_id!r}: {exc}"
             ) from exc
+        except ValueError as exc:
+            _logger.error(
+                "DependencyGraph.add: ValueError for type %r on object %r: %s",
+                obj_type,
+                obj_id,
+                exc,
+            )
+            raise ValueError(
+                f"DependencyGraph.add: cannot register type {obj_type!r} "
+                f"on object {obj_id!r}: {exc}"
+            ) from exc
+        except TypeError as exc:
+            _logger.error(
+                "DependencyGraph.add: TypeError for type %r on object %r: %s",
+                obj_type,
+                obj_id,
+                exc,
+            )
+            raise TypeError(
+                f"DependencyGraph.add: cannot register type {obj_type!r} "
+                f"on object {obj_id!r}: {exc}"
+            ) from exc
+
+        try:
+            self.register(obj_id, dep_ids)
         except ValueError as exc:
             _logger.error(
                 "DependencyGraph.add: ValueError for type %r on object %r: %s",
@@ -472,10 +503,12 @@ class DependencyGraph:
             if obj_id not in self._rdeps.get(dep_id, _EMPTY):
                 _logger.error(
                     "DependencyGraph.unregister: _deps[%r] lists dep %r "
-                    "but _rdeps[%r] has no back-edge; bidirectional invariant violated.",
+                    "but _rdeps[%r] has no back-edge (actual: %r); "
+                    "bidirectional invariant violated.",
                     obj_id,
                     dep_id,
                     dep_id,
+                    self._rdeps.get(dep_id),
                 )
                 raise RuntimeError(
                     f"DependencyGraph.unregister: _deps[{obj_id!r}] lists dep "
@@ -532,10 +565,10 @@ class DependencyGraph:
         * ``obj_id`` registered, with dependents — all dependents plus
           ``obj_id``.
         * ``obj_id`` registered, no dependents — ``frozenset({obj_id})``.
-        * ``obj_id`` not registered, but referenced by registered dependents
-          (a forward reference: others were registered naming it before it
-          registered itself) — the dependents only; ``obj_id`` is excluded
-          because it had no ``_deps`` entry to remove.
+        * ``obj_id`` not registered but referenced by registered dependents
+          (present only in ``_rdeps``, never had a ``_deps`` entry — a stable,
+          fully supported pattern, not a transitional state) — the dependents
+          only; ``obj_id`` is excluded because it was never registered.
         * ``obj_id`` completely unknown — ``frozenset()``; no mutation occurs.
 
         Parameters
@@ -589,7 +622,13 @@ class DependencyGraph:
             if root_registered:
                 self.unregister(obj_id)
                 removed.add(obj_id)
-        except RuntimeError:
+        except Exception:  # pylint: disable=broad-exception-caught
+            # Broad by design: unregister may raise RuntimeError (out-of-band
+            # corruption) but also TypeError/ValueError (a non-str or empty id
+            # surfaced mid-cascade). Catch every failure so the partial cascade
+            # state is logged before re-raising — the canonical log-then-reraise
+            # pattern — then re-raise unchanged so callers still see the original
+            # exception type.
             _logger.error(
                 "DependencyGraph.cascade_unregister: failed while unregistering cascade "
                 "for root %r; affected_count=%d; removed_ids_so_far=%r",
