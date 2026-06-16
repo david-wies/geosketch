@@ -15,6 +15,7 @@
 import enum
 import math
 from dataclasses import dataclass
+from typing import Any
 
 
 class DirectionMode(enum.Enum):
@@ -56,10 +57,9 @@ class GeoObject:
         ``"cylinder"``, ``"solid"``, ``"tangent"``).
         Distinct from the 2-letter ID prefix used in ``id`` (``pt`` for a
         Point, ``ln`` for a Line, etc.). Pinned at construction time via
-        ``field(init=False, default=...)`` on every concrete subclass; treat
-        it as a read-only class invariant after construction (post-init
-        reassignment is technically legal because the dataclass is mutable,
-        but no code outside of test fixtures should rely on that).
+        ``field(init=False, default=...)`` on every concrete subclass.
+        Read-only after construction — ``__setattr__`` raises
+        ``AttributeError`` on any post-init reassignment attempt.
     alpha : float
         Opacity in [0.0, 1.0].
     visibility : bool
@@ -82,11 +82,41 @@ class GeoObject:
                 "subclasses (Point, Line, Polygon, Ray, Vector, Circle, "
                 "Ball, Cylinder, Solid, Tangent)."
             )
+
+        if not isinstance(self.id, str):
+            raise TypeError(f"GeoObject.id must be a str, got {type(self.id).__name__}")
+
         # Enforced here so all ten concrete subclasses inherit the check via
         # their ``super().__post_init__()`` call; ``nan``/out-of-range opacity
         # would otherwise construct cleanly and silently corrupt rendering.
         if not math.isfinite(self.alpha) or not 0.0 <= self.alpha <= 1.0:
             raise ValueError(f"GeoObject.alpha must be in [0.0, 1.0]; got {self.alpha!r}")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # Construction safety: this guard must not fire when @dataclass sets the
+        # fields during __init__. The two guarded fields reach that point by
+        # different routes, so the reason the guard stays silent differs:
+        #
+        # * ``id`` (init=True, no default) — the generated __init__ runs
+        #   ``self.id = <arg>``, which DOES call __setattr__. At that moment
+        #   ``hasattr(self, 'id')`` is False: there is no class-level default and
+        #   no prior instance assignment, so the guard does not fire. A later
+        #   reassignment finds the instance-dict entry, ``hasattr`` is True, and
+        #   the guard fires.
+        # * ``type`` (init=False, default=<literal> on each concrete subclass) —
+        #   the dataclass stores that literal as a CLASS-level attribute, so
+        #   ``hasattr(self, 'type')`` is already True before __init__ even runs.
+        #   The guard still does not fire, but for a different reason: for an
+        #   init=False field with a plain default the generated __init__ emits
+        #   NO assignment at all, so __setattr__ is simply never called for
+        #   ``type`` during construction. The class-level literal serves every
+        #   instance. (Note: ``name in self.__dict__`` would NOT be equivalent
+        #   for ``type`` — it is False both during and after construction since
+        #   ``type`` lives on the class, never the instance — so ``hasattr`` is
+        #   the correct probe here, not an interchangeable one.)
+        if name in ("type", "id") and hasattr(self, name):
+            raise AttributeError(f"{name!r} is read-only post-construction")
+        super().__setattr__(name, value)
 
 
 @dataclass

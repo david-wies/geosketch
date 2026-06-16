@@ -176,6 +176,8 @@ After completing a PR review, **always post the findings as a comment on the PR*
 
 When a PR includes a **Test Plan** section (a checklist of test steps), **execute every step** as part of the review — even if the checklist items are already marked done. After running each step, update the comment to mark passing items with `[x]` and failing items with a note. Do this on every review pass, including re-reviews before merge, so the test plan reflects the current state of the code.
 
+**Verifying prior review issues is always done by reading the actual files** — never by relying on commit messages, PR comment text, or agent reports alone. For each previously raised issue, read the relevant file and line(s) to confirm the fix is present. Grepping for a function name does not count; read the body. Claiming an issue is resolved without file-level evidence is not acceptable.
+
 ### Issue implementation
 When implementing an issue that contains **Acceptance Criteria** and/or a **Definition of Done**, treat each item as a gate:
 1. After finishing implementation, go through every Acceptance Criterion and every Definition of Done item one by one and verify it is satisfied.

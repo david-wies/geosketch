@@ -19,7 +19,7 @@ from geometry.models.common import GeoObject
 
 @dataclass
 class Polygon(GeoObject):
-    """A polygon defined by an ordered list of point IDs.
+    """A polygon defined by an ordered tuple of point IDs.
 
     Vertex order is CCW — the services layer enforces winding order on
     creation and modification; this model stores the result as-is.
@@ -27,19 +27,18 @@ class Polygon(GeoObject):
     ``is_convex`` is set by the services layer (using the cross-product
     method) on creation and after any modification.
 
-    The ``point_ids`` list is **defensively copied** in ``__post_init__`` so
-    that two Polygons constructed from the same source list do not share
-    the same list object — without this, mutating one polygon's vertex list
-    via ``ModifyPolygonVerticesCommand`` would silently alter every polygon
-    that aliased it.
+    The ``point_ids`` sequence is **defensively converted** to a tuple in
+    ``__post_init__`` so that polygon vertex membership cannot be mutated in
+    place through an aliased source object.
 
     Fields
     ------
-    point_ids : list[str]
-        Ordered point IDs in CCW winding order. The constructor defensively
-        copies the supplied list so the polygon always owns a fresh list
-        independent of the caller's reference (see Notes).  Must only be
-        modified by ``ModifyPolygonVerticesCommand``.
+    point_ids : tuple[str, ...]
+        Ordered point IDs in CCW winding order. A polygon must have **at least
+        3 vertices**, fewer is rejected with ``ValueError`` at construction.
+        The constructor defensively converts the supplied sequence to an
+        immutable tuple independent of the caller's reference (see Notes).
+        Must only be replaced by ``ModifyPolygonVerticesCommand``.
     is_convex : bool
         True if the polygon is convex; cached by the services layer.
         Must only be updated by ``PolygonService.create()`` and by
@@ -62,9 +61,13 @@ class Polygon(GeoObject):
     ``PolygonService.create()`` is the only initial setter for ``is_convex``.
     The two fields must stay coherent (``is_convex`` always reflects the
     current ``point_ids``), so they are co-owned by the same command path.
+
+    ``__post_init__`` performs structural validation: it rejects any vertex
+    count below 3 with ``ValueError`` (a polygon needs at least 3 points),
+    mirroring the layer-count check ``Solid.__post_init__`` enforces.
     """
 
-    point_ids: list[str]
+    point_ids: tuple[str, ...]
     is_convex: bool
     line_color: str
     fill_color: str
@@ -72,4 +75,8 @@ class Polygon(GeoObject):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        self.point_ids = list(self.point_ids)
+        self.point_ids = tuple(self.point_ids)
+        if len(self.point_ids) < 3:
+            raise ValueError(
+                f"Polygon {self.id!r} requires at least 3 vertices; got {len(self.point_ids)}"
+            )

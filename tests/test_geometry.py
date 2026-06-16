@@ -57,7 +57,7 @@ def _pt(pid: str, easting: float, northing: float, altitude: float = 0.0) -> Poi
     )
 
 
-def _poly(pid: str, point_ids: list[str], name: str = "poly") -> Polygon:
+def _poly(pid: str, point_ids: tuple[str, ...], name: str = "poly") -> Polygon:
     return Polygon(
         id=pid,
         name=name,
@@ -217,7 +217,7 @@ def test_signed_area_ccw_is_positive():
 
 def test_signed_area_cw_is_negative():
     pts, poly = _unit_square()
-    poly.point_ids = list(reversed(poly.point_ids))
+    poly.point_ids = tuple(reversed(poly.point_ids))
     assert geo.signed_area(poly, pts) == pytest.approx(-4.0)
 
 
