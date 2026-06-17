@@ -111,6 +111,10 @@ def validate_polygon_non_degenerate(polygon: Polygon, points: Mapping[str, Point
     ------
     ValueError
         If ``abs(signed_area) < EPS_AREA``.
+    KeyError
+        If a point ID in ``polygon.point_ids`` is absent from ``points`` (a
+        programmer error under the documented precondition that
+        :func:`validate_reference_exists` runs on every vertex first).
     """
     area = abs(float(geo.signed_area(polygon, points)))
     if area < EPS_AREA:
@@ -143,6 +147,10 @@ def validate_polygon_simple(polygon: Polygon, points: Mapping[str, Point]) -> No
     ValueError
         If the polygon has fewer than 3 vertices (a degenerate ring that
         shapely cannot construct), or if its boundary is self-intersecting.
+    KeyError
+        If a point ID in ``polygon.point_ids`` is absent from ``points`` (a
+        programmer error under the documented precondition that
+        :func:`validate_reference_exists` runs on every vertex first).
     """
     if len(polygon.point_ids) < 3:
         raise ValueError(
@@ -207,8 +215,11 @@ def validate_circle_tangent_point(center: Point, surface_point: Point, radius: f
     Raises
     ------
     ValueError
-        If ``abs(horizontal_distance - radius) >= EPS_DISTANCE``.
+        If ``radius`` is non-finite (``nan`` or ``±inf``), or if
+        ``abs(horizontal_distance - radius) >= EPS_DISTANCE``.
     """
+    if not math.isfinite(radius):
+        raise ValueError(f"Radius must be finite; got {radius!r}")
     horizontal = math.hypot(
         surface_point.easting - center.easting, surface_point.northing - center.northing
     )
@@ -242,8 +253,11 @@ def validate_ball_tangent_point(center: Point, surface_point: Point, radius: flo
     Raises
     ------
     ValueError
-        If ``abs(distance_3d - radius) >= EPS_DISTANCE``.
+        If ``radius`` is non-finite (``nan`` or ``±inf``), or if
+        ``abs(distance_3d - radius) >= EPS_DISTANCE``.
     """
+    if not math.isfinite(radius):
+        raise ValueError(f"Radius must be finite; got {radius!r}")
     dist = float(geo.distance(center, surface_point))
     error = abs(dist - radius)
     if error >= EPS_DISTANCE:
@@ -293,10 +307,16 @@ def validate_ball_tangent_perpendicular(
     Raises
     ------
     ValueError
-        If ``center`` and ``surface_point`` coincide (the radius has no
-        direction, so perpendicularity is undefined), or if
+        If ``tangent_direction`` or ``tangent_elevation`` is non-finite
+        (``nan`` or ``±inf``), if ``center`` and ``surface_point`` coincide
+        (the radius has no direction, so perpendicularity is undefined), or if
         ``abs(dot) >= EPS_ANGLE`` (the tangent is not perpendicular).
     """
+    if not math.isfinite(tangent_direction) or not math.isfinite(tangent_elevation):
+        raise ValueError(
+            f"Ball tangent direction and elevation must be finite; got "
+            f"direction {tangent_direction!r}, elevation {tangent_elevation!r}"
+        )
     radius_vec = np.array(
         [
             surface_point.easting - center.easting,

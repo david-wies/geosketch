@@ -153,6 +153,18 @@ def test_polygon_simple_rejects_bowtie():
         val.validate_polygon_simple(poly, pts)
 
 
+def test_polygon_simple_rejects_fewer_than_three_vertices():
+    # The Polygon constructor rejects < 3, so build a valid triangle then shrink
+    # point_ids to exercise validate_polygon_simple's own < 3 short-circuit
+    # (distinct from validate_polygon_vertex_count). The points dict still
+    # resolves both IDs so the count guard fires before any KeyError.
+    pts = {"v0": _pt("v0", 0, 0), "v1": _pt("v1", 2, 0), "v2": _pt("v2", 1, 2)}
+    poly = _poly("pg_v", ("v0", "v1", "v2"))
+    poly.point_ids = ("v0", "v1")
+    with pytest.raises(ValueError, match="at least 3 vertices"):
+        val.validate_polygon_simple(poly, pts)
+
+
 # ---------------------------------------------------------------------------
 # polygon vertex count
 # ---------------------------------------------------------------------------
@@ -195,6 +207,13 @@ def test_circle_tangent_point_rejects_off_circumference():
         val.validate_circle_tangent_point(_pt("c", 0, 0), _pt("p", 3, 4), 4.0)
 
 
+def test_circle_tangent_point_rejects_nan_radius():
+    # A NaN radius makes |distance - radius| NaN, which compares False against
+    # the tolerance and would slip the gate silently; the finite guard rejects it.
+    with pytest.raises(ValueError, match="finite"):
+        val.validate_circle_tangent_point(_pt("c", 0, 0), _pt("p", 3, 4), math.nan)
+
+
 # ---------------------------------------------------------------------------
 # ball tangent point (3D)
 # ---------------------------------------------------------------------------
@@ -232,6 +251,13 @@ def test_ball_tangent_point_boundary_at_tolerance_rejects():
     radius = 5.0 - EPS_DISTANCE
     with pytest.raises(ValueError, match="ball"):
         val.validate_ball_tangent_point(_pt("c", 0, 0, 0.0), _pt("p", 0, 3, 4.0), radius)
+
+
+def test_ball_tangent_point_rejects_nan_radius():
+    # A NaN radius makes |distance - radius| NaN, which compares False against
+    # the tolerance and would slip the gate silently; the finite guard rejects it.
+    with pytest.raises(ValueError, match="finite"):
+        val.validate_ball_tangent_point(_pt("c", 0, 0, 0.0), _pt("p", 3, 4, 12.0), math.nan)
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +308,21 @@ def test_ball_tangent_perpendicular_boundary_over_tolerance_rejects():
     az = EPS_ANGLE * 10
     with pytest.raises(ValueError, match="perpendicular"):
         val.validate_ball_tangent_perpendicular(_pt("c", 0, 0, 0.0), _pt("p", 1, 0, 0.0), az, 0.0)
+
+
+@pytest.mark.parametrize(
+    ("direction", "elevation"),
+    [(math.nan, 0.0), (0.0, math.nan), (math.inf, 0.0)],
+)
+def test_ball_tangent_perpendicular_rejects_non_finite_angle(direction, elevation):
+    # A non-finite azimuth or elevation yields a NaN dot product, which compares
+    # False against the tolerance and would be silently admitted as
+    # "perpendicular"; the finite guard rejects it. Centre/surface point are a
+    # valid finite due-East radius so only the angle guard is exercised.
+    with pytest.raises(ValueError, match="finite"):
+        val.validate_ball_tangent_perpendicular(
+            _pt("c", 0, 0, 0.0), _pt("p", 1, 0, 0.0), direction, elevation
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +419,22 @@ def test_solid_layers_rejects_too_few():
     objects = _solid_objects()
     with pytest.raises(ValueError, match="at least 2 layers"):
         val.validate_solid_layers(["pg_a"], objects)
+
+
+def test_solid_layers_rejects_empty():
+    # An empty layer list also trips the < 2 guard (zero layers, no extent).
+    objects = _solid_objects()
+    with pytest.raises(ValueError, match="at least 2 layers"):
+        val.validate_solid_layers([], objects)
+
+
+def test_solid_layers_accepts_duplicate_layer_id():
+    # Pins CURRENT behavior per the round-4 review: validate_solid_layers does
+    # not reject a layer ID repeated within the stack, so two references to the
+    # same valid polygon pass. (Rejecting duplicates is intentionally out of
+    # scope here; this test guards against silently changing that behavior.)
+    objects = _solid_objects()
+    val.validate_solid_layers(["pg_001", "pg_001"], {"pg_001": objects["pg_a"]})
 
 
 def test_solid_layers_rejects_missing_object():
