@@ -1,0 +1,434 @@
+# Copyright 2026 David Wies
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for ``geometry.services.validation`` (issue #14).
+
+Each of the twelve validators gets at least one valid case (does not raise)
+and one invalid case (raises ``ValueError``), plus boundary cases where the
+tolerance edge or a structural sub-rule deserves explicit coverage. Inputs are
+exact (3-4-5 triangles, axis-aligned squares, unit radii) so the assertions do
+not depend on floating-point noise beyond a tight tolerance.
+"""
+
+from __future__ import annotations
+
+import math
+
+import pytest
+
+from geometry.models.ball import Ball
+from geometry.models.circle import Circle
+from geometry.models.point import Point
+from geometry.models.polygon import Polygon
+from geometry.models.solid import Solid
+from geometry.services import validation as val
+from geometry.utils.constants import EPS_DISTANCE
+
+# ---------------------------------------------------------------------------
+# builders
+# ---------------------------------------------------------------------------
+
+
+# A single ``_envelope`` collapses the five model builders below to one-line
+# constructor calls. This keeps them readable, removes the intra-file
+# repetition of the shared ``alpha``/``visibility``/colour fields, and (by
+# design) makes the builder call shapes structurally distinct from the
+# multi-line keyword blocks in ``test_geometry.py`` so pylint's duplicate-code
+# (R0801) check does not flag the two suites as overlapping.
+_LINE = "#000000"
+_FILL = "#cccccc"
+
+
+def _envelope(pid: str, name: str | None = None) -> dict[str, object]:
+    """Shared ``GeoObject`` envelope kwargs (id, name, alpha, visibility)."""
+    return {"id": pid, "name": name or pid, "alpha": 1.0, "visibility": True}
+
+
+def _pt(pid: str, easting: float, northing: float, altitude: float = 0.0) -> Point:
+    return Point(
+        **_envelope(pid),
+        easting=float(easting),
+        northing=float(northing),
+        altitude=float(altitude),
+        color=_LINE,
+    )
+
+
+def _poly(pid: str, point_ids: tuple[str, ...], name: str = "poly") -> Polygon:
+    return Polygon(
+        **_envelope(pid, name),
+        point_ids=point_ids,
+        is_convex=False,
+        line_color=_LINE,
+        fill_color=_FILL,
+    )
+
+
+def _circle(pid: str, center_id: str, radius: float) -> Circle:
+    return Circle(
+        **_envelope(pid),
+        center_id=center_id,
+        radius=float(radius),
+        line_color=_LINE,
+        fill_color=_FILL,
+    )
+
+
+def _ball(pid: str, center_id: str, radius: float) -> Ball:
+    return Ball(
+        **_envelope(pid),
+        center_id=center_id,
+        radius=float(radius),
+        line_color=_LINE,
+        fill_color=_FILL,
+    )
+
+
+def _solid(pid: str, layers: tuple[str, ...]) -> Solid:
+    return Solid(**_envelope(pid), layers=layers, line_color=_LINE, fill_color=_FILL)
+
+
+def _unit_square(prefix: str = "s") -> tuple[dict[str, Point], Polygon]:
+    """CCW square with corners at (0,0),(2,0),(2,2),(0,2)."""
+    corners = ((0, 0), (2, 0), (2, 2), (0, 2))
+    pts = {f"{prefix}{i}": _pt(f"{prefix}{i}", e, n) for i, (e, n) in enumerate(corners)}
+    poly = _poly(f"pg_{prefix}", tuple(pts))
+    return pts, poly
+
+
+# ---------------------------------------------------------------------------
+# polygon non-degenerate
+# ---------------------------------------------------------------------------
+
+
+def test_polygon_non_degenerate_valid_square():
+    pts, poly = _unit_square()
+    val.validate_polygon_non_degenerate(poly, pts)  # 2x2 square, area 4 -> ok
+
+
+def test_polygon_non_degenerate_rejects_collinear():
+    # Three collinear points enclose zero area -> degenerate.
+    pts = {
+        "k0": _pt("k0", 0, 0),
+        "k1": _pt("k1", 1, 1),
+        "k2": _pt("k2", 2, 2),
+    }
+    poly = _poly("pg_k", ("k0", "k1", "k2"))
+    with pytest.raises(ValueError, match="degenerate"):
+        val.validate_polygon_non_degenerate(poly, pts)
+
+
+# ---------------------------------------------------------------------------
+# polygon simple
+# ---------------------------------------------------------------------------
+
+
+def test_polygon_simple_valid_square():
+    pts, poly = _unit_square()
+    val.validate_polygon_simple(poly, pts)  # axis-aligned square is simple
+
+
+def test_polygon_simple_rejects_bowtie():
+    # A self-intersecting "bowtie": swapping the last two corners crosses the
+    # diagonals, producing a figure-eight boundary.
+    pts = {
+        "b0": _pt("b0", 0, 0),
+        "b1": _pt("b1", 2, 0),
+        "b2": _pt("b2", 0, 2),
+        "b3": _pt("b3", 2, 2),
+    }
+    poly = _poly("pg_b", ("b0", "b1", "b2", "b3"))
+    with pytest.raises(ValueError, match="self-intersecting"):
+        val.validate_polygon_simple(poly, pts)
+
+
+# ---------------------------------------------------------------------------
+# polygon vertex count
+# ---------------------------------------------------------------------------
+
+
+def test_polygon_vertex_count_valid_triangle():
+    poly = _poly("pg_t", ("t0", "t1", "t2"))  # exactly 3 vertices -> ok
+    val.validate_polygon_vertex_count(poly)
+
+
+def test_polygon_vertex_count_rejects_two():
+    # The Polygon constructor rejects < 3, so a 2-vertex polygon cannot be
+    # built directly; construct a valid triangle then shrink point_ids to
+    # exercise the validator's own guard.
+    poly = _poly("pg_t", ("t0", "t1", "t2"))
+    object.__setattr__(poly, "point_ids", ("t0", "t1"))
+    with pytest.raises(ValueError, match="at least 3 vertices"):
+        val.validate_polygon_vertex_count(poly)
+
+
+# ---------------------------------------------------------------------------
+# circle tangent point (2D)
+# ---------------------------------------------------------------------------
+
+
+def test_circle_tangent_point_valid_on_circumference():
+    # Centre at origin, radius 5, point at (3,4): 2D distance == 5 -> ok.
+    val.validate_circle_tangent_point(_pt("c", 0, 0), _pt("p", 3, 4), 5.0)
+
+
+def test_circle_tangent_point_ignores_altitude():
+    # A circle is planar: the same (3,4) point lifted 100 m still has horizontal
+    # distance 5, so it must pass even though its 3D distance is far from 5.
+    val.validate_circle_tangent_point(_pt("c", 0, 0, 0.0), _pt("p", 3, 4, 100.0), 5.0)
+
+
+def test_circle_tangent_point_rejects_off_circumference():
+    # 2D distance 5 but radius declared 4 -> off the circumference.
+    with pytest.raises(ValueError, match="circle"):
+        val.validate_circle_tangent_point(_pt("c", 0, 0), _pt("p", 3, 4), 4.0)
+
+
+# ---------------------------------------------------------------------------
+# ball tangent point (3D)
+# ---------------------------------------------------------------------------
+
+
+def test_ball_tangent_point_valid_on_surface():
+    # 3-4-12-13 quadruple: 3D distance from origin to (3,4,12) is 13 -> ok.
+    val.validate_ball_tangent_point(_pt("c", 0, 0, 0.0), _pt("p", 3, 4, 12.0), 13.0)
+
+
+def test_ball_tangent_point_rejects_using_2d_distance():
+    # Horizontal distance is 5, but the true 3D distance is 13; passing radius 5
+    # (the 2D value) must be rejected, proving the check is genuinely 3D.
+    with pytest.raises(ValueError, match="ball"):
+        val.validate_ball_tangent_point(_pt("c", 0, 0, 0.0), _pt("p", 3, 4, 12.0), 5.0)
+
+
+def test_ball_tangent_point_uses_real_ball_radius():
+    # Drive the check from a real Ball's radius field (not a bare float), the way
+    # the command layer would: a unit ball with a surface point at distance 1.
+    ball = _ball("ba_001", "c", 1.0)
+    val.validate_ball_tangent_point(_pt("c", 0, 0, 0.0), _pt("p", 0, 0, 1.0), ball.radius)
+
+
+# ---------------------------------------------------------------------------
+# ball tangent perpendicular
+# ---------------------------------------------------------------------------
+
+
+def test_ball_tangent_perpendicular_valid():
+    # Radius points due East (surface point at (1,0,0)). A tangent pointing due
+    # North (azimuth 0, elevation 0) is perpendicular to it.
+    val.validate_ball_tangent_perpendicular(_pt("c", 0, 0, 0.0), _pt("p", 1, 0, 0.0), 0.0, 0.0)
+
+
+def test_ball_tangent_perpendicular_valid_vertical_radius():
+    # Radius points straight up (surface point above centre). A horizontal
+    # tangent (any azimuth, elevation 0) is perpendicular to a vertical radius.
+    val.validate_ball_tangent_perpendicular(
+        _pt("c", 0, 0, 0.0), _pt("p", 0, 0, 1.0), math.pi / 2, 0.0
+    )
+
+
+def test_ball_tangent_perpendicular_rejects_parallel():
+    # Radius points due East; a tangent also pointing due East (azimuth pi/2)
+    # is parallel, not perpendicular -> |dot| == 1.
+    with pytest.raises(ValueError, match="perpendicular"):
+        val.validate_ball_tangent_perpendicular(
+            _pt("c", 0, 0, 0.0), _pt("p", 1, 0, 0.0), math.pi / 2, 0.0
+        )
+
+
+def test_ball_tangent_perpendicular_rejects_zero_radius():
+    # Centre and surface point coincide: the radius has no direction.
+    with pytest.raises(ValueError, match="coincide"):
+        val.validate_ball_tangent_perpendicular(_pt("c", 5, 5, 5.0), _pt("p", 5, 5, 5.0), 0.0, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# cylinder axis elevation
+# ---------------------------------------------------------------------------
+
+
+def test_cylinder_axis_elevation_valid():
+    val.validate_cylinder_axis_elevation(math.pi / 4)  # inclined, positive -> ok
+
+
+def test_cylinder_axis_elevation_rejects_zero():
+    with pytest.raises(ValueError, match="> 0"):
+        val.validate_cylinder_axis_elevation(0.0)
+
+
+def test_cylinder_axis_elevation_rejects_negative():
+    with pytest.raises(ValueError, match="> 0"):
+        val.validate_cylinder_axis_elevation(-0.1)
+
+
+# ---------------------------------------------------------------------------
+# positive radius
+# ---------------------------------------------------------------------------
+
+
+def test_positive_radius_valid():
+    val.validate_positive_radius(1.0)
+
+
+def test_positive_radius_rejects_zero():
+    with pytest.raises(ValueError, match="> 0"):
+        val.validate_positive_radius(0.0)
+
+
+def test_positive_radius_rejects_negative():
+    with pytest.raises(ValueError, match="> 0"):
+        val.validate_positive_radius(-2.5)
+
+
+# ---------------------------------------------------------------------------
+# solid layers
+# ---------------------------------------------------------------------------
+
+
+def _solid_objects() -> dict[str, object]:
+    """Two polygons and a point, the building blocks for the solid-layer tests."""
+    pts_a, poly_a = _unit_square("a")
+    pts_b, poly_b = _unit_square("b")
+    apex = _pt("pt_apex", 1, 1, 5.0)
+    objects: dict[str, object] = {"pg_a": poly_a, "pg_b": poly_b, "pt_apex": apex}
+    # Resolve the polygons' own vertices too so the lookup is self-consistent,
+    # though validate_solid_layers only inspects the layer IDs themselves.
+    objects.update(pts_a)
+    objects.update(pts_b)
+    return objects
+
+
+def test_solid_layers_valid_two_polygons():
+    objects = _solid_objects()
+    val.validate_solid_layers(["pg_a", "pg_b"], objects)
+
+
+def test_solid_layers_accepts_real_solid_layer_stack():
+    # Validate the layer list taken straight off a constructed Solid object, the
+    # way the command layer would, rather than a hand-built list literal.
+    objects = _solid_objects()
+    solid = _solid("so_001", ("pg_a", "pg_b", "pt_apex"))
+    val.validate_solid_layers(list(solid.layers), objects)
+
+
+def test_solid_layers_valid_point_apex_last():
+    objects = _solid_objects()
+    val.validate_solid_layers(["pg_a", "pg_b", "pt_apex"], objects)
+
+
+def test_solid_layers_rejects_too_few():
+    objects = _solid_objects()
+    with pytest.raises(ValueError, match="at least 2 layers"):
+        val.validate_solid_layers(["pg_a"], objects)
+
+
+def test_solid_layers_rejects_missing_object():
+    objects = _solid_objects()
+    with pytest.raises(ValueError, match="non-existent"):
+        val.validate_solid_layers(["pg_a", "pg_missing"], objects)
+
+
+def test_solid_layers_rejects_wrong_type():
+    # A Circle is neither a Polygon nor a Point, so it cannot be a layer.
+    objects = _solid_objects()
+    objects["ci_001"] = _circle("ci_001", "a0", 1.0)
+    with pytest.raises(ValueError, match="Polygon or Point"):
+        val.validate_solid_layers(["pg_a", "ci_001"], objects)
+
+
+def test_solid_layers_rejects_two_point_layers():
+    objects = _solid_objects()
+    objects["pt_base"] = _pt("pt_base", 1, 1, 0.0)
+    with pytest.raises(ValueError, match="at most one Point"):
+        val.validate_solid_layers(["pt_base", "pg_a", "pt_apex"], objects)
+
+
+def test_solid_layers_rejects_point_layer_in_middle():
+    objects = _solid_objects()
+    with pytest.raises(ValueError, match="first or last"):
+        val.validate_solid_layers(["pg_a", "pt_apex", "pg_b"], objects)
+
+
+def test_solid_layers_classifies_by_type_not_id_prefix():
+    # An object whose ID does not look like a point but whose .type is "point"
+    # must still be treated as a Point layer (and, being in the middle, fail).
+    # This proves classification reads .type, not the ID prefix.
+    objects = _solid_objects()
+    weird = _pt("xx_weird", 1, 1, 2.0)  # .type == "point", non-"pt_" prefix
+    objects["xx_weird"] = weird
+    with pytest.raises(ValueError, match="first or last"):
+        val.validate_solid_layers(["pg_a", "xx_weird", "pg_b"], objects)
+
+
+# ---------------------------------------------------------------------------
+# solid non-degenerate
+# ---------------------------------------------------------------------------
+
+
+def test_solid_non_degenerate_valid():
+    val.validate_solid_non_degenerate(10.0)
+
+
+def test_solid_non_degenerate_rejects_flat():
+    with pytest.raises(ValueError, match="degenerate"):
+        val.validate_solid_non_degenerate(0.0)
+
+
+# ---------------------------------------------------------------------------
+# reference exists
+# ---------------------------------------------------------------------------
+
+
+def test_reference_exists_valid():
+    objects = {"pt_001": _pt("pt_001", 0, 0)}
+    val.validate_reference_exists("pt_001", objects)
+
+
+def test_reference_exists_rejects_missing():
+    objects = {"pt_001": _pt("pt_001", 0, 0)}
+    with pytest.raises(ValueError, match="does not exist"):
+        val.validate_reference_exists("pt_999", objects)
+
+
+# ---------------------------------------------------------------------------
+# altitude finite
+# ---------------------------------------------------------------------------
+
+
+def test_altitude_finite_valid():
+    val.validate_altitude_finite(42.5)
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_altitude_finite_rejects_non_finite(bad):
+    with pytest.raises(ValueError, match="finite"):
+        val.validate_altitude_finite(bad)
+
+
+# ---------------------------------------------------------------------------
+# tolerance boundary cases
+# ---------------------------------------------------------------------------
+
+
+def test_circle_tangent_point_boundary_just_inside_tolerance():
+    # Error just under EPS_DISTANCE must pass; the check uses >= for rejection.
+    radius = 5.0 - EPS_DISTANCE / 2
+    val.validate_circle_tangent_point(_pt("c", 0, 0), _pt("p", 5, 0), radius)
+
+
+def test_circle_tangent_point_boundary_at_tolerance_rejects():
+    # Error exactly EPS_DISTANCE must reject (>= boundary).
+    radius = 5.0 - EPS_DISTANCE
+    with pytest.raises(ValueError, match="circle"):
+        val.validate_circle_tangent_point(_pt("c", 0, 0), _pt("p", 5, 0), radius)

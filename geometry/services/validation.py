@@ -11,3 +11,501 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Rule-checking gate between user input and object creation for GeoSketch.
+
+This module is the single home for every *validation* rule that must hold
+before a geometry object is admitted into the document: polygon degeneracy /
+simplicity / vertex count, circle and ball tangency, ball-tangent
+perpendicularity, cylinder axis sanity, positive radius, the structural rules
+on a solid's layer stack, solid volume degeneracy, referential existence, and
+altitude finiteness. Where :mod:`geometry.services.geometry` *computes*
+numbers, this module *judges* them: each function returns ``None`` on success
+and raises :class:`ValueError` on failure, never silently degrading.
+
+Unlike the model dataclasses — which enforce their own structural invariants
+at construction (a ``Circle`` already rejects ``radius <= EPS_DISTANCE``, a
+``Polygon`` already rejects fewer than three vertices) — these validators run
+*earlier*, at the boundary where the command layer assembles candidate input
+that may reference other objects. They are deliberately allowed to overlap the
+model guards: validating up front yields a single, user-facing ``ValueError``
+with an actionable message rather than letting a constructor raise deep inside
+object creation.
+
+Conventions
+-----------
+* Every numeric tolerance is imported by name from
+  :mod:`geometry.utils.constants` (``EPS_AREA``, ``EPS_DISTANCE``,
+  ``EPS_ANGLE``, ``EPS_VOLUME``); this module inlines no bare literal.
+* Geometry is never re-derived here. Polygon signed area comes from
+  :func:`geometry.signed_area` and 3-D distance from
+  :func:`geometry.distance`, so a single source owns each formula.
+* Circle tangency is a **2-D** (horizontal ``(easting, northing)``) test
+  because a circle is planar; ball tangency is a **3-D** test because a ball
+  is a sphere. The two must not be conflated.
+* Solid layers are classified as Point vs Polygon by the *resolved object's*
+  ``.type`` field (``"point"`` / ``"polygon"``), not by parsing the ID prefix
+  string — the prefix is a display convenience, the ``.type`` is the contract.
+* It imports neither ``tkinter`` nor ``matplotlib``.
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Mapping
+
+import numpy as np
+import shapely
+
+from geometry.models.common import GeoObject
+from geometry.models.point import Point
+from geometry.models.polygon import Polygon
+from geometry.services import geometry as geo
+from geometry.utils.constants import EPS_ANGLE, EPS_AREA, EPS_DISTANCE, EPS_VOLUME
+
+__all__ = [
+    "validate_polygon_non_degenerate",
+    "validate_polygon_simple",
+    "validate_polygon_vertex_count",
+    "validate_circle_tangent_point",
+    "validate_ball_tangent_point",
+    "validate_ball_tangent_perpendicular",
+    "validate_cylinder_axis_elevation",
+    "validate_positive_radius",
+    "validate_solid_layers",
+    "validate_solid_non_degenerate",
+    "validate_reference_exists",
+    "validate_altitude_finite",
+]
+
+
+# ---------------------------------------------------------------------------
+# polygon rules
+# ---------------------------------------------------------------------------
+
+
+def validate_polygon_non_degenerate(polygon: Polygon, points: Mapping[str, Point]) -> None:
+    """Reject a polygon whose signed area is below the degeneracy tolerance.
+
+    A polygon with ``|signed_area| < EPS_AREA`` encloses no meaningful region
+    (collinear vertices, a zero-width sliver, or coincident points) and cannot
+    be rendered, filled, or measured, so it is rejected before creation. The
+    area is taken from :func:`geometry.signed_area` so the shoelace formula
+    lives in exactly one place; only its magnitude matters here (winding is the
+    creation path's concern, not validation's).
+
+    Parameters
+    ----------
+    polygon : Polygon
+        The candidate polygon.
+    points : Mapping[str, Point]
+        Point lookup covering every ID in ``polygon.point_ids``.
+
+    Raises
+    ------
+    ValueError
+        If ``abs(signed_area) < EPS_AREA``.
+    """
+    area = abs(float(geo.signed_area(polygon, points)))
+    if area < EPS_AREA:
+        raise ValueError(
+            f"Polygon {polygon.id!r} is degenerate: |signed area| must be "
+            f">= {EPS_AREA}; got {area!r}"
+        )
+
+
+def validate_polygon_simple(polygon: Polygon, points: Mapping[str, Point]) -> None:
+    """Reject a self-intersecting (non-simple) polygon.
+
+    A simple polygon has a boundary that never crosses itself; a bowtie or any
+    figure-eight boundary is non-simple and breaks every downstream area /
+    containment / distance operation (which all assume a single well-formed
+    ring). Simplicity is decided by :func:`shapely.is_simple` on a shapely
+    polygon built from the project's in-memory coordinates, matching how
+    :mod:`geometry.services.geometry` constructs shapely geometry at the call
+    boundary.
+
+    Parameters
+    ----------
+    polygon : Polygon
+        The candidate polygon.
+    points : Mapping[str, Point]
+        Point lookup covering every ID in ``polygon.point_ids``.
+
+    Raises
+    ------
+    ValueError
+        If the polygon's boundary is self-intersecting.
+    """
+    sp_poly = shapely.Polygon(
+        [(points[pid].easting, points[pid].northing) for pid in polygon.point_ids]
+    )
+    if not shapely.is_simple(sp_poly):
+        raise ValueError(
+            f"Polygon {polygon.id!r} is self-intersecting (not simple); "
+            f"its boundary must not cross itself"
+        )
+
+
+def validate_polygon_vertex_count(polygon: Polygon) -> None:
+    """Reject a polygon with fewer than three vertices.
+
+    Three vertices is the minimum that can enclose an area; two or fewer
+    describes a segment or a point, not a polygon. This duplicates the
+    ``Polygon`` constructor's own guard on purpose, so the command layer can
+    surface a clean message before attempting construction.
+
+    Parameters
+    ----------
+    polygon : Polygon
+        The candidate polygon.
+
+    Raises
+    ------
+    ValueError
+        If ``len(polygon.point_ids) < 3``.
+    """
+    count = len(polygon.point_ids)
+    if count < 3:
+        raise ValueError(f"Polygon {polygon.id!r} requires at least 3 vertices; got {count!r}")
+
+
+# ---------------------------------------------------------------------------
+# circle / ball tangency
+# ---------------------------------------------------------------------------
+
+
+def validate_circle_tangent_point(center: Point, surface_point: Point, radius: float) -> None:
+    """Reject a tangent point that does not lie on the circle's circumference.
+
+    A circle is planar in the horizontal ``(easting, northing)`` plane, so its
+    circumference test uses the **2-D** horizontal distance
+    (``math.hypot`` of the easting/northing deltas) — altitude is irrelevant to
+    a planar circle. The point is accepted only when its horizontal distance
+    from the centre matches ``radius`` within :data:`EPS_DISTANCE`.
+
+    Parameters
+    ----------
+    center : Point
+        The circle's centre.
+    surface_point : Point
+        The candidate point on the circumference.
+    radius : float
+        The circle's radius in metres.
+
+    Raises
+    ------
+    ValueError
+        If ``abs(horizontal_distance - radius) >= EPS_DISTANCE``.
+    """
+    horizontal = math.hypot(
+        surface_point.easting - center.easting, surface_point.northing - center.northing
+    )
+    error = abs(horizontal - radius)
+    if error >= EPS_DISTANCE:
+        raise ValueError(
+            f"Tangent point does not lie on the circle: |2D distance - radius| "
+            f"must be < {EPS_DISTANCE}; got distance {horizontal!r}, radius "
+            f"{radius!r} (error {error!r})"
+        )
+
+
+def validate_ball_tangent_point(center: Point, surface_point: Point, radius: float) -> None:
+    """Reject a tangent point that does not lie on the ball's spherical surface.
+
+    A ball is a sphere, so its surface test is **3-D**: it reuses
+    :func:`geometry.distance` (``√[(Δe)²+(Δn)²+(Δz)²]``) rather than the
+    horizontal-only distance used for a planar circle. The point is accepted
+    only when its 3-D distance from the centre matches ``radius`` within
+    :data:`EPS_DISTANCE`.
+
+    Parameters
+    ----------
+    center : Point
+        The ball's centre.
+    surface_point : Point
+        The candidate point on the spherical surface.
+    radius : float
+        The ball's radius in metres.
+
+    Raises
+    ------
+    ValueError
+        If ``abs(distance_3d - radius) >= EPS_DISTANCE``.
+    """
+    dist = float(geo.distance(center, surface_point))
+    error = abs(dist - radius)
+    if error >= EPS_DISTANCE:
+        raise ValueError(
+            f"Tangent point does not lie on the ball: |3D distance - radius| "
+            f"must be < {EPS_DISTANCE}; got distance {dist!r}, radius {radius!r} "
+            f"(error {error!r})"
+        )
+
+
+def validate_ball_tangent_perpendicular(
+    center: Point,
+    surface_point: Point,
+    tangent_direction: float,
+    tangent_elevation: float,
+) -> None:
+    """Reject a ball tangent whose direction is not perpendicular to the radius.
+
+    A line tangent to a sphere at ``surface_point`` must be orthogonal to the
+    radius arm ``center → surface_point``. Orthogonality is tested in 3-D via
+    the dot product of two unit vectors::
+
+        tangent_unit_3d = (sin(az)·cos(el), cos(az)·cos(el), sin(el))
+        radius_unit_3d  = unit(surface_point - center)   in (E, N, Z)
+
+    where ``az = tangent_direction`` (azimuth) and ``el = tangent_elevation``.
+    The tangent components use the spec's azimuth convention (``sin`` on
+    easting, ``cos`` on northing), matching :func:`geometry.vector_endpoint`.
+    Both vectors are unit-length, so ``|dot|`` is ``|cos θ|`` and
+    :data:`EPS_ANGLE` is a genuine angular tolerance: the tangent is accepted
+    only when ``|dot| < EPS_ANGLE`` (i.e. θ within tolerance of 90°).
+
+    Parameters
+    ----------
+    center : Point
+        The ball's centre.
+    surface_point : Point
+        The point of tangency on the spherical surface.
+    tangent_direction : float
+        The tangent's azimuth in radians (CW from North).
+    tangent_elevation : float
+        The tangent's elevation above the horizontal plane in radians.
+
+    Raises
+    ------
+    ValueError
+        If ``center`` and ``surface_point`` coincide (the radius has no
+        direction, so perpendicularity is undefined), or if
+        ``abs(dot) >= EPS_ANGLE`` (the tangent is not perpendicular).
+    """
+    radius_vec = np.array(
+        [
+            surface_point.easting - center.easting,
+            surface_point.northing - center.northing,
+            surface_point.altitude - center.altitude,
+        ],
+        dtype=np.float64,
+    )
+    norm = float(np.linalg.norm(radius_vec))
+    if norm < EPS_DISTANCE:
+        raise ValueError(
+            "Ball tangent is undefined: center and surface point coincide "
+            "(zero-length radius), so perpendicularity cannot be checked"
+        )
+    radius_unit = radius_vec / norm
+    cos_el = math.cos(tangent_elevation)
+    tangent_unit = np.array(
+        [
+            math.sin(tangent_direction) * cos_el,
+            math.cos(tangent_direction) * cos_el,
+            math.sin(tangent_elevation),
+        ],
+        dtype=np.float64,
+    )
+    dot = abs(float(np.dot(tangent_unit, radius_unit)))
+    if dot >= EPS_ANGLE:
+        raise ValueError(
+            f"Ball tangent is not perpendicular to the radius: |dot(tangent, "
+            f"radius)| must be < {EPS_ANGLE}; got {dot!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# cylinder / radius scalars
+# ---------------------------------------------------------------------------
+
+
+def validate_cylinder_axis_elevation(axis_elevation: float) -> None:
+    """Reject a cylinder axis elevation at or below zero.
+
+    A cylinder's axis must rise out of the base plane; an ``axis_elevation`` of
+    ``0`` collapses the solid into a flat disk and a negative value points the
+    axis below the base, neither of which is a valid cylinder. (The upper bound
+    — disallowing an inclined axis at exactly vertical — is the ``Cylinder``
+    model's concern; this validator guards only the lower, degenerate end.)
+
+    Parameters
+    ----------
+    axis_elevation : float
+        The cylinder axis elevation in radians.
+
+    Raises
+    ------
+    ValueError
+        If ``axis_elevation <= 0``.
+    """
+    if axis_elevation <= 0:
+        raise ValueError(
+            f"Cylinder axis elevation must be > 0 (a flat or downward axis is "
+            f"degenerate); got {axis_elevation!r}"
+        )
+
+
+def validate_positive_radius(radius: float) -> None:
+    """Reject a non-positive radius shared by Circle, Ball, and Cylinder.
+
+    A radius of ``0`` or less describes no surface. This is the common
+    radius-sanity gate for every radial type; the per-model constructors apply
+    a tighter ``> EPS_DISTANCE`` guard, but the command layer calls this first
+    for a uniform, type-agnostic message.
+
+    Parameters
+    ----------
+    radius : float
+        The candidate radius in metres.
+
+    Raises
+    ------
+    ValueError
+        If ``radius <= 0``.
+    """
+    if radius <= 0:
+        raise ValueError(f"Radius must be > 0; got {radius!r}")
+
+
+# ---------------------------------------------------------------------------
+# solid rules
+# ---------------------------------------------------------------------------
+
+
+def validate_solid_layers(layers: list[str], objects: Mapping[str, GeoObject]) -> None:
+    """Reject a structurally invalid solid layer stack.
+
+    A solid is an ordered stack of cross-section layers, each of which must be
+    an existing Polygon or an existing Point (an apex/nadir). The structural
+    rules enforced here are, in order:
+
+    * at least two layers (a single cross-section has no extent);
+    * every layer ID resolves to an existing object;
+    * every resolved object is a Polygon or a Point — nothing else;
+    * at most one Point layer (a solid has at most one apex/nadir);
+    * the Point layer, if present, is the first or last element.
+
+    Point vs Polygon is decided from the **resolved object's** ``.type`` field
+    (``"point"`` / ``"polygon"``), never from the ID prefix string: the prefix
+    is a display convenience, while ``.type`` is the authoritative contract and
+    survives any future ID-scheme change.
+
+    Parameters
+    ----------
+    layers : list[str]
+        Ordered layer object IDs.
+    objects : Mapping[str, GeoObject]
+        Object lookup used to resolve and type-classify each layer.
+
+    Raises
+    ------
+    ValueError
+        If any structural rule above is violated.
+    """
+    if len(layers) < 2:
+        raise ValueError(f"Solid requires at least 2 layers; got {len(layers)!r}")
+
+    point_indices: list[int] = []
+    for index, layer_id in enumerate(layers):
+        obj = objects.get(layer_id)
+        if obj is None:
+            raise ValueError(f"Solid layer {layer_id!r} references a non-existent object")
+        if obj.type not in ("polygon", "point"):
+            raise ValueError(
+                f"Solid layer {layer_id!r} must be a Polygon or Point; got type {obj.type!r}"
+            )
+        if obj.type == "point":
+            point_indices.append(index)
+
+    if len(point_indices) > 1:
+        offenders = [layers[i] for i in point_indices]
+        raise ValueError(
+            f"Solid may contain at most one Point layer (apex/nadir); "
+            f"got {len(point_indices)}: {offenders!r}"
+        )
+    if point_indices and point_indices[0] not in (0, len(layers) - 1):
+        raise ValueError(
+            f"Solid Point layer must be the first or last layer; got "
+            f"{layers[point_indices[0]]!r} at index {point_indices[0]!r}"
+        )
+
+
+def validate_solid_non_degenerate(volume: float) -> None:
+    """Reject a solid whose volume is below the degeneracy tolerance.
+
+    The 3-D analogue of :func:`validate_polygon_non_degenerate`. A solid whose
+    layers are coplanar (zero vertical extent, or a coplanar-hull fallback)
+    encloses ``|volume| < EPS_VOLUME`` and is rejected. The structural
+    :func:`validate_solid_layers` check cannot catch this, because a layer
+    stack can be structurally valid yet geometrically flat — only the computed
+    volume reveals the collapse.
+
+    Parameters
+    ----------
+    volume : float
+        The solid's signed or unsigned volume in cubic metres, as computed by
+        the geometry layer.
+
+    Raises
+    ------
+    ValueError
+        If ``abs(volume) < EPS_VOLUME``.
+    """
+    magnitude = abs(volume)
+    if magnitude < EPS_VOLUME:
+        raise ValueError(
+            f"Solid is degenerate: |volume| must be >= {EPS_VOLUME}; got {magnitude!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# referential / scalar rules
+# ---------------------------------------------------------------------------
+
+
+def validate_reference_exists(obj_id: str, objects: Mapping[str, GeoObject]) -> None:
+    """Reject a reference to an object that is not in the document.
+
+    Every inter-object reference (line → point, polygon → point, tangent →
+    shape, solid → layer) is an ID string that must resolve to a live object.
+    This is the generic existence gate the command layer calls before wiring a
+    reference, so a dangling ID fails loud with the offending value rather than
+    surfacing later as a ``KeyError`` deep in a geometry computation.
+
+    Parameters
+    ----------
+    obj_id : str
+        The referenced object ID.
+    objects : Mapping[str, GeoObject]
+        The document's object lookup.
+
+    Raises
+    ------
+    ValueError
+        If ``obj_id`` is not a key in ``objects``.
+    """
+    if obj_id not in objects:
+        raise ValueError(f"Referenced object {obj_id!r} does not exist")
+
+
+def validate_altitude_finite(altitude: float) -> None:
+    """Reject a non-finite altitude (``nan`` or ``±inf``).
+
+    Altitude feeds 3-D distance, vector endpoints, and slice-plane membership;
+    a ``nan`` or infinite value silently poisons every one of those. The
+    ``Point`` constructor enforces the same rule, but this validator lets the
+    point-import and form paths reject bad input before construction.
+
+    Parameters
+    ----------
+    altitude : float
+        The candidate altitude (Z) in metres.
+
+    Raises
+    ------
+    ValueError
+        If ``altitude`` is not finite.
+    """
+    if not math.isfinite(altitude):
+        raise ValueError(f"Altitude must be finite; got {altitude!r}")
