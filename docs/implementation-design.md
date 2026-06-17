@@ -669,7 +669,9 @@ def validate_polygon_vertex_count(polygon: Polygon) -> None:
 def validate_circle_tangent_point(
     center: Point, surface_point: Point, radius: float
 ) -> None:
-    """Raise ValueError if |distance(center, surface_point) - radius| >= EPS_DISTANCE."""
+    """Raise ValueError if |distance_2d(center, surface_point) - radius| >= EPS_DISTANCE.
+    Uses 2D horizontal (easting, northing) distance because a circle is planar.
+    """
 
 def validate_ball_tangent_point(
     center: Point, surface_point: Point, radius: float

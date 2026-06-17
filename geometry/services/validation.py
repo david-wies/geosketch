@@ -46,13 +46,19 @@ Conventions
 * Solid layers are classified as Point vs Polygon by the *resolved object's*
   ``.type`` field (``"point"`` / ``"polygon"``), not by parsing the ID prefix
   string — the prefix is a display convenience, the ``.type`` is the contract.
+* The polygon validators (:func:`validate_polygon_non_degenerate`,
+  :func:`validate_polygon_simple`) index ``points[pid]`` directly and therefore
+  raise :class:`KeyError` (not :class:`ValueError`) on a missing point ID. This
+  is intentional under the precondition that the command layer runs
+  :func:`validate_reference_exists` on every vertex first; a missing ID at this
+  point is a programmer error, not user-facing bad input.
 * It imports neither ``tkinter`` nor ``matplotlib``.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 import shapely
@@ -135,8 +141,13 @@ def validate_polygon_simple(polygon: Polygon, points: Mapping[str, Point]) -> No
     Raises
     ------
     ValueError
-        If the polygon's boundary is self-intersecting.
+        If the polygon has fewer than 3 vertices (a degenerate ring that
+        shapely cannot construct), or if its boundary is self-intersecting.
     """
+    if len(polygon.point_ids) < 3:
+        raise ValueError(
+            f"Polygon {polygon.id!r} requires at least 3 vertices; got {len(polygon.point_ids)!r}"
+        )
     sp_poly = shapely.Polygon(
         [(points[pid].easting, points[pid].northing) for pid in polygon.point_ids]
     )
@@ -263,7 +274,10 @@ def validate_ball_tangent_perpendicular(
     easting, ``cos`` on northing), matching :func:`geometry.vector_endpoint`.
     Both vectors are unit-length, so ``|dot|`` is ``|cos θ|`` and
     :data:`EPS_ANGLE` is a genuine angular tolerance: the tangent is accepted
-    only when ``|dot| < EPS_ANGLE`` (i.e. θ within tolerance of 90°).
+    only when ``|dot| < EPS_ANGLE`` (i.e. θ within tolerance of 90°). The tight
+    1e-9 rad tolerance is appropriate here because this validator is fed a
+    *computed/snapped* tangent direction (from the command layer), not a raw
+    hand-entered azimuth/elevation.
 
     Parameters
     ----------
@@ -337,8 +351,11 @@ def validate_cylinder_axis_elevation(axis_elevation: float) -> None:
     Raises
     ------
     ValueError
-        If ``axis_elevation <= 0``.
+        If ``axis_elevation`` is non-finite (``nan`` or ``±inf``), or if
+        ``axis_elevation <= 0``.
     """
+    if not math.isfinite(axis_elevation):
+        raise ValueError(f"Cylinder axis elevation must be finite; got {axis_elevation!r}")
     if axis_elevation <= 0:
         raise ValueError(
             f"Cylinder axis elevation must be > 0 (a flat or downward axis is "
@@ -362,8 +379,10 @@ def validate_positive_radius(radius: float) -> None:
     Raises
     ------
     ValueError
-        If ``radius <= 0``.
+        If ``radius`` is non-finite (``nan`` or ``±inf``), or if ``radius <= 0``.
     """
+    if not math.isfinite(radius):
+        raise ValueError(f"Radius must be finite; got {radius!r}")
     if radius <= 0:
         raise ValueError(f"Radius must be > 0; got {radius!r}")
 
@@ -373,7 +392,7 @@ def validate_positive_radius(radius: float) -> None:
 # ---------------------------------------------------------------------------
 
 
-def validate_solid_layers(layers: list[str], objects: Mapping[str, GeoObject]) -> None:
+def validate_solid_layers(layers: Sequence[str], objects: Mapping[str, GeoObject]) -> None:
     """Reject a structurally invalid solid layer stack.
 
     A solid is an ordered stack of cross-section layers, each of which must be
@@ -393,7 +412,7 @@ def validate_solid_layers(layers: list[str], objects: Mapping[str, GeoObject]) -
 
     Parameters
     ----------
-    layers : list[str]
+    layers : Sequence[str]
         Ordered layer object IDs.
     objects : Mapping[str, GeoObject]
         Object lookup used to resolve and type-classify each layer.
@@ -450,8 +469,12 @@ def validate_solid_non_degenerate(volume: float) -> None:
     Raises
     ------
     ValueError
-        If ``abs(volume) < EPS_VOLUME``.
+        If ``volume`` is non-finite (``nan`` or ``±inf``) — a ``nan`` from a
+        degenerate hull must not slip the gate — or if
+        ``abs(volume) < EPS_VOLUME``.
     """
+    if not math.isfinite(volume):
+        raise ValueError(f"Volume must be finite; got {volume!r}")
     magnitude = abs(volume)
     if magnitude < EPS_VOLUME:
         raise ValueError(

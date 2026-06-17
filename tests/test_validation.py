@@ -33,7 +33,7 @@ from geometry.models.point import Point
 from geometry.models.polygon import Polygon
 from geometry.models.solid import Solid
 from geometry.services import validation as val
-from geometry.utils.constants import EPS_DISTANCE
+from geometry.utils.constants import EPS_ANGLE, EPS_DISTANCE, EPS_VOLUME
 
 # ---------------------------------------------------------------------------
 # builders
@@ -99,8 +99,8 @@ def _solid(pid: str, layers: tuple[str, ...]) -> Solid:
     return Solid(**_envelope(pid), layers=layers, line_color=_LINE, fill_color=_FILL)
 
 
-def _unit_square(prefix: str = "s") -> tuple[dict[str, Point], Polygon]:
-    """CCW square with corners at (0,0),(2,0),(2,2),(0,2)."""
+def _square(prefix: str = "s") -> tuple[dict[str, Point], Polygon]:
+    """2x2 CCW square with corners at (0,0),(2,0),(2,2),(0,2)."""
     corners = ((0, 0), (2, 0), (2, 2), (0, 2))
     pts = {f"{prefix}{i}": _pt(f"{prefix}{i}", e, n) for i, (e, n) in enumerate(corners)}
     poly = _poly(f"pg_{prefix}", tuple(pts))
@@ -113,7 +113,7 @@ def _unit_square(prefix: str = "s") -> tuple[dict[str, Point], Polygon]:
 
 
 def test_polygon_non_degenerate_valid_square():
-    pts, poly = _unit_square()
+    pts, poly = _square()
     val.validate_polygon_non_degenerate(poly, pts)  # 2x2 square, area 4 -> ok
 
 
@@ -135,7 +135,7 @@ def test_polygon_non_degenerate_rejects_collinear():
 
 
 def test_polygon_simple_valid_square():
-    pts, poly = _unit_square()
+    pts, poly = _square()
     val.validate_polygon_simple(poly, pts)  # axis-aligned square is simple
 
 
@@ -168,7 +168,7 @@ def test_polygon_vertex_count_rejects_two():
     # built directly; construct a valid triangle then shrink point_ids to
     # exercise the validator's own guard.
     poly = _poly("pg_t", ("t0", "t1", "t2"))
-    object.__setattr__(poly, "point_ids", ("t0", "t1"))
+    poly.point_ids = ("t0", "t1")
     with pytest.raises(ValueError, match="at least 3 vertices"):
         val.validate_polygon_vertex_count(poly)
 
@@ -219,6 +219,21 @@ def test_ball_tangent_point_uses_real_ball_radius():
     val.validate_ball_tangent_point(_pt("c", 0, 0, 0.0), _pt("p", 0, 0, 1.0), ball.radius)
 
 
+def test_ball_tangent_point_boundary_just_inside_tolerance():
+    # 3D point (0,3,4): sqrt(0+9+16) == 5 (a clean quadruple at altitude 4, so
+    # the check genuinely exercises the 3D path). Error just under EPS_DISTANCE
+    # must pass; the check uses >= for rejection.
+    radius = 5.0 - EPS_DISTANCE / 2
+    val.validate_ball_tangent_point(_pt("c", 0, 0, 0.0), _pt("p", 0, 3, 4.0), radius)
+
+
+def test_ball_tangent_point_boundary_at_tolerance_rejects():
+    # Same 3D distance 5; error exactly EPS_DISTANCE must reject (>= boundary).
+    radius = 5.0 - EPS_DISTANCE
+    with pytest.raises(ValueError, match="ball"):
+        val.validate_ball_tangent_point(_pt("c", 0, 0, 0.0), _pt("p", 0, 3, 4.0), radius)
+
+
 # ---------------------------------------------------------------------------
 # ball tangent perpendicular
 # ---------------------------------------------------------------------------
@@ -253,6 +268,22 @@ def test_ball_tangent_perpendicular_rejects_zero_radius():
         val.validate_ball_tangent_perpendicular(_pt("c", 5, 5, 5.0), _pt("p", 5, 5, 5.0), 0.0, 0.0)
 
 
+def test_ball_tangent_perpendicular_boundary_just_inside_tolerance():
+    # Radius due East (1,0,0); with elevation 0 the dot product reduces to
+    # sin(azimuth). A tiny azimuth of 0.1 * EPS_ANGLE gives |dot| ~ 1e-10,
+    # comfortably under EPS_ANGLE -> perpendicular within tolerance, passes.
+    az = EPS_ANGLE * 0.1
+    val.validate_ball_tangent_perpendicular(_pt("c", 0, 0, 0.0), _pt("p", 1, 0, 0.0), az, 0.0)
+
+
+def test_ball_tangent_perpendicular_boundary_over_tolerance_rejects():
+    # Same construction with azimuth 10 * EPS_ANGLE gives |dot| ~ 1e-8,
+    # comfortably over EPS_ANGLE -> not perpendicular, rejects.
+    az = EPS_ANGLE * 10
+    with pytest.raises(ValueError, match="perpendicular"):
+        val.validate_ball_tangent_perpendicular(_pt("c", 0, 0, 0.0), _pt("p", 1, 0, 0.0), az, 0.0)
+
+
 # ---------------------------------------------------------------------------
 # cylinder axis elevation
 # ---------------------------------------------------------------------------
@@ -270,6 +301,11 @@ def test_cylinder_axis_elevation_rejects_zero():
 def test_cylinder_axis_elevation_rejects_negative():
     with pytest.raises(ValueError, match="> 0"):
         val.validate_cylinder_axis_elevation(-0.1)
+
+
+def test_cylinder_axis_elevation_rejects_nan():
+    with pytest.raises(ValueError, match="finite"):
+        val.validate_cylinder_axis_elevation(math.nan)
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +327,11 @@ def test_positive_radius_rejects_negative():
         val.validate_positive_radius(-2.5)
 
 
+def test_positive_radius_rejects_nan():
+    with pytest.raises(ValueError, match="finite"):
+        val.validate_positive_radius(math.nan)
+
+
 # ---------------------------------------------------------------------------
 # solid layers
 # ---------------------------------------------------------------------------
@@ -298,8 +339,8 @@ def test_positive_radius_rejects_negative():
 
 def _solid_objects() -> dict[str, object]:
     """Two polygons and a point, the building blocks for the solid-layer tests."""
-    pts_a, poly_a = _unit_square("a")
-    pts_b, poly_b = _unit_square("b")
+    pts_a, poly_a = _square("a")
+    pts_b, poly_b = _square("b")
     apex = _pt("pt_apex", 1, 1, 5.0)
     objects: dict[str, object] = {"pg_a": poly_a, "pg_b": poly_b, "pt_apex": apex}
     # Resolve the polygons' own vertices too so the lookup is self-consistent,
@@ -319,12 +360,18 @@ def test_solid_layers_accepts_real_solid_layer_stack():
     # way the command layer would, rather than a hand-built list literal.
     objects = _solid_objects()
     solid = _solid("so_001", ("pg_a", "pg_b", "pt_apex"))
-    val.validate_solid_layers(list(solid.layers), objects)
+    val.validate_solid_layers(solid.layers, objects)
 
 
 def test_solid_layers_valid_point_apex_last():
     objects = _solid_objects()
     val.validate_solid_layers(["pg_a", "pg_b", "pt_apex"], objects)
+
+
+def test_solid_layers_valid_point_apex_first():
+    # The Point layer is allowed at the first position, not only the last.
+    objects = _solid_objects()
+    val.validate_solid_layers(["pt_apex", "pg_a", "pg_b"], objects)
 
 
 def test_solid_layers_rejects_too_few():
@@ -383,6 +430,29 @@ def test_solid_non_degenerate_valid():
 def test_solid_non_degenerate_rejects_flat():
     with pytest.raises(ValueError, match="degenerate"):
         val.validate_solid_non_degenerate(0.0)
+
+
+def test_solid_non_degenerate_valid_negative_volume():
+    # The gate compares |volume|, so a negative (e.g. opposite-winding) volume
+    # of sufficient magnitude is accepted.
+    val.validate_solid_non_degenerate(-10.0)
+
+
+def test_solid_non_degenerate_boundary_at_tolerance_passes():
+    # The check is |volume| < EPS_VOLUME rejects, so |volume| == EPS_VOLUME passes.
+    val.validate_solid_non_degenerate(EPS_VOLUME)
+
+
+def test_solid_non_degenerate_boundary_just_below_tolerance_rejects():
+    # |volume| just under EPS_VOLUME must reject.
+    with pytest.raises(ValueError, match="degenerate"):
+        val.validate_solid_non_degenerate(EPS_VOLUME / 2)
+
+
+def test_solid_non_degenerate_rejects_nan():
+    # A NaN from a degenerate hull must not slip the non-degenerate gate.
+    with pytest.raises(ValueError, match="finite"):
+        val.validate_solid_non_degenerate(math.nan)
 
 
 # ---------------------------------------------------------------------------
