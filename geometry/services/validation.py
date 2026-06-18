@@ -46,12 +46,17 @@ Conventions
 * Solid layers are classified as Point vs Polygon by the *resolved object's*
   ``.type`` field (``"point"`` / ``"polygon"``), not by parsing the ID prefix
   string — the prefix is a display convenience, the ``.type`` is the contract.
-* The polygon validators (:func:`validate_polygon_non_degenerate`,
-  :func:`validate_polygon_simple`) index ``points[pid]`` directly and therefore
-  raise :class:`KeyError` (not :class:`ValueError`) on a missing point ID. This
-  is intentional under the precondition that the command layer runs
-  :func:`validate_reference_exists` on every vertex first; a missing ID at this
-  point is a programmer error, not user-facing bad input.
+* Referential existence is a **two-tier contract**. Tier 1 (user-facing): the
+  command layer runs :func:`validate_reference_exists` on every vertex ID
+  first, which raises :class:`ValueError` for a dangling reference — so a caller
+  catching :class:`ValueError` already covers the missing-ID case. Tier 2
+  (programmer error): the polygon validators
+  (:func:`validate_polygon_non_degenerate`, :func:`validate_polygon_simple`)
+  index ``points[pid]`` directly and therefore raise :class:`KeyError`, not
+  :class:`ValueError`, if that precondition was skipped. The split is
+  intentional: a missing ID reaching these validators is a bug in the call
+  sequence, not user-facing bad input, and is surfaced loudly rather than
+  folded into the user-error channel.
 * It imports neither ``tkinter`` nor ``matplotlib``.
 """
 
@@ -177,7 +182,7 @@ def validate_polygon_non_degenerate(polygon: Polygon, points: Mapping[str, Point
 
 
 def validate_polygon_simple(polygon: Polygon, points: Mapping[str, Point]) -> None:
-    """Reject a self-intersecting (non-simple) polygon.
+    """Reject a polygon whose boundary is not a simple ring.
 
     A simple polygon has a boundary that never crosses itself; a bowtie or any
     figure-eight boundary is non-simple and breaks every downstream area /
@@ -186,6 +191,13 @@ def validate_polygon_simple(polygon: Polygon, points: Mapping[str, Point]) -> No
     polygon built from the project's in-memory coordinates, matching how
     :mod:`geometry.services.geometry` constructs shapely geometry at the call
     boundary.
+
+    Simplicity is **not** the same property as non-degeneracy: ``is_simple``
+    also reports ``False`` for a collinear or coincident-vertex ring that
+    collapses to a line (zero enclosed area), so this validator can reject such
+    a ring too — its message names both causes. Dedicated zero-area rejection
+    (with the precise ``EPS_AREA`` tolerance) is the job of
+    :func:`validate_polygon_non_degenerate`; run both for a full picture.
 
     Parameters
     ----------
@@ -200,8 +212,8 @@ def validate_polygon_simple(polygon: Polygon, points: Mapping[str, Point]) -> No
         If the polygon has fewer than 3 vertices (a degenerate ring that
         shapely cannot construct), if any vertex coordinate is non-finite (a
         ``nan`` / ``±inf`` poisons ``shapely.is_simple``, which then makes the
-        self-intersection branch unreachable), or if its boundary is
-        self-intersecting.
+        not-simple branch unreachable), or if its boundary is not a simple ring
+        (self-intersecting, or collinear/zero-area).
     KeyError
         If a point ID in ``polygon.point_ids`` is absent from ``points`` (a
         programmer error under the documented precondition that
@@ -218,8 +230,9 @@ def validate_polygon_simple(polygon: Polygon, points: Mapping[str, Point]) -> No
     )
     if not shapely.is_simple(sp_poly):
         raise ValueError(
-            f"Polygon {polygon.id!r} is self-intersecting (not simple); "
-            f"its boundary must not cross itself"
+            f"Polygon {polygon.id!r} is not a simple ring (self-intersecting, "
+            f"or collinear/zero-area so the boundary collapses to a line); a "
+            f"simple ring must not cross itself or degenerate"
         )
 
 
@@ -385,31 +398,24 @@ def validate_ball_tangent_perpendicular(
         )
     _require_finite_coords(center, "easting", "northing", "altitude")
     _require_finite_coords(surface_point, "easting", "northing", "altitude")
-    radius_vec = np.array(
-        [
-            surface_point.easting - center.easting,
-            surface_point.northing - center.northing,
-            surface_point.altitude - center.altitude,
-        ],
-        dtype=np.float64,
-    )
-    norm = float(np.linalg.norm(radius_vec))
+    radius_e = surface_point.easting - center.easting
+    radius_n = surface_point.northing - center.northing
+    radius_z = surface_point.altitude - center.altitude
+    norm = math.hypot(radius_e, radius_n, radius_z)
     if norm < EPS_DISTANCE:
         raise ValueError(
             "Ball tangent is undefined: center and surface point coincide "
             "(zero-length radius), so perpendicularity cannot be checked"
         )
-    radius_unit = radius_vec / norm
     cos_el = math.cos(tangent_elevation)
-    tangent_unit = np.array(
-        [
-            math.sin(tangent_direction) * cos_el,
-            math.cos(tangent_direction) * cos_el,
-            math.sin(tangent_elevation),
-        ],
-        dtype=np.float64,
-    )
-    dot = abs(float(np.dot(tangent_unit, radius_unit)))
+    tangent_e = math.sin(tangent_direction) * cos_el
+    tangent_n = math.cos(tangent_direction) * cos_el
+    tangent_z = math.sin(tangent_elevation)
+    # Both vectors are unit-length (the tangent by construction; the radius arm
+    # is unit-normalised by folding the division by ``norm`` into the dot below),
+    # so ``|dot|`` is ``|cos theta|``. Pure-``math`` scalars avoid allocating the
+    # transient 3-element NumPy arrays this single-shot check previously built.
+    dot = abs((tangent_e * radius_e + tangent_n * radius_n + tangent_z * radius_z) / norm)
     if dot >= EPS_ANGLE:
         raise ValueError(
             f"Ball tangent is not perpendicular to the radius: |dot(tangent, "
@@ -452,12 +458,15 @@ def validate_cylinder_axis_elevation(axis_elevation: float) -> None:
 
 
 def validate_positive_radius(radius: float) -> None:
-    """Reject a non-positive radius shared by Circle, Ball, and Cylinder.
+    """Reject a radius at or below the distance tolerance.
 
-    A radius of ``0`` or less describes no surface. This is the common
-    radius-sanity gate for every radial type; the per-model constructors apply
-    a tighter ``> EPS_DISTANCE`` guard, but the command layer calls this first
-    for a uniform, type-agnostic message.
+    A radius of ``EPS_DISTANCE`` or less describes no meaningful surface. This
+    is the common radius-sanity gate for every radial type (Circle, Ball,
+    Cylinder); it deliberately uses the **same** bound the per-model
+    constructors apply (``radius <= EPS_DISTANCE``) so the command layer can
+    surface a uniform, type-agnostic message for the exact boundary case the
+    constructor would otherwise reject deep inside object creation — the two
+    bounds cannot drift.
 
     Parameters
     ----------
@@ -467,12 +476,13 @@ def validate_positive_radius(radius: float) -> None:
     Raises
     ------
     ValueError
-        If ``radius`` is non-finite (``nan`` or ``±inf``), or if ``radius <= 0``.
+        If ``radius`` is non-finite (``nan`` or ``±inf``), or if
+        ``radius <= EPS_DISTANCE``.
     """
     if not math.isfinite(radius):
         raise ValueError(f"Radius must be finite; got {radius!r}")
-    if radius <= 0:
-        raise ValueError(f"Radius must be > 0; got {radius!r}")
+    if radius <= EPS_DISTANCE:
+        raise ValueError(f"Radius must be > {EPS_DISTANCE}; got {radius!r}")
 
 
 # ---------------------------------------------------------------------------

@@ -33,7 +33,7 @@ from geometry.models.point import Point
 from geometry.models.polygon import Polygon
 from geometry.models.solid import Solid
 from geometry.services import validation as val
-from geometry.utils.constants import EPS_ANGLE, EPS_DISTANCE, EPS_VOLUME
+from geometry.utils.constants import EPS_ANGLE, EPS_AREA, EPS_DISTANCE, EPS_VOLUME
 
 # ---------------------------------------------------------------------------
 # builders
@@ -140,6 +140,31 @@ def test_polygon_non_degenerate_rejects_non_finite_coord(bad):
         val.validate_polygon_non_degenerate(poly, pts)
 
 
+def test_polygon_non_degenerate_boundary_at_tolerance_passes():
+    # Thin triangle (0,0),(1,0),(0, 2*EPS_AREA): shoelace area == 1 * 2*EPS_AREA / 2
+    # == EPS_AREA exactly. The gate rejects |area| < EPS_AREA, so area == EPS_AREA
+    # passes — pinning the `<` (not `<=`) boundary against a future flip.
+    pts = {
+        "ta0": _pt("ta0", 0, 0),
+        "ta1": _pt("ta1", 1, 0),
+        "ta2": _pt("ta2", 0, 2 * EPS_AREA),
+    }
+    poly = _poly("pg_ta", ("ta0", "ta1", "ta2"))
+    val.validate_polygon_non_degenerate(poly, pts)
+
+
+def test_polygon_non_degenerate_boundary_just_below_tolerance_rejects():
+    # Same construction at half the height: area == EPS_AREA / 2 < EPS_AREA rejects.
+    pts = {
+        "tb0": _pt("tb0", 0, 0),
+        "tb1": _pt("tb1", 1, 0),
+        "tb2": _pt("tb2", 0, EPS_AREA),
+    }
+    poly = _poly("pg_tb", ("tb0", "tb1", "tb2"))
+    with pytest.raises(ValueError, match="degenerate"):
+        val.validate_polygon_non_degenerate(poly, pts)
+
+
 # ---------------------------------------------------------------------------
 # polygon simple
 # ---------------------------------------------------------------------------
@@ -185,6 +210,16 @@ def test_polygon_simple_rejects_non_finite_coord(bad):
     pts, poly = _square()
     pts["s2"].northing = bad
     with pytest.raises(ValueError, match="finite"):
+        val.validate_polygon_simple(poly, pts)
+
+
+def test_polygon_simple_rejects_collinear_with_accurate_message():
+    # shapely.is_simple is False for a collinear (zero-area) ring too, so
+    # validate_polygon_simple rejects it; the reworded message must name the
+    # collapse, not only self-intersection.
+    pts = {"m0": _pt("m0", 0, 0), "m1": _pt("m1", 1, 1), "m2": _pt("m2", 2, 2)}
+    poly = _poly("pg_m", ("m0", "m1", "m2"))
+    with pytest.raises(ValueError, match="collinear/zero-area"):
         val.validate_polygon_simple(poly, pts)
 
 
@@ -427,13 +462,33 @@ def test_positive_radius_valid():
 
 
 def test_positive_radius_rejects_zero():
-    with pytest.raises(ValueError, match="> 0"):
+    with pytest.raises(ValueError, match="must be >"):
         val.validate_positive_radius(0.0)
 
 
 def test_positive_radius_rejects_negative():
-    with pytest.raises(ValueError, match="> 0"):
+    with pytest.raises(ValueError, match="must be >"):
         val.validate_positive_radius(-2.5)
+
+
+def test_positive_radius_rejects_at_tolerance():
+    # The validator matches the Circle/Ball/Cylinder constructors, which reject
+    # radius <= EPS_DISTANCE; a radius of exactly EPS_DISTANCE must reject here so
+    # the validator and constructor bounds cannot drift.
+    with pytest.raises(ValueError, match="must be >"):
+        val.validate_positive_radius(EPS_DISTANCE)
+
+
+def test_positive_radius_rejects_within_tolerance_band():
+    # The exact gap the alignment closes: a radius in (0, EPS_DISTANCE] passed the
+    # old `<= 0` validator yet failed the constructor. It must now reject up front.
+    with pytest.raises(ValueError, match="must be >"):
+        val.validate_positive_radius(EPS_DISTANCE / 2)
+
+
+def test_positive_radius_accepts_just_above_tolerance():
+    # Just above the tolerance passes (the constructor would accept it too).
+    val.validate_positive_radius(EPS_DISTANCE * 2)
 
 
 @pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])

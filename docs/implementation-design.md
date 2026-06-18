@@ -696,7 +696,7 @@ def validate_cylinder_axis_elevation(axis_elevation: float) -> None:
     """Raise ValueError if axis_elevation <= 0 (degenerate flat disk)."""
 
 def validate_positive_radius(radius: float) -> None:
-    """Raise ValueError if radius <= 0 (used by Circle, Ball, Cylinder)."""
+    """Raise ValueError if radius <= EPS_DISTANCE (matches Circle/Ball/Cylinder constructors)."""
 
 def validate_solid_layers(layers: list[str], objects: Mapping[str, GeoObject]) -> None:
     """Raise ValueError if:
