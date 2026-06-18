@@ -86,6 +86,44 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
+# shared coordinate guard
+# ---------------------------------------------------------------------------
+
+
+def _require_finite_coords(point: Point, *fields: str) -> None:
+    """Reject a point carrying a non-finite coordinate on any named field.
+
+    Point coordinates can be mutated after construction via the point-edit path
+    (``GeoObject.__setattr__`` does not re-check finiteness), so a ``nan`` or
+    ``±inf`` can reach a validator's geometry computation and poison it: since
+    ``nan >= EPS`` and ``nan < EPS`` are both ``False``, the reject branch
+    becomes unreachable and the validator silently returns ``None`` instead of
+    raising. This helper is the single up-front gate the coordinate-consuming
+    validators call before any geometry runs, mirroring the scalar
+    ``math.isfinite`` guards already present on radius / direction / elevation.
+
+    Parameters
+    ----------
+    point : Point
+        The point whose coordinates are checked.
+    *fields : str
+        Attribute names to test (``"easting"``, ``"northing"``, ``"altitude"``).
+        Circle validators pass the 2-D pair; ball validators add altitude.
+
+    Raises
+    ------
+    ValueError
+        If any named field's value is non-finite (``nan`` or ``±inf``).
+    """
+    for field in fields:
+        value = getattr(point, field)
+        if not math.isfinite(value):
+            raise ValueError(
+                f"Point {point.id!r} coordinate {field!r} must be finite; got {value!r}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # polygon rules
 # ---------------------------------------------------------------------------
 
@@ -110,13 +148,27 @@ def validate_polygon_non_degenerate(polygon: Polygon, points: Mapping[str, Point
     Raises
     ------
     ValueError
-        If ``abs(signed_area) < EPS_AREA``.
+        If the signed area is non-finite (a ``nan`` / ``±inf`` coordinate on a
+        vertex poisons the shoelace sum, and ``nan < EPS_AREA`` is ``False``, so
+        the degeneracy branch would be unreachable), or if
+        ``abs(signed_area) < EPS_AREA``.
     KeyError
         If a point ID in ``polygon.point_ids`` is absent from ``points`` (a
         programmer error under the documented precondition that
         :func:`validate_reference_exists` runs on every vertex first).
     """
-    area = abs(float(geo.signed_area(polygon, points)))
+    # An infinite vertex coordinate makes the shoelace sum evaluate ``inf * 0``,
+    # which numpy would surface as a RuntimeWarning. This validator deliberately
+    # tolerates a non-finite result and rejects it explicitly below, so the
+    # intermediate warning is expected noise and is suppressed here.
+    with np.errstate(invalid="ignore"):
+        signed = float(geo.signed_area(polygon, points))
+    if not math.isfinite(signed):
+        raise ValueError(
+            f"Polygon {polygon.id!r} has a non-finite signed area "
+            f"(a vertex coordinate is nan or ±inf); got {signed!r}"
+        )
+    area = abs(signed)
     if area < EPS_AREA:
         raise ValueError(
             f"Polygon {polygon.id!r} is degenerate: |signed area| must be "
@@ -146,7 +198,10 @@ def validate_polygon_simple(polygon: Polygon, points: Mapping[str, Point]) -> No
     ------
     ValueError
         If the polygon has fewer than 3 vertices (a degenerate ring that
-        shapely cannot construct), or if its boundary is self-intersecting.
+        shapely cannot construct), if any vertex coordinate is non-finite (a
+        ``nan`` / ``±inf`` poisons ``shapely.is_simple``, which then makes the
+        self-intersection branch unreachable), or if its boundary is
+        self-intersecting.
     KeyError
         If a point ID in ``polygon.point_ids`` is absent from ``points`` (a
         programmer error under the documented precondition that
@@ -156,6 +211,8 @@ def validate_polygon_simple(polygon: Polygon, points: Mapping[str, Point]) -> No
         raise ValueError(
             f"Polygon {polygon.id!r} requires at least 3 vertices; got {len(polygon.point_ids)!r}"
         )
+    for pid in polygon.point_ids:
+        _require_finite_coords(points[pid], "easting", "northing")
     sp_poly = shapely.Polygon(
         [(points[pid].easting, points[pid].northing) for pid in polygon.point_ids]
     )
@@ -215,11 +272,14 @@ def validate_circle_tangent_point(center: Point, surface_point: Point, radius: f
     Raises
     ------
     ValueError
-        If ``radius`` is non-finite (``nan`` or ``±inf``), or if
+        If ``radius`` or either point's planar coordinates are non-finite
+        (``nan`` or ``±inf``), or if
         ``abs(horizontal_distance - radius) >= EPS_DISTANCE``.
     """
     if not math.isfinite(radius):
         raise ValueError(f"Radius must be finite; got {radius!r}")
+    _require_finite_coords(center, "easting", "northing")
+    _require_finite_coords(surface_point, "easting", "northing")
     horizontal = math.hypot(
         surface_point.easting - center.easting, surface_point.northing - center.northing
     )
@@ -253,11 +313,14 @@ def validate_ball_tangent_point(center: Point, surface_point: Point, radius: flo
     Raises
     ------
     ValueError
-        If ``radius`` is non-finite (``nan`` or ``±inf``), or if
+        If ``radius`` or either point's 3-D coordinates are non-finite
+        (``nan`` or ``±inf``), or if
         ``abs(distance_3d - radius) >= EPS_DISTANCE``.
     """
     if not math.isfinite(radius):
         raise ValueError(f"Radius must be finite; got {radius!r}")
+    _require_finite_coords(center, "easting", "northing", "altitude")
+    _require_finite_coords(surface_point, "easting", "northing", "altitude")
     dist = float(geo.distance(center, surface_point))
     error = abs(dist - radius)
     if error >= EPS_DISTANCE:
@@ -308,15 +371,20 @@ def validate_ball_tangent_perpendicular(
     ------
     ValueError
         If ``tangent_direction`` or ``tangent_elevation`` is non-finite
-        (``nan`` or ``±inf``), if ``center`` and ``surface_point`` coincide
-        (the radius has no direction, so perpendicularity is undefined), or if
-        ``abs(dot) >= EPS_ANGLE`` (the tangent is not perpendicular).
+        (``nan`` or ``±inf``), if either point's 3-D coordinates are non-finite
+        (a poisoned radius vector both skips the coincidence guard and yields a
+        ``nan`` dot, making the perpendicular branch unreachable), if ``center``
+        and ``surface_point`` coincide (the radius has no direction, so
+        perpendicularity is undefined), or if ``abs(dot) >= EPS_ANGLE`` (the
+        tangent is not perpendicular).
     """
     if not math.isfinite(tangent_direction) or not math.isfinite(tangent_elevation):
         raise ValueError(
             f"Ball tangent direction and elevation must be finite; got "
             f"direction {tangent_direction!r}, elevation {tangent_elevation!r}"
         )
+    _require_finite_coords(center, "easting", "northing", "altitude")
+    _require_finite_coords(surface_point, "easting", "northing", "altitude")
     radius_vec = np.array(
         [
             surface_point.easting - center.easting,

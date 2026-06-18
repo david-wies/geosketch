@@ -129,6 +129,17 @@ def test_polygon_non_degenerate_rejects_collinear():
         val.validate_polygon_non_degenerate(poly, pts)
 
 
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_polygon_non_degenerate_rejects_non_finite_coord(bad):
+    # A vertex coordinate mutated to nan/±inf after construction poisons the
+    # shoelace sum; |nan| < EPS_AREA and |inf| < EPS_AREA are both False, so the
+    # non-finite signed-area guard is what rejects it.
+    pts, poly = _square()
+    pts["s0"].easting = bad
+    with pytest.raises(ValueError, match="finite"):
+        val.validate_polygon_non_degenerate(poly, pts)
+
+
 # ---------------------------------------------------------------------------
 # polygon simple
 # ---------------------------------------------------------------------------
@@ -162,6 +173,18 @@ def test_polygon_simple_rejects_fewer_than_three_vertices():
     poly = _poly("pg_v", ("v0", "v1", "v2"))
     poly.point_ids = ("v0", "v1")
     with pytest.raises(ValueError, match="at least 3 vertices"):
+        val.validate_polygon_simple(poly, pts)
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_polygon_simple_rejects_non_finite_coord(bad):
+    # A vertex coordinate mutated to nan/±inf after construction poisons
+    # shapely.is_simple (which then returns a value that makes the
+    # self-intersection branch unreachable); the up-front coordinate guard
+    # rejects it before the shapely Polygon is built.
+    pts, poly = _square()
+    pts["s2"].northing = bad
+    with pytest.raises(ValueError, match="finite"):
         val.validate_polygon_simple(poly, pts)
 
 
@@ -203,15 +226,28 @@ def test_circle_tangent_point_ignores_altitude():
 
 def test_circle_tangent_point_rejects_off_circumference():
     # 2D distance 5 but radius declared 4 -> off the circumference.
-    with pytest.raises(ValueError, match="circle"):
+    with pytest.raises(ValueError, match="does not lie on the circle"):
         val.validate_circle_tangent_point(_pt("c", 0, 0), _pt("p", 3, 4), 4.0)
 
 
-def test_circle_tangent_point_rejects_nan_radius():
-    # A NaN radius makes |distance - radius| NaN, which compares False against
-    # the tolerance and would slip the gate silently; the finite guard rejects it.
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_circle_tangent_point_rejects_non_finite_radius(bad):
+    # A non-finite radius makes |distance - radius| non-finite, which compares
+    # False against the tolerance and would slip the gate silently; the finite
+    # guard rejects it.
     with pytest.raises(ValueError, match="finite"):
-        val.validate_circle_tangent_point(_pt("c", 0, 0), _pt("p", 3, 4), math.nan)
+        val.validate_circle_tangent_point(_pt("c", 0, 0), _pt("p", 3, 4), bad)
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_circle_tangent_point_rejects_non_finite_coord(bad):
+    # A coordinate mutated to nan/±inf after construction poisons math.hypot;
+    # nan/inf both compare False against the tolerance, so without the up-front
+    # coordinate guard the validator would silently admit the bad point.
+    surface = _pt("p", 3, 4)
+    surface.easting = bad
+    with pytest.raises(ValueError, match="finite"):
+        val.validate_circle_tangent_point(_pt("c", 0, 0), surface, 5.0)
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +263,7 @@ def test_ball_tangent_point_valid_on_surface():
 def test_ball_tangent_point_rejects_using_2d_distance():
     # Horizontal distance is 5, but the true 3D distance is 13; passing radius 5
     # (the 2D value) must be rejected, proving the check is genuinely 3D.
-    with pytest.raises(ValueError, match="ball"):
+    with pytest.raises(ValueError, match="does not lie on the ball"):
         val.validate_ball_tangent_point(_pt("c", 0, 0, 0.0), _pt("p", 3, 4, 12.0), 5.0)
 
 
@@ -249,15 +285,28 @@ def test_ball_tangent_point_boundary_just_inside_tolerance():
 def test_ball_tangent_point_boundary_at_tolerance_rejects():
     # Same 3D distance 5; error exactly EPS_DISTANCE must reject (>= boundary).
     radius = 5.0 - EPS_DISTANCE
-    with pytest.raises(ValueError, match="ball"):
+    with pytest.raises(ValueError, match="does not lie on the ball"):
         val.validate_ball_tangent_point(_pt("c", 0, 0, 0.0), _pt("p", 0, 3, 4.0), radius)
 
 
-def test_ball_tangent_point_rejects_nan_radius():
-    # A NaN radius makes |distance - radius| NaN, which compares False against
-    # the tolerance and would slip the gate silently; the finite guard rejects it.
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_ball_tangent_point_rejects_non_finite_radius(bad):
+    # A non-finite radius makes |distance - radius| non-finite, which compares
+    # False against the tolerance and would slip the gate silently; the finite
+    # guard rejects it.
     with pytest.raises(ValueError, match="finite"):
-        val.validate_ball_tangent_point(_pt("c", 0, 0, 0.0), _pt("p", 3, 4, 12.0), math.nan)
+        val.validate_ball_tangent_point(_pt("c", 0, 0, 0.0), _pt("p", 3, 4, 12.0), bad)
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_ball_tangent_point_rejects_non_finite_coord(bad):
+    # An altitude mutated to nan/±inf after construction poisons geo.distance;
+    # the resulting non-finite error compares False against the tolerance, so the
+    # up-front 3-D coordinate guard is what rejects it.
+    surface = _pt("p", 3, 4, 12.0)
+    surface.altitude = bad
+    with pytest.raises(ValueError, match="finite"):
+        val.validate_ball_tangent_point(_pt("c", 0, 0, 0.0), surface, 13.0)
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +361,13 @@ def test_ball_tangent_perpendicular_boundary_over_tolerance_rejects():
 
 @pytest.mark.parametrize(
     ("direction", "elevation"),
-    [(math.nan, 0.0), (0.0, math.nan), (math.inf, 0.0)],
+    [
+        (math.nan, 0.0),
+        (0.0, math.nan),
+        (math.inf, 0.0),
+        (-math.inf, 0.0),
+        (0.0, -math.inf),
+    ],
 )
 def test_ball_tangent_perpendicular_rejects_non_finite_angle(direction, elevation):
     # A non-finite azimuth or elevation yields a NaN dot product, which compares
@@ -323,6 +378,18 @@ def test_ball_tangent_perpendicular_rejects_non_finite_angle(direction, elevatio
         val.validate_ball_tangent_perpendicular(
             _pt("c", 0, 0, 0.0), _pt("p", 1, 0, 0.0), direction, elevation
         )
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_ball_tangent_perpendicular_rejects_non_finite_coord(bad):
+    # A coordinate mutated to nan/±inf after construction poisons the radius
+    # vector: a non-finite norm skips the coincidence guard AND a non-finite dot
+    # makes the perpendicular branch unreachable (the double bypass). The
+    # up-front 3-D coordinate guard rejects the point before either runs.
+    surface = _pt("p", 1, 0, 0.0)
+    surface.northing = bad
+    with pytest.raises(ValueError, match="finite"):
+        val.validate_ball_tangent_perpendicular(_pt("c", 0, 0, 0.0), surface, 0.0, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -344,9 +411,10 @@ def test_cylinder_axis_elevation_rejects_negative():
         val.validate_cylinder_axis_elevation(-0.1)
 
 
-def test_cylinder_axis_elevation_rejects_nan():
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_cylinder_axis_elevation_rejects_non_finite(bad):
     with pytest.raises(ValueError, match="finite"):
-        val.validate_cylinder_axis_elevation(math.nan)
+        val.validate_cylinder_axis_elevation(bad)
 
 
 # ---------------------------------------------------------------------------
@@ -368,9 +436,12 @@ def test_positive_radius_rejects_negative():
         val.validate_positive_radius(-2.5)
 
 
-def test_positive_radius_rejects_nan():
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_positive_radius_rejects_non_finite(bad):
+    # The finite guard is the ONLY branch that rejects +inf: +inf > 0 is True, so
+    # without it the radius gate would silently admit an infinite radius.
     with pytest.raises(ValueError, match="finite"):
-        val.validate_positive_radius(math.nan)
+        val.validate_positive_radius(bad)
 
 
 # ---------------------------------------------------------------------------
@@ -506,10 +577,12 @@ def test_solid_non_degenerate_boundary_just_below_tolerance_rejects():
         val.validate_solid_non_degenerate(EPS_VOLUME / 2)
 
 
-def test_solid_non_degenerate_rejects_nan():
-    # A NaN from a degenerate hull must not slip the non-degenerate gate.
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_solid_non_degenerate_rejects_non_finite(bad):
+    # A NaN from a degenerate hull (or an infinite volume) must not slip the
+    # non-degenerate gate: |nan| < EPS and |inf| < EPS are both False.
     with pytest.raises(ValueError, match="finite"):
-        val.validate_solid_non_degenerate(math.nan)
+        val.validate_solid_non_degenerate(bad)
 
 
 # ---------------------------------------------------------------------------
