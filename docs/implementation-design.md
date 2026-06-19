@@ -669,13 +669,17 @@ def validate_polygon_vertex_count(polygon: Polygon) -> None:
 def validate_circle_tangent_point(
     center: Point, surface_point: Point, radius: float
 ) -> None:
-    """Raise ValueError if |distance(center, surface_point) - radius| >= EPS_DISTANCE."""
+    """Raise ValueError if |distance_2d(center, surface_point) - radius| >= EPS_DISTANCE.
+    Uses 2D horizontal (easting, northing) distance because a circle is planar.
+    Also rejects if radius <= EPS_DISTANCE (radius must be strictly positive).
+    """
 
 def validate_ball_tangent_point(
     center: Point, surface_point: Point, radius: float
 ) -> None:
     """Raise ValueError if |distance_3d(center, surface_point) - radius| >= EPS_DISTANCE.
     Uses 3D distance.
+    Also rejects if radius <= EPS_DISTANCE (radius must be strictly positive).
     """
 
 def validate_ball_tangent_perpendicular(
@@ -694,9 +698,9 @@ def validate_cylinder_axis_elevation(axis_elevation: float) -> None:
     """Raise ValueError if axis_elevation <= 0 (degenerate flat disk)."""
 
 def validate_positive_radius(radius: float) -> None:
-    """Raise ValueError if radius <= 0 (used by Circle, Ball, Cylinder)."""
+    """Raise ValueError if radius <= EPS_DISTANCE (matches Circle/Ball/Cylinder constructors)."""
 
-def validate_solid_layers(layers: list[str], objects: Mapping[str, GeoObject]) -> None:
+def validate_solid_layers(layers: Sequence[str], objects: Mapping[str, GeoObject]) -> None:
     """Raise ValueError if:
     - fewer than 2 layers
     - more than one Point layer

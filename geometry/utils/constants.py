@@ -46,9 +46,10 @@ EPS_ALTITUDE : float
     normalised Custom normal) but must be retained for a non-unit normal. No
     code consumes this constant yet.
 EPS_VOLUME : float
-    1e-9 m³. Forward-looking: will gate Solid/Ball/Cylinder degeneracy once
-    volume measurement lands (``|volume| < EPS_VOLUME`` will reject), analogous
-    to EPS_AREA for 2-D polygons. No code consumes this constant yet.
+    1e-9 m³. Gates Solid degeneracy via
+    :func:`geometry.services.validation.validate_solid_non_degenerate`
+    (``|volume| < EPS_VOLUME`` rejects), the 3-D analogue of how EPS_AREA gates
+    2-D polygon degeneracy.
 """
 
 EPS_DISTANCE: float = 1e-6
