@@ -671,6 +671,7 @@ def validate_circle_tangent_point(
 ) -> None:
     """Raise ValueError if |distance_2d(center, surface_point) - radius| >= EPS_DISTANCE.
     Uses 2D horizontal (easting, northing) distance because a circle is planar.
+    Also rejects if radius <= EPS_DISTANCE (radius must be strictly positive).
     """
 
 def validate_ball_tangent_point(
@@ -678,6 +679,7 @@ def validate_ball_tangent_point(
 ) -> None:
     """Raise ValueError if |distance_3d(center, surface_point) - radius| >= EPS_DISTANCE.
     Uses 3D distance.
+    Also rejects if radius <= EPS_DISTANCE (radius must be strictly positive).
     """
 
 def validate_ball_tangent_perpendicular(

@@ -756,3 +756,43 @@ def test_circle_tangent_point_boundary_at_tolerance_rejects():
     radius = 5.0 - EPS_DISTANCE
     with pytest.raises(ValueError, match="circle"):
         val.validate_circle_tangent_point(_pt("c", 0, 0), _pt("p", 5, 0), radius)
+
+
+def test_ball_tangent_perpendicular_boundary_at_tolerance_rejects():
+    # Pins the EXACT EPS_ANGLE boundary of the >= gate so a future >= -> >
+    # regression would be caught by this test.
+    #
+    # With elevation 0 the dot product reduces to |sin(azimuth)|. Choosing
+    # az = asin(EPS_ANGLE) makes sin(az) == EPS_ANGLE exactly, so |dot| ==
+    # EPS_ANGLE. The gate is `if dot >= EPS_ANGLE`, so this must raise.
+    #
+    # The 0.1x/10x margin tests in test_ball_tangent_perpendicular_boundary_*
+    # never touch the exact edge; this test locks it.
+    az = math.asin(EPS_ANGLE)
+    with pytest.raises(ValueError, match="perpendicular"):
+        val.validate_ball_tangent_perpendicular(_pt("c", 0, 0, 0.0), _pt("p", 1, 0, 0.0), az, 0.0)
+
+
+def test_polygon_non_degenerate_accepts_clockwise_winding():
+    # A CW square: vertices (0,0),(0,2),(2,2),(2,0) have a negative shoelace
+    # signed area (-4.0). The validator calls abs(signed_area) at line 176,
+    # so winding direction must be irrelevant — this test proves that the abs()
+    # is load-bearing and that the validator does not silently require CCW input.
+    pts = {
+        "cw0": _pt("cw0", 0, 0),
+        "cw1": _pt("cw1", 0, 2),
+        "cw2": _pt("cw2", 2, 2),
+        "cw3": _pt("cw3", 2, 0),
+    }
+    poly = _poly("pg_cw", ("cw0", "cw1", "cw2", "cw3"))
+    val.validate_polygon_non_degenerate(poly, pts)  # signed area -4 -> |area| 4 -> ok
+
+
+def test_solid_layers_valid_two_layers_point_apex():
+    # Minimal valid apex stack: exactly [point, polygon].  The existing
+    # test_solid_layers_valid_point_apex_first uses a 3-layer stack; this test
+    # proves the position-rules also accept a 2-layer degenerate apex where the
+    # Point is the ONLY non-polygon layer and sits at index 0, which the guard
+    # `point_indices[0] not in (0, len(layers) - 1)` must not reject.
+    objects = _solid_objects()
+    val.validate_solid_layers(["pt_apex", "pg_a"], objects)
