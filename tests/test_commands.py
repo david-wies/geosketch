@@ -78,17 +78,34 @@ _LINE_HEX = "#101010"
 _FILL_HEX = "#f0f0f0"
 
 
+def _env(pid: str) -> dict:
+    """Display-envelope kwargs (id/name/alpha/visibility) shared by every builder."""
+    return {"id": pid, "name": pid, "alpha": 1.0, "visibility": True}
+
+
+def _bearing(
+    mode: DirectionMode = DirectionMode.AZIMUTH,
+    direction: float = 0.0,
+    elevation: float = 0.0,
+) -> dict:
+    """Direction-metadata kwargs for the four ElevatedObject subclasses."""
+    return {
+        "direction": direction,
+        "elevation": elevation,
+        "direction_mode": mode,
+        "direction_units": DirectionUnits.RADIANS,
+    }
+
+
+def _colors() -> dict:
+    """Line/fill colour kwargs for the nine non-Point types."""
+    return {"line_color": _LINE_HEX, "fill_color": _FILL_HEX}
+
+
 def make_point(pid: str, easting: float, northing: float, altitude: float = 0.0) -> Point:
     """Build a Point with the given coordinates and an arbitrary marker colour."""
     return Point(
-        id=pid,
-        name=pid,
-        alpha=1.0,
-        visibility=True,
-        easting=easting,
-        northing=northing,
-        altitude=altitude,
-        color="#abcdef",
+        **_env(pid), easting=easting, northing=northing, altitude=altitude, color="#abcdef"
     )
 
 
@@ -100,105 +117,56 @@ def make_line(
 ) -> Line:
     """Build a Line between two point IDs with a placeholder direction/elevation."""
     return Line(
-        id=pid,
-        name=pid,
-        alpha=1.0,
-        visibility=True,
-        direction=0.0,
-        elevation=0.0,
-        direction_mode=mode,
-        direction_units=DirectionUnits.RADIANS,
+        **_env(pid),
+        **_bearing(mode),
         point_a_id=point_a_id,
         point_b_id=point_b_id,
-        line_color=_LINE_HEX,
-        fill_color=_FILL_HEX,
+        **_colors(),
     )
 
 
 def make_ray(pid: str, origin_id: str) -> Ray:
     """Build a Ray from an origin point with a fixed intrinsic direction."""
     return Ray(
-        id=pid,
-        name=pid,
-        alpha=1.0,
-        visibility=True,
-        direction=1.0,
-        elevation=0.25,
-        direction_mode=DirectionMode.AZIMUTH,
-        direction_units=DirectionUnits.RADIANS,
-        origin_id=origin_id,
-        line_color=_LINE_HEX,
-        fill_color=_FILL_HEX,
+        **_env(pid), **_bearing(direction=1.0, elevation=0.25), origin_id=origin_id, **_colors()
     )
 
 
 def make_vector(pid: str, origin_id: str, length: float, endpoint_id: str | None) -> Vector:
     """Build a Vector, either Length+Direction (no endpoint) or Origin+Endpoint."""
     return Vector(
-        id=pid,
-        name=pid,
-        alpha=1.0,
-        visibility=True,
-        direction=0.0,
-        elevation=0.0,
-        direction_mode=DirectionMode.AZIMUTH,
-        direction_units=DirectionUnits.RADIANS,
+        **_env(pid),
+        **_bearing(),
         origin_id=origin_id,
         length=length,
         endpoint_id=endpoint_id,
-        line_color=_LINE_HEX,
-        fill_color=_FILL_HEX,
+        **_colors(),
     )
 
 
 def make_circle(pid: str, center_id: str, radius: float = 5.0) -> Circle:
     """Build a Circle around a centre point."""
-    return Circle(
-        id=pid,
-        name=pid,
-        alpha=1.0,
-        visibility=True,
-        center_id=center_id,
-        radius=radius,
-        line_color=_LINE_HEX,
-        fill_color=_FILL_HEX,
-    )
+    return Circle(**_env(pid), center_id=center_id, radius=radius, **_colors())
 
 
 def make_tangent(pid: str, shape_id: str, point_id: str) -> Tangent:
     """Build a Circle Tangent (elevation 0.0) at a surface point."""
     return Tangent(
-        id=pid,
-        name=pid,
-        alpha=1.0,
-        visibility=True,
-        direction=0.0,
-        elevation=0.0,
-        direction_mode=DirectionMode.AZIMUTH,
-        direction_units=DirectionUnits.RADIANS,
+        **_env(pid),
+        **_bearing(),
         shape_id=shape_id,
         shape_type="circle",
         point_id=point_id,
-        line_color=_LINE_HEX,
-        fill_color=_FILL_HEX,
+        **_colors(),
     )
 
 
 def make_polygon(pid: str, point_ids: tuple[str, ...], is_convex: bool = True) -> Polygon:
     """Build a Polygon over the given vertex IDs."""
-    return Polygon(
-        id=pid,
-        name=pid,
-        alpha=1.0,
-        visibility=True,
-        point_ids=point_ids,
-        is_convex=is_convex,
-        line_color=_LINE_HEX,
-        fill_color=_FILL_HEX,
-    )
+    return Polygon(**_env(pid), point_ids=point_ids, is_convex=is_convex, **_colors())
 
 
-class _HistoryRecorder:
+class _HistoryRecorder:  # pylint: disable=too-few-public-methods
     """Records every :data:`HISTORY_CHANGED` payload for assertions."""
 
     def __init__(self) -> None:
@@ -376,7 +344,7 @@ def test_create_object_round_trip():
     assert counter.created == ["pt_001"]
 
     history.undo()
-    assert objects == {}
+    assert not objects
     assert not graph.is_registered("pt_001")
     assert counter.deleted == [["pt_001"]]
 
@@ -806,7 +774,7 @@ def test_bulk_import_round_trip():
     assert counter.created == ["pt_001", "pt_002", "pt_003"]
 
     history.undo()
-    assert objects == {}
+    assert not objects
     # Undo reverses import order: last created is deleted first.
     assert counter.deleted == [["pt_003"], ["pt_002"], ["pt_001"]]
 
