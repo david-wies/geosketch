@@ -244,6 +244,32 @@ def test_polygon_vertex_count_rejects_two():
 
 
 # ---------------------------------------------------------------------------
+# polygon Tier-2 KeyError contract (missing reference precondition skipped)
+# ---------------------------------------------------------------------------
+
+
+def test_polygon_non_degenerate_missing_point_raises_keyerror():
+    # The two-tier contract: validate_reference_exists (Tier 1, user-facing) is
+    # documented to run on every vertex first. If a caller skips it and a vertex
+    # ID is absent from `points`, indexing points[pid] raises KeyError (Tier 2,
+    # programmer error) -- NOT ValueError -- so the bug surfaces loudly rather
+    # than folding into the user-error channel.
+    pts, poly = _square()
+    del pts["s0"]
+    with pytest.raises(KeyError):
+        val.validate_polygon_non_degenerate(poly, pts)
+
+
+def test_polygon_simple_missing_point_raises_keyerror():
+    # Same Tier-2 contract for validate_polygon_simple: a dangling vertex ID that
+    # bypassed validate_reference_exists raises KeyError, not ValueError.
+    pts, poly = _square()
+    del pts["s0"]
+    with pytest.raises(KeyError):
+        val.validate_polygon_simple(poly, pts)
+
+
+# ---------------------------------------------------------------------------
 # circle tangent point (2D)
 # ---------------------------------------------------------------------------
 
@@ -283,6 +309,27 @@ def test_circle_tangent_point_rejects_non_finite_coord(bad):
     surface.easting = bad
     with pytest.raises(ValueError, match="finite"):
         val.validate_circle_tangent_point(_pt("c", 0, 0), surface, 5.0)
+
+
+@pytest.mark.parametrize("radius", [0.0, -1e-9, EPS_DISTANCE])
+def test_circle_tangent_point_rejects_non_positive_radius(radius):
+    # A zero / small-negative / exactly-EPS_DISTANCE radius paired with a
+    # near-coincident surface point would make |distance - radius| < EPS_DISTANCE
+    # true, so the off-circumference branch never fires and the validator would
+    # silently accept a geometrically-invalid radius. The positivity guard
+    # (radius <= EPS_DISTANCE, matching validate_positive_radius) rejects it
+    # before the distance test runs. EPS_DISTANCE itself rejects (the bound is
+    # <=), pinning the boundary against a future flip.
+    surface = _pt("p", radius, 0)  # distance == radius, so the old reject branch was dead
+    with pytest.raises(ValueError, match="must be >"):
+        val.validate_circle_tangent_point(_pt("c", 0, 0), surface, radius)
+
+
+def test_circle_tangent_point_accepts_radius_just_above_tolerance():
+    # Just above the bound the validator behaves normally: a surface point at the
+    # matching distance passes (proving the guard does not over-reach).
+    radius = EPS_DISTANCE * 2
+    val.validate_circle_tangent_point(_pt("c", 0, 0), _pt("p", radius, 0), radius)
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +391,27 @@ def test_ball_tangent_point_rejects_non_finite_coord(bad):
         val.validate_ball_tangent_point(_pt("c", 0, 0, 0.0), surface, 13.0)
 
 
+@pytest.mark.parametrize("radius", [0.0, -1e-9, EPS_DISTANCE])
+def test_ball_tangent_point_rejects_non_positive_radius(radius):
+    # A zero / small-negative / exactly-EPS_DISTANCE radius paired with a
+    # near-coincident surface point would make |distance - radius| < EPS_DISTANCE
+    # true, so the off-surface branch never fires and the validator would silently
+    # accept a geometrically-invalid radius. The positivity guard (radius <=
+    # EPS_DISTANCE, matching validate_positive_radius) rejects it before the
+    # distance test runs. EPS_DISTANCE itself rejects (the bound is <=), pinning
+    # the boundary against a future flip.
+    surface = _pt("p", 0, 0, radius)  # distance == radius, so the old reject branch was dead
+    with pytest.raises(ValueError, match="must be >"):
+        val.validate_ball_tangent_point(_pt("c", 0, 0, 0.0), surface, radius)
+
+
+def test_ball_tangent_point_accepts_radius_just_above_tolerance():
+    # Just above the bound the validator behaves normally: a surface point at the
+    # matching 3-D distance passes (proving the guard does not over-reach).
+    radius = EPS_DISTANCE * 2
+    val.validate_ball_tangent_point(_pt("c", 0, 0, 0.0), _pt("p", 0, 0, radius), radius)
+
+
 # ---------------------------------------------------------------------------
 # ball tangent perpendicular
 # ---------------------------------------------------------------------------
@@ -401,6 +469,7 @@ def test_ball_tangent_perpendicular_boundary_over_tolerance_rejects():
         (0.0, math.nan),
         (math.inf, 0.0),
         (-math.inf, 0.0),
+        (0.0, math.inf),
         (0.0, -math.inf),
     ],
 )

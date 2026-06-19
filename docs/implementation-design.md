@@ -698,7 +698,7 @@ def validate_cylinder_axis_elevation(axis_elevation: float) -> None:
 def validate_positive_radius(radius: float) -> None:
     """Raise ValueError if radius <= EPS_DISTANCE (matches Circle/Ball/Cylinder constructors)."""
 
-def validate_solid_layers(layers: list[str], objects: Mapping[str, GeoObject]) -> None:
+def validate_solid_layers(layers: Sequence[str], objects: Mapping[str, GeoObject]) -> None:
     """Raise ValueError if:
     - fewer than 2 layers
     - more than one Point layer

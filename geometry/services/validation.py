@@ -286,11 +286,16 @@ def validate_circle_tangent_point(center: Point, surface_point: Point, radius: f
     ------
     ValueError
         If ``radius`` or either point's planar coordinates are non-finite
-        (``nan`` or ``±inf``), or if
+        (``nan`` or ``±inf``), if ``radius <= EPS_DISTANCE`` (a zero / near-zero
+        / small-negative radius paired with a near-coincident surface point would
+        otherwise make the off-circumference branch unreachable, silently
+        admitting a geometrically-invalid radius), or if
         ``abs(horizontal_distance - radius) >= EPS_DISTANCE``.
     """
     if not math.isfinite(radius):
         raise ValueError(f"Radius must be finite; got {radius!r}")
+    if radius <= EPS_DISTANCE:
+        raise ValueError(f"Radius must be > {EPS_DISTANCE}; got {radius!r}")
     _require_finite_coords(center, "easting", "northing")
     _require_finite_coords(surface_point, "easting", "northing")
     horizontal = math.hypot(
@@ -327,11 +332,16 @@ def validate_ball_tangent_point(center: Point, surface_point: Point, radius: flo
     ------
     ValueError
         If ``radius`` or either point's 3-D coordinates are non-finite
-        (``nan`` or ``±inf``), or if
+        (``nan`` or ``±inf``), if ``radius <= EPS_DISTANCE`` (a zero / near-zero
+        / small-negative radius paired with a near-coincident surface point would
+        otherwise make the off-surface branch unreachable, silently admitting a
+        geometrically-invalid radius), or if
         ``abs(distance_3d - radius) >= EPS_DISTANCE``.
     """
     if not math.isfinite(radius):
         raise ValueError(f"Radius must be finite; got {radius!r}")
+    if radius <= EPS_DISTANCE:
+        raise ValueError(f"Radius must be > {EPS_DISTANCE}; got {radius!r}")
     _require_finite_coords(center, "easting", "northing", "altitude")
     _require_finite_coords(surface_point, "easting", "northing", "altitude")
     dist = float(geo.distance(center, surface_point))
@@ -387,7 +397,8 @@ def validate_ball_tangent_perpendicular(
         (``nan`` or ``±inf``), if either point's 3-D coordinates are non-finite
         (a poisoned radius vector both skips the coincidence guard and yields a
         ``nan`` dot, making the perpendicular branch unreachable), if ``center``
-        and ``surface_point`` coincide (the radius has no direction, so
+        and ``surface_point`` coincide or are within ``EPS_DISTANCE`` of each
+        other (the radius is too short to have a well-defined direction, so
         perpendicularity is undefined), or if ``abs(dot) >= EPS_ANGLE`` (the
         tangent is not perpendicular).
     """
@@ -404,8 +415,9 @@ def validate_ball_tangent_perpendicular(
     norm = math.hypot(radius_e, radius_n, radius_z)
     if norm < EPS_DISTANCE:
         raise ValueError(
-            "Ball tangent is undefined: center and surface point coincide "
-            "(zero-length radius), so perpendicularity cannot be checked"
+            "Ball tangent is undefined: center and surface point coincide or are "
+            "within EPS_DISTANCE (radius too short to have a well-defined "
+            "direction), so perpendicularity cannot be checked"
         )
     cos_el = math.cos(tangent_elevation)
     tangent_e = math.sin(tangent_direction) * cos_el
