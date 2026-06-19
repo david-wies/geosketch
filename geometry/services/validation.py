@@ -52,8 +52,9 @@ Conventions
   catching :class:`ValueError` already covers the missing-ID case. Tier 2
   (programmer error): the polygon validators
   (:func:`validate_polygon_non_degenerate`, :func:`validate_polygon_simple`)
-  index ``points[pid]`` directly and therefore raise :class:`KeyError`, not
-  :class:`ValueError`, if that precondition was skipped. The split is
+  resolve ``points[pid]`` (directly, or via :func:`geometry.signed_area`) and
+  therefore raise :class:`KeyError`, not :class:`ValueError`, if that
+  precondition was skipped. The split is
   intentional: a missing ID reaching these validators is a bug in the call
   sequence, not user-facing bad input, and is surfaced loudly rather than
   folded into the user-error channel.
@@ -192,12 +193,15 @@ def validate_polygon_simple(polygon: Polygon, points: Mapping[str, Point]) -> No
     :mod:`geometry.services.geometry` constructs shapely geometry at the call
     boundary.
 
-    Simplicity is **not** the same property as non-degeneracy: ``is_simple``
-    also reports ``False`` for a collinear or coincident-vertex ring that
-    collapses to a line (zero enclosed area), so this validator can reject such
-    a ring too — its message names both causes. Dedicated zero-area rejection
-    (with the precise ``EPS_AREA`` tolerance) is the job of
-    :func:`validate_polygon_non_degenerate`; run both for a full picture.
+    Simplicity is **not** the same property as non-degeneracy. ``is_simple``
+    reports ``False`` for a collinear ring (or one carrying *some* repeated
+    vertices) that collapses to a line, so this validator rejects those too. It
+    does **not**, however, catch a *fully*-coincident ring (every vertex the
+    same point, e.g. ``[(5,5),(5,5),(5,5)]``): shapely treats that as ``simple``,
+    and it is instead rejected on area by
+    :func:`validate_polygon_non_degenerate` via :data:`EPS_AREA`. Because each
+    validator covers a degeneracy the other misses, run **both** for a full
+    picture.
 
     Parameters
     ----------
@@ -213,7 +217,9 @@ def validate_polygon_simple(polygon: Polygon, points: Mapping[str, Point]) -> No
         shapely cannot construct), if any vertex coordinate is non-finite (a
         ``nan`` / ``±inf`` poisons ``shapely.is_simple``, which then makes the
         not-simple branch unreachable), or if its boundary is not a simple ring
-        (self-intersecting, or collinear/zero-area).
+        (self-intersecting, or collinear/zero-area with some repeated vertices —
+        a *fully*-coincident ring is simple to shapely and is rejected on area
+        by :func:`validate_polygon_non_degenerate` instead).
     KeyError
         If a point ID in ``polygon.point_ids`` is absent from ``points`` (a
         programmer error under the documented precondition that
@@ -231,8 +237,10 @@ def validate_polygon_simple(polygon: Polygon, points: Mapping[str, Point]) -> No
     if not shapely.is_simple(sp_poly):
         raise ValueError(
             f"Polygon {polygon.id!r} is not a simple ring (self-intersecting, "
-            f"or collinear/zero-area so the boundary collapses to a line); a "
-            f"simple ring must not cross itself or degenerate"
+            f"or collinear/zero-area with some repeated vertices so the boundary "
+            f"collapses to a line); a simple ring must not cross itself. (A "
+            f"fully-coincident ring is simple to shapely and is rejected on area "
+            f"by validate_polygon_non_degenerate instead.)"
         )
 
 
@@ -292,10 +300,7 @@ def validate_circle_tangent_point(center: Point, surface_point: Point, radius: f
         admitting a geometrically-invalid radius), or if
         ``abs(horizontal_distance - radius) >= EPS_DISTANCE``.
     """
-    if not math.isfinite(radius):
-        raise ValueError(f"Radius must be finite; got {radius!r}")
-    if radius <= EPS_DISTANCE:
-        raise ValueError(f"Radius must be > {EPS_DISTANCE}; got {radius!r}")
+    validate_positive_radius(radius)
     _require_finite_coords(center, "easting", "northing")
     _require_finite_coords(surface_point, "easting", "northing")
     horizontal = math.hypot(
@@ -338,10 +343,7 @@ def validate_ball_tangent_point(center: Point, surface_point: Point, radius: flo
         geometrically-invalid radius), or if
         ``abs(distance_3d - radius) >= EPS_DISTANCE``.
     """
-    if not math.isfinite(radius):
-        raise ValueError(f"Radius must be finite; got {radius!r}")
-    if radius <= EPS_DISTANCE:
-        raise ValueError(f"Radius must be > {EPS_DISTANCE}; got {radius!r}")
+    validate_positive_radius(radius)
     _require_finite_coords(center, "easting", "northing", "altitude")
     _require_finite_coords(surface_point, "easting", "northing", "altitude")
     dist = float(geo.distance(center, surface_point))

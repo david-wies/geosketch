@@ -311,6 +311,19 @@ def test_circle_tangent_point_rejects_non_finite_coord(bad):
         val.validate_circle_tangent_point(_pt("c", 0, 0), surface, 5.0)
 
 
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_circle_tangent_point_rejects_non_finite_center_coord(bad):
+    # The CENTER guard (distinct from the surface-point guard above): a centre
+    # coordinate mutated to nan/±inf after construction poisons math.hypot just
+    # the same. A refactor dropping _require_finite_coords(center, ...) would
+    # pass every surface-point test yet reintroduce NaN poisoning; this exercises
+    # the centre branch specifically.
+    center = _pt("c", 0, 0)
+    center.easting = bad
+    with pytest.raises(ValueError, match="finite"):
+        val.validate_circle_tangent_point(center, _pt("p", 3, 4), 5.0)
+
+
 @pytest.mark.parametrize("radius", [0.0, -1e-9, EPS_DISTANCE])
 def test_circle_tangent_point_rejects_non_positive_radius(radius):
     # A zero / small-negative / exactly-EPS_DISTANCE radius paired with a
@@ -389,6 +402,19 @@ def test_ball_tangent_point_rejects_non_finite_coord(bad):
     surface.altitude = bad
     with pytest.raises(ValueError, match="finite"):
         val.validate_ball_tangent_point(_pt("c", 0, 0, 0.0), surface, 13.0)
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_ball_tangent_point_rejects_non_finite_center_coord(bad):
+    # The CENTER guard (distinct from the surface-point guard above): a centre
+    # altitude mutated to nan/±inf after construction poisons geo.distance just
+    # the same. A refactor dropping _require_finite_coords(center, ...) would pass
+    # every surface-point test yet reintroduce NaN poisoning; this exercises the
+    # centre branch specifically.
+    center = _pt("c", 0, 0, 0.0)
+    center.altitude = bad
+    with pytest.raises(ValueError, match="finite"):
+        val.validate_ball_tangent_point(center, _pt("p", 3, 4, 12.0), 13.0)
 
 
 @pytest.mark.parametrize("radius", [0.0, -1e-9, EPS_DISTANCE])
@@ -494,6 +520,20 @@ def test_ball_tangent_perpendicular_rejects_non_finite_coord(bad):
     surface.northing = bad
     with pytest.raises(ValueError, match="finite"):
         val.validate_ball_tangent_perpendicular(_pt("c", 0, 0, 0.0), surface, 0.0, 0.0)
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_ball_tangent_perpendicular_rejects_non_finite_center_coord(bad):
+    # The CENTER guard (distinct from the surface-point guard above): a centre
+    # coordinate mutated to nan/±inf after construction poisons the radius vector
+    # (non-finite norm skips the coincidence guard; non-finite dot makes the
+    # perpendicular branch unreachable). The angles here are finite, so only the
+    # centre coordinate guard can reject -- exercising the centre branch
+    # specifically (a refactor dropping it would pass every surface-point test).
+    center = _pt("c", 0, 0, 0.0)
+    center.northing = bad
+    with pytest.raises(ValueError, match="finite"):
+        val.validate_ball_tangent_perpendicular(center, _pt("p", 1, 0, 0.0), 0.0, 0.0)
 
 
 # ---------------------------------------------------------------------------
