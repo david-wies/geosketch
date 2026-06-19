@@ -27,9 +27,21 @@ The object store is a flat ``dict[str, GeoObject]`` keyed by ID string, and
 every inter-object reference is an ID string rather than a memory pointer (see
 ``CLAUDE.md`` §4). That means a command can swap a whole object *instance* in
 and out of the dict on do/undo without breaking any referrer — nobody holds a
-pointer to the old instance. Commands therefore snapshot the affected objects
-with :func:`copy.deepcopy` and restore those snapshots verbatim, which is both
-simpler and more robust than computing field-level diffs.
+pointer to the old instance.
+
+Two restore strategies coexist, chosen per command:
+
+* **Deepcopy snapshots** — the three *editing* commands
+  (:class:`ModifyObjectCommand`, :class:`MovePointCommand`,
+  :class:`ModifyPolygonVerticesCommand`) take :func:`copy.deepcopy` snapshots of
+  the affected objects before and after the edit and restore those snapshots
+  verbatim, which is simpler and more robust than computing field-level diffs.
+* **Live-instance swap** — :class:`CreateObjectCommand` reuses the single live
+  instance it was handed, and :class:`CascadeDeleteCommand` stores live
+  references to the instances it removes. No deepcopy is needed because a
+  removed (or not-yet-inserted) instance is never mutated in place while it is
+  out of the store, so swapping it back in restores the original field state
+  faithfully.
 
 Collaborators, not a Project
 ----------------------------
@@ -59,6 +71,7 @@ the reference for which derived scalars each dependent type caches.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import logging
 from collections import deque
 from collections.abc import Sequence
@@ -70,11 +83,13 @@ from geometry.models.line import Line
 from geometry.models.polygon import Polygon
 from geometry.models.tangent import Tangent
 from geometry.models.vector import Vector
+from geometry.services import validation
 from geometry.services.dep_graph import DependencyGraph
 from geometry.services.geometry import azimuth as _azimuth
 from geometry.services.geometry import distance as _distance
 from geometry.services.geometry import elevation as _elevation
 from geometry.services.geometry import is_convex as _is_convex
+from geometry.services.geometry import signed_area as _signed_area
 from geometry.services.geometry import tangent_direction as _tangent_direction
 from geometry.utils.angles import azimuth_to_angle, normalize_to_2pi
 from geometry.utils.events import (
@@ -117,6 +132,13 @@ class Command(Protocol):
     classes need not inherit from anything. ``@runtime_checkable`` lets tests
     assert ``isinstance(cmd, Command)`` structurally.
 
+    Caveat: ``@runtime_checkable`` only checks **member presence**. An
+    ``isinstance(cmd, Command)`` test passes as long as the object has
+    ``description``, ``do`` and ``undo`` attributes — it does *not* verify their
+    signatures, that ``do``/``undo`` are callable with no required arguments, or
+    that ``description`` is actually a ``str``. Treat a passing check as "looks
+    structurally command-shaped", not as a full contract guarantee.
+
     The contract is that :meth:`undo` exactly reverses the state change made by
     the most recent :meth:`do`, so that an arbitrary ``do``/``undo``/``do`` …
     sequence is always consistent with the object store.
@@ -148,19 +170,23 @@ class CommandHistory:
     reachable.
 
     Every state-changing method fires :data:`~geometry.utils.events.HISTORY_CHANGED`
-    (when a bus is configured) carrying the current :attr:`can_undo` /
-    :attr:`can_redo` flags, so a toolbar can enable/disable its Undo/Redo
-    controls without polling. If a bus is supplied, the history also subscribes
-    to :data:`~geometry.utils.events.PROJECT_LOADED` and clears itself when a new
-    project is loaded — undo history from the previous project is meaningless
-    against the new object store.
+    carrying the current :attr:`can_undo` / :attr:`can_redo` flags, so a toolbar
+    can enable/disable its Undo/Redo controls without polling. The history also
+    subscribes to :data:`~geometry.utils.events.PROJECT_LOADED` and clears itself
+    when a new project is loaded — undo history from the previous project is
+    meaningless against the new object store.
+
+    The bus is **required** (no ``None`` default): a missing bus would silently
+    disable the :data:`PROJECT_LOADED` self-clear, a real behavioural divergence,
+    and is inconsistent with the command classes which all require a non-optional
+    bus. Event-agnostic tests can simply pass a fresh ``EventBus()`` with no
+    subscribers, which makes every ``fire`` a no-op.
 
     Fields
     ------
-    _bus : EventBus | None
+    _bus : EventBus
         Event bus used to publish :data:`HISTORY_CHANGED` and to receive
-        :data:`PROJECT_LOADED`. ``None`` disables both (useful in unit tests that
-        do not exercise eventing).
+        :data:`PROJECT_LOADED`.
     _undo : collections.deque[Command]
         Applied commands, oldest at the left, newest at the right. Capped at
         :data:`MAX_HISTORY`; overflow drops the oldest entry.
@@ -169,14 +195,13 @@ class CommandHistory:
         (end of the list). Cleared by :meth:`push`.
     """
 
-    def __init__(self, bus: EventBus | None = None) -> None:
+    def __init__(self, bus: EventBus) -> None:
         self._bus = bus
         self._undo: deque[Command] = deque(maxlen=MAX_HISTORY)
         self._redo: list[Command] = []
-        if bus is not None:
-            # Clear history on project load: undo entries reference objects from
-            # the previous project and would corrupt the freshly loaded store.
-            bus.subscribe(PROJECT_LOADED, self._on_project_loaded)
+        # Clear history on project load: undo entries reference objects from
+        # the previous project and would corrupt the freshly loaded store.
+        bus.subscribe(PROJECT_LOADED, self._on_project_loaded)
 
     def _on_project_loaded(self) -> None:
         """Clear all history when a new project is loaded (bus handler)."""
@@ -184,8 +209,7 @@ class CommandHistory:
 
     def _fire_history_changed(self) -> None:
         """Publish :data:`HISTORY_CHANGED` with the current undo/redo flags."""
-        if self._bus is not None:
-            self._bus.fire(HISTORY_CHANGED, can_undo=self.can_undo, can_redo=self.can_redo)
+        self._bus.fire(HISTORY_CHANGED, can_undo=self.can_undo, can_redo=self.can_redo)
 
     @property
     def can_undo(self) -> bool:
@@ -218,6 +242,13 @@ class CommandHistory:
     def undo(self) -> Command | None:
         """Reverse the newest command and move it to the redo stack.
 
+        The top command is *peeked* and :meth:`Command.undo` is applied before
+        either stack is mutated. If ``undo`` raises (e.g. a bus handler throws —
+        :meth:`EventBus.fire` propagates — or a partial mutation fails) the
+        command stays on the undo stack and :data:`HISTORY_CHANGED` never fires,
+        so the failed transition is fully recoverable rather than losing the
+        command from both stacks.
+
         Returns
         -------
         Command or None
@@ -226,14 +257,22 @@ class CommandHistory:
         """
         if not self._undo:
             return None
-        cmd = self._undo.pop()
+        cmd = self._undo[-1]  # peek; stacks untouched if undo() raises
         cmd.undo()
+        self._undo.pop()
         self._redo.append(cmd)
         self._fire_history_changed()
         return cmd
 
     def redo(self) -> Command | None:
         """Re-apply the most recently undone command.
+
+        The top command is *peeked* and :meth:`Command.do` is applied before
+        either stack is mutated. If ``do`` raises (e.g. a bus handler throws —
+        :meth:`EventBus.fire` propagates — or a partial mutation fails) the
+        command stays on the redo stack and :data:`HISTORY_CHANGED` never fires,
+        so the failed transition is fully recoverable rather than losing the
+        command from both stacks.
 
         Returns
         -------
@@ -243,8 +282,9 @@ class CommandHistory:
         """
         if not self._redo:
             return None
-        cmd = self._redo.pop()
+        cmd = self._redo[-1]  # peek; stacks untouched if do() raises
         cmd.do()
+        self._redo.pop()
         self._undo.append(cmd)
         self._fire_history_changed()
         return cmd
@@ -269,6 +309,13 @@ class CreateObjectCommand:
     unregisters it, firing :data:`OBJECT_DELETED`. Because references are ID
     strings, re-inserting the same instance on redo restores every referrer
     automatically.
+
+    Single-call semantics: this command assumes :meth:`do` runs before
+    :meth:`undo`. :class:`CommandHistory` always calls :meth:`do` first (via
+    :meth:`CommandHistory.push`), so no guard is needed in normal use. Calling
+    :meth:`undo` prematurely (before any :meth:`do`) would attempt to remove an
+    object that the store never received; that missing-key case is handled
+    defensively as a logged no-op rather than a bare ``KeyError``.
 
     Fields
     ------
@@ -298,13 +345,45 @@ class CreateObjectCommand:
         self.description = f"Create {obj.type} '{obj.name}'"
 
     def do(self) -> None:
-        """Insert the object, register its edges, fire :data:`OBJECT_CREATED`."""
+        """Insert the object, register its edges, fire :data:`OBJECT_CREATED`.
+
+        The store insert and graph registration are made atomic: if
+        :meth:`DependencyGraph.add` raises (e.g. a malformed reference field), the
+        just-inserted store entry is removed before the exception propagates, so a
+        failed create never leaves the object orphaned in the store with no graph
+        edges. This also keeps :class:`BulkImportCommand`'s rollback exact, since
+        a failed wrapped create contributes no partial state of its own.
+        """
         self._objects[self._obj.id] = self._obj
-        self._graph.add(self._obj)
+        try:
+            self._graph.add(self._obj)
+        except Exception:
+            _logger.error(
+                "CreateObjectCommand.do: graph registration failed for %r; "
+                "removing the just-inserted store entry",
+                self._obj.id,
+            )
+            del self._objects[self._obj.id]
+            raise
         self._bus.fire(OBJECT_CREATED, obj_id=self._obj.id)
 
     def undo(self) -> None:
-        """Remove the object, unregister it, fire :data:`OBJECT_DELETED`."""
+        """Remove the object, unregister it, fire :data:`OBJECT_DELETED`.
+
+        Guards the store removal: if the object was already removed out-of-band
+        (so ``self._obj.id`` is absent from the store) the removal is a logged
+        no-op rather than a bare ``KeyError``, and the graph is left untouched —
+        unregistering an id this command did not remove would deepen the
+        store/graph inconsistency. Only when this command actually removes the
+        object does it unregister the matching edges, keeping the two in sync.
+        """
+        if self._obj.id not in self._objects:
+            _logger.warning(
+                "CreateObjectCommand.undo: object %r already absent from the store; "
+                "treating removal as a no-op and leaving the graph untouched",
+                self._obj.id,
+            )
+            return
         del self._objects[self._obj.id]
         self._graph.unregister(self._obj.id)
         self._bus.fire(OBJECT_DELETED, obj_ids=[self._obj.id])
@@ -326,6 +405,17 @@ class CascadeDeleteCommand:
     set from the restored graph. The deleted instances are never mutated while
     out of the store, so the snapshot preserves their original IDs and field
     state for a faithful restore.
+
+    Single-call semantics: this command assumes :meth:`do` runs before
+    :meth:`undo`. :class:`CommandHistory` always calls :meth:`do` first, so no
+    guard is required; a premature :meth:`undo` (before any :meth:`do`) simply
+    iterates an empty snapshot and is a harmless no-op.
+
+    Atomicity: :meth:`do` removes each ``(store entry, graph edge set)`` pair in
+    turn, but if any removal raises mid-cascade it restores every pair already
+    removed before re-raising, so the store and graph never disagree about a
+    half-deleted closure (and no :data:`OBJECT_DELETED` fires for a failed
+    cascade).
 
     Fields
     ------
@@ -362,14 +452,44 @@ class CascadeDeleteCommand:
         self._snapshot: dict[str, GeoObject] = {}
 
     def do(self) -> None:
-        """Remove the root plus its dependent closure; fire one delete event."""
+        """Remove the root plus its dependent closure; fire one delete event.
+
+        Removal is atomic: if any per-object removal raises mid-cascade, every
+        already-removed object is re-inserted and re-registered before the
+        exception propagates, so the store and graph are restored exactly to
+        their pre-:meth:`do` state and no partial deletion persists.
+        """
         closure = self._graph.dependents_of(self._root_id) | {self._root_id}
         # Store the live instances directly: they are not mutated while deleted,
         # so their original IDs/state are preserved for a faithful undo.
         self._snapshot = {oid: self._objects[oid] for oid in closure if oid in self._objects}
-        for oid in self._snapshot:
-            del self._objects[oid]
-            self._graph.unregister(oid)
+        store_removed: list[GeoObject] = []
+        try:
+            for oid, obj in self._snapshot.items():
+                del self._objects[oid]
+                store_removed.append(obj)  # record before the graph call can raise
+                self._graph.unregister(oid)
+        except Exception:  # pylint: disable=broad-exception-caught
+            # Roll back so a failure on the k-th object never leaves the store
+            # and graph half-deleted and disagreeing. Restore the store from the
+            # objects removed so far, then re-register EVERY snapshot object's
+            # edges: unregistering one object collaterally prunes the forward
+            # back-edges of *other* objects that referenced it, so re-adding only
+            # the fully-removed ones would leave those siblings missing edges.
+            # ``add`` replaces (it does not accumulate), so re-adding an object
+            # that is still registered is a safe no-op that reinstates its edges.
+            _logger.error(
+                "CascadeDeleteCommand.do: failed mid-cascade for root %r after "
+                "removing %d store entr(ies); rolling back",
+                self._root_id,
+                len(store_removed),
+            )
+            for obj in store_removed:
+                self._objects[obj.id] = obj
+            for obj in self._snapshot.values():
+                self._graph.add(obj)
+            self._snapshot = {}
+            raise
         self._bus.fire(OBJECT_DELETED, obj_ids=list(self._snapshot))
 
     def undo(self) -> None:
@@ -429,6 +549,17 @@ class ModifyObjectCommand:
         self._bus = bus
         before = copy.deepcopy(objects[obj_id])
         after = copy.deepcopy(before)
+        # Validate every key against the model's declared fields before any
+        # setattr, so a typo (e.g. ``"colour"``) raises rather than silently
+        # creating a stray attribute that no renderer reads. The models are
+        # dataclasses, so ``dataclasses.fields`` is the authoritative field set.
+        valid_fields = {f.name for f in dataclasses.fields(after)}
+        for key in changes:
+            if key not in valid_fields:
+                raise ValueError(
+                    f"ModifyObjectCommand: unknown field {key!r} for type "
+                    f"{before.type!r} (object {obj_id!r})"
+                )
         for key, value in changes.items():
             setattr(after, key, value)
         self._before = before
@@ -514,7 +645,27 @@ class MovePointCommand:
 
         self._after: dict[str, GeoObject] = {point_id: moved_point}
         for dep_id in dependent_ids:
-            self._after[dep_id] = self._recompute_dependent(objects[dep_id], moved_store)
+            dependent = objects[dep_id]
+            try:
+                self._after[dep_id] = self._recompute_dependent(dependent, moved_store)
+            except ValueError as exc:
+                # A move can invalidate a dependent's geometry — e.g. it makes a
+                # Tangent's surface point coincide horizontally with its circle's
+                # center, so ``tangent_direction`` raises "zero-radius circle has
+                # no tangent". The failure happens here in ``__init__`` before any
+                # store mutation, so the store/graph stay clean; re-raise with the
+                # moved point and offending dependent named, and the move rejected.
+                _logger.error(
+                    "MovePointCommand: moving point %r would invalidate dependent "
+                    "%r; rejecting the move (%s)",
+                    point_id,
+                    dep_id,
+                    exc,
+                )
+                raise ValueError(
+                    f"Cannot move point {point_id!r}: it would invalidate dependent "
+                    f"{dep_id!r} ({exc}); the move was rejected"
+                ) from exc
 
         # Point first so the UI updates the marker before its dependents.
         self._ids = [point_id, *dependent_ids]
@@ -580,6 +731,12 @@ class MovePointCommand:
             result.direction = MovePointCommand._directed_value(az, result.direction_mode)
             # elevation is deliberately not recomputed (see method docstring).
         elif isinstance(result, Polygon):
+            # Per spec (MVP.md:1087-1088) a point move refreshes only the cached
+            # convexity flag; it deliberately does NOT re-wind or re-validate
+            # simplicity of a polygon containing the moved point. Re-winding and
+            # simplicity validation are ModifyPolygonVerticesCommand's job (a
+            # vertex-set edit), not a coordinate move's — do not "fix" this to
+            # call the polygon validators here.
             result.is_convex = bool(_is_convex(result, store))
         # Ray / Circle / Ball / Cylinder / Solid: unchanged copy.
         return result
@@ -589,9 +746,11 @@ class MovePointCommand:
         """Convert an azimuth (radians) into the stored value for ``mode``.
 
         In :attr:`DirectionMode.AZIMUTH` the azimuth is stored directly
-        (normalised into ``[0, 2π)``); in :attr:`DirectionMode.ANGLE` it is first
-        converted to a math angle. Mirrors the conversion the creation path uses
-        so a moved object's stored ``direction`` matches a freshly created one.
+        (normalised into ``[0, 2π)``); in :attr:`DirectionMode.ANGLE` it is
+        converted to a math angle via :func:`azimuth_to_angle`, which already
+        returns a ``normalize_to_2pi`` result, so no second normalisation is
+        applied there. Mirrors the conversion the creation path uses so a moved
+        object's stored ``direction`` matches a freshly created one.
 
         Parameters
         ----------
@@ -607,7 +766,9 @@ class MovePointCommand:
         """
         if mode is DirectionMode.AZIMUTH:
             return float(normalize_to_2pi(az))
-        return float(normalize_to_2pi(azimuth_to_angle(az)))
+        # azimuth_to_angle already normalises into [0, 2π), so no outer
+        # normalize_to_2pi is needed here (it would be a no-op).
+        return float(azimuth_to_angle(az))
 
     def do(self) -> None:
         """Install the moved point and recomputed dependents; fire per object."""
@@ -630,9 +791,27 @@ class ModifyPolygonVerticesCommand:
     Changing ``point_ids`` alters which Points the polygon references, so unlike
     :class:`ModifyObjectCommand` this command **does** update the dependency
     graph: :meth:`DependencyGraph.add` re-registers the new edge set (and
-    restores the old set on undo). The cached ``is_convex`` flag is recomputed
-    against the new vertex order so it stays coherent with ``point_ids`` (the two
-    are co-owned by this command per the ``Polygon`` model contract).
+    restores the old set on undo).
+
+    The construction sequence mirrors the polygon *creation* path (``CLAUDE.md``
+    §3, spec/MVP.md: "Modifying a polygon's point list reorders CCW, validates
+    that the polygon is simple, and updates the convexity flag"). In
+    :meth:`__init__`, before any store mutation, the candidate ring is:
+
+    1. built with the new ``point_ids``;
+    2. rejected if degenerate (``|signed_area| < EPS_AREA``);
+    3. reordered to CCW — if the signed area is negative (CW) the vertex tuple
+       is reversed, since a positive signed area is CCW;
+    4. validated for simplicity (no self-intersection) on the final, reordered
+       ring; and
+    5. only then has its cached ``is_convex`` recomputed (meaningful only on a
+       simple, CCW ring).
+
+    Because every rejection happens in :meth:`__init__` before the store is
+    touched, a rejected edit never enters the undo history — the same safety
+    property the other commands rely on. The ``is_convex`` flag stays coherent
+    with ``point_ids`` (the two are co-owned by this command per the ``Polygon``
+    model contract).
 
     Fields
     ------
@@ -649,7 +828,8 @@ class ModifyPolygonVerticesCommand:
     _before : Polygon
         Deep copy with the original ``point_ids``/``is_convex``.
     _after : Polygon
-        Deep copy with the new ``point_ids`` and recomputed ``is_convex``.
+        Deep copy with the new ``point_ids`` reordered CCW, validated simple,
+        and with recomputed ``is_convex``.
     """
 
     def __init__(
@@ -667,8 +847,14 @@ class ModifyPolygonVerticesCommand:
         before = copy.deepcopy(objects[polygon_id])
         after = copy.deepcopy(before)
         after.point_ids = tuple(new_point_ids)
-        # Recompute convexity against the *current* store: the move/edit of the
-        # referenced points is out of scope here, only the vertex set changes.
+        # Mirror the polygon creation path: reject degeneracy, reorder CCW,
+        # validate simplicity, then cache convexity — all before any mutation,
+        # so a rejected edit never enters history. (CLAUDE.md §3, spec/MVP.md.)
+        validation.validate_polygon_non_degenerate(after, objects)
+        if float(_signed_area(after, objects)) < 0.0:
+            # Negative signed area == clockwise; reverse to store CCW.
+            after.point_ids = tuple(reversed(after.point_ids))
+        validation.validate_polygon_simple(after, objects)
         after.is_convex = bool(_is_convex(after, objects))
         self._before = before
         self._after = after
@@ -697,6 +883,11 @@ class BulkImportCommand:
     it (which, with ID-string references, would not matter for correctness but
     keeps the event order intuitive).
 
+    Both :meth:`do` and :meth:`undo` are atomic: if a wrapped create (or its
+    reversal) raises mid-batch, the creations already applied in that call are
+    rolled back before the exception propagates, so a partially-applied batch
+    never persists in the store or graph.
+
     Fields
     ------
     description : str
@@ -717,11 +908,45 @@ class BulkImportCommand:
         self.description = description or f"Import {len(objs)} object(s)"
 
     def do(self) -> None:
-        """Apply each wrapped creation in import order."""
-        for cmd in self._commands:
-            cmd.do()
+        """Apply each wrapped creation in import order, atomically.
+
+        If a wrapped :meth:`CreateObjectCommand.do` raises mid-batch, every
+        creation already applied in this call is undone (newest first) before the
+        exception propagates, so a partial import never persists.
+        """
+        applied: list[CreateObjectCommand] = []
+        try:
+            for cmd in self._commands:
+                cmd.do()
+                applied.append(cmd)
+        except Exception:  # pylint: disable=broad-exception-caught
+            _logger.error(
+                "BulkImportCommand.do: failed after applying %d of %d creation(s); rolling back",
+                len(applied),
+                len(self._commands),
+            )
+            for cmd in reversed(applied):
+                cmd.undo()
+            raise
 
     def undo(self) -> None:
-        """Reverse each wrapped creation in the opposite order."""
-        for cmd in reversed(self._commands):
-            cmd.undo()
+        """Reverse each wrapped creation in the opposite order, atomically.
+
+        If a wrapped :meth:`CreateObjectCommand.undo` raises mid-batch, every
+        reversal already applied in this call is re-applied before the exception
+        propagates, so the store is not left in a partially-undone state.
+        """
+        reversed_so_far: list[CreateObjectCommand] = []
+        try:
+            for cmd in reversed(self._commands):
+                cmd.undo()
+                reversed_so_far.append(cmd)
+        except Exception:  # pylint: disable=broad-exception-caught
+            _logger.error(
+                "BulkImportCommand.undo: failed after reversing %d of %d creation(s); restoring",
+                len(reversed_so_far),
+                len(self._commands),
+            )
+            for cmd in reversed(reversed_so_far):
+                cmd.do()
+            raise

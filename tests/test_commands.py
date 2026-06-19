@@ -18,8 +18,9 @@ Three concerns are exercised here:
 
 * :class:`CommandHistory` mechanics — undo/redo round-trips, the bounded
   ring-buffer overflow, redo-stack invalidation on a fresh push, the
-  :data:`HISTORY_CHANGED` event payload, and clearing (explicit and on
-  :data:`PROJECT_LOADED`);
+  :data:`HISTORY_CHANGED` event payload, clearing (explicit and on
+  :data:`PROJECT_LOADED`), and the peek-apply-then-move contract that keeps a
+  command recoverable when its ``do``/``undo`` raises;
 * each of the six command classes — do/undo/redo against a live object store
   and dependency graph, asserting the store and graph return to their
   pre-command state on undo and re-reach the post-command state on redo; and
@@ -37,13 +38,16 @@ import math
 import pytest
 
 from geometry.models import (
+    Ball,
     Circle,
+    Cylinder,
     DirectionMode,
     DirectionUnits,
     Line,
     Point,
     Polygon,
     Ray,
+    Solid,
     Tangent,
     Vector,
 )
@@ -161,6 +165,48 @@ def make_tangent(pid: str, shape_id: str, point_id: str) -> Tangent:
     )
 
 
+def make_ball(pid: str, center_id: str, radius: float = 5.0) -> Ball:
+    """Build a Ball around a centre point."""
+    return Ball(**_env(pid), center_id=center_id, radius=radius, **_colors())
+
+
+def make_ball_tangent(pid: str, shape_id: str, point_id: str, elevation: float) -> Tangent:
+    """Build a Ball Tangent carrying a user-supplied (non-zero) elevation."""
+    return Tangent(
+        **_env(pid),
+        **_bearing(elevation=elevation),
+        shape_id=shape_id,
+        shape_type="ball",
+        point_id=point_id,
+        **_colors(),
+    )
+
+
+def make_cylinder(pid: str, base_center_id: str) -> Cylinder:
+    """Build a vertical Cylinder anchored at a base-centre point.
+
+    The axis/direction kwargs are assembled in a local dict (rather than spelled
+    out as consecutive call keywords) so this builder does not duplicate the
+    constructor-call block in ``test_models``'s cylinder test.
+    """
+    axis = {"axis_mode": "vertical", "axis_azimuth": 0.0, "axis_elevation": math.pi / 2}
+    bearing = {"direction_mode": DirectionMode.AZIMUTH, "direction_units": DirectionUnits.RADIANS}
+    return Cylinder(
+        **_env(pid),
+        base_center_id=base_center_id,
+        radius=5.0,
+        height=10.0,
+        **axis,
+        **bearing,
+        **_colors(),
+    )
+
+
+def make_solid(pid: str, layers: tuple[str, ...]) -> Solid:
+    """Build a Solid over an ordered layer stack (polygons and/or one apex point)."""
+    return Solid(**_env(pid), layers=layers, **_colors())
+
+
 def make_polygon(pid: str, point_ids: tuple[str, ...], is_convex: bool = True) -> Polygon:
     """Build a Polygon over the given vertex IDs."""
     return Polygon(**_env(pid), point_ids=point_ids, is_convex=is_convex, **_colors())
@@ -217,6 +263,47 @@ class _NoOpCommand:
         self._log.append(f"undo:{self.description}")
 
 
+class _RaisingCommand:
+    """A :class:`Command` whose :meth:`do`/:meth:`undo` can be armed to raise.
+
+    Used to exercise the peek-apply-then-move contract of
+    :meth:`CommandHistory.undo`/:meth:`CommandHistory.redo`: when the applied
+    side raises, the command must stay on its originating stack and
+    :data:`HISTORY_CHANGED` must not fire for the failed transition.
+    """
+
+    def __init__(self, label: str = "raiser") -> None:
+        self.description = label
+        self.raise_on_do = False
+        self.raise_on_undo = False
+
+    def do(self) -> None:
+        if self.raise_on_do:
+            raise RuntimeError("do failed on purpose")
+
+    def undo(self) -> None:
+        if self.raise_on_undo:
+            raise RuntimeError("undo failed on purpose")
+
+
+class _FailingUnregisterGraph(DependencyGraph):
+    """A graph whose :meth:`unregister` raises once it reaches a chosen ID.
+
+    Used to induce a mid-cascade failure in
+    :meth:`CascadeDeleteCommand.do` and verify the rollback restores both the
+    store and the graph exactly to their pre-``do`` state.
+    """
+
+    def __init__(self, fail_id: str) -> None:
+        super().__init__()
+        self._fail_id = fail_id
+
+    def unregister(self, obj_id: str, *, strict: bool = False) -> None:
+        if obj_id == self._fail_id:
+            raise RuntimeError(f"induced unregister failure for {obj_id!r}")
+        super().unregister(obj_id, strict=strict)
+
+
 # ---------------------------------------------------------------------------
 # CommandHistory mechanics
 # ---------------------------------------------------------------------------
@@ -228,7 +315,7 @@ def test_noop_command_satisfies_protocol():
 
 def test_push_applies_command_and_enables_undo():
     log: list[str] = []
-    history = CommandHistory()
+    history = CommandHistory(EventBus())
     history.push(_NoOpCommand("a", log))
     assert log == ["do:a"]
     assert history.can_undo
@@ -237,7 +324,7 @@ def test_push_applies_command_and_enables_undo():
 
 def test_undo_then_redo_round_trip():
     log: list[str] = []
-    history = CommandHistory()
+    history = CommandHistory(EventBus())
     history.push(_NoOpCommand("a", log))
     history.undo()
     assert history.can_redo
@@ -249,18 +336,18 @@ def test_undo_then_redo_round_trip():
 
 
 def test_undo_on_empty_history_returns_none():
-    history = CommandHistory()
+    history = CommandHistory(EventBus())
     assert history.undo() is None
 
 
 def test_redo_on_empty_stack_returns_none():
-    history = CommandHistory()
+    history = CommandHistory(EventBus())
     assert history.redo() is None
 
 
 def test_new_push_discards_redo_stack():
     log: list[str] = []
-    history = CommandHistory()
+    history = CommandHistory(EventBus())
     history.push(_NoOpCommand("a", log))
     history.undo()
     assert history.can_redo
@@ -271,7 +358,7 @@ def test_new_push_discards_redo_stack():
 
 def test_ring_buffer_drops_oldest_at_overflow():
     log: list[str] = []
-    history = CommandHistory()
+    history = CommandHistory(EventBus())
     # Push one more than the cap; the first command must be evicted.
     for i in range(MAX_HISTORY + 1):
         history.push(_NoOpCommand(f"c{i}", log))
@@ -322,6 +409,51 @@ def test_project_loaded_clears_history():
     bus.fire(PROJECT_LOADED)
     assert not history.can_undo
     assert not history.can_redo
+
+
+def test_redo_keeps_command_when_do_raises():
+    # A failed redo (do() raises) must leave the command recoverable on the redo
+    # stack and must NOT fire HISTORY_CHANGED for the aborted transition.
+    bus = EventBus()
+    recorder = _HistoryRecorder()
+    history = CommandHistory(bus)
+    cmd = _RaisingCommand()
+    history.push(cmd)  # (True, False)
+    history.undo()  # (False, True) — cmd now on the redo stack
+    assert history.can_redo
+
+    bus.subscribe(HISTORY_CHANGED, recorder)
+    cmd.raise_on_do = True
+    with pytest.raises(RuntimeError, match="do failed on purpose"):
+        history.redo()
+    # Command stays recoverable; no HISTORY_CHANGED for the failed transition.
+    assert history.can_redo
+    assert not history.can_undo
+    assert not recorder.events
+
+    # Once the fault clears, redo succeeds and the command moves across.
+    cmd.raise_on_do = False
+    history.redo()
+    assert history.can_undo
+    assert not history.can_redo
+
+
+def test_undo_keeps_command_when_undo_raises():
+    # The symmetric case: a failed undo must leave the command on the undo stack.
+    bus = EventBus()
+    recorder = _HistoryRecorder()
+    history = CommandHistory(bus)
+    cmd = _RaisingCommand()
+    history.push(cmd)
+    assert history.can_undo
+
+    bus.subscribe(HISTORY_CHANGED, recorder)
+    cmd.raise_on_undo = True
+    with pytest.raises(RuntimeError, match="undo failed on purpose"):
+        history.undo()
+    assert history.can_undo
+    assert not history.can_redo
+    assert not recorder.events
 
 
 # ---------------------------------------------------------------------------
@@ -554,13 +686,17 @@ def test_move_point_recomputes_dependent_line_direction_and_elevation():
     before_dir = objects["ln_001"].direction  # placeholder 0.0 from the builder
     before_el = objects["ln_001"].elevation
 
-    # Move pt_002 due East and up: azimuth becomes π/2, elevation positive.
+    # Move pt_002 to a genuinely new horizontal position (north-east) and up, so
+    # both the azimuth (now π/4, NE) and the elevation change for real — not
+    # merely the altitude. A move that kept (easting, northing) would leave the
+    # azimuth unchanged and make ``direction != before_dir`` pass by accident.
     history.push(
-        MovePointCommand(objects, graph, bus, "pt_002", easting=10.0, northing=0.0, altitude=10.0)
+        MovePointCommand(objects, graph, bus, "pt_002", easting=10.0, northing=10.0, altitude=10.0)
     )
     line = objects["ln_001"]
-    assert line.direction == pytest.approx(math.pi / 2)  # azimuth due East
-    assert line.elevation == pytest.approx(math.atan2(10.0, 10.0))
+    assert line.direction == pytest.approx(math.pi / 4)  # azimuth NE
+    # Horizontal reach is √(10²+10²); the climb is 10, so elevation = atan2(10, √200).
+    assert line.elevation == pytest.approx(math.atan2(10.0, math.hypot(10.0, 10.0)))
     assert line.direction != before_dir
     assert line.elevation != before_el
 
@@ -647,6 +783,144 @@ def test_move_point_recomputes_tangent_direction():
 
     history.undo()
     assert objects["tg_001"].direction == pytest.approx(before_dir)
+
+
+def test_move_circle_center_recomputes_tangent_direction_transitively():
+    # The tangent depends on the circle (and its surface point); the circle
+    # depends on its center point. Moving the CENTER is a *transitive*
+    # dependency hop through the circle, so the tangent must still recompute.
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0),  # circle center
+        "pt_002": make_point("pt_002", 5.0, 0.0),  # surface point
+        "ci_001": make_circle("ci_001", "pt_001"),
+        "tg_001": make_tangent("tg_001", "ci_001", "pt_002"),
+    }
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+    bus = EventBus()
+    history = CommandHistory(bus)
+    before_dir = objects["tg_001"].direction
+
+    # Move the center so the radius arm (center -> surface) rotates; the tangent
+    # azimuth, derived from that arm, must change even though only the center
+    # (a transitive dependency) moved.
+    history.push(MovePointCommand(objects, graph, bus, "pt_001", easting=0.0, northing=-5.0))
+    assert objects["tg_001"].direction != before_dir
+
+    history.undo()
+    assert objects["tg_001"].direction == pytest.approx(before_dir)
+
+
+def test_move_point_preserves_nonzero_ball_tangent_elevation():
+    # A Ball tangent carries a user-supplied, non-zero elevation that the move
+    # recompute must leave untouched (only the azimuth direction is refreshed).
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0, 0.0),  # ball center
+        "pt_002": make_point("pt_002", 3.0, 0.0, 4.0),  # surface point (r = 5)
+        "ba_001": make_ball("ba_001", "pt_001"),
+        "tg_001": make_ball_tangent("tg_001", "ba_001", "pt_002", elevation=0.3),
+    }
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+    bus = EventBus()
+    history = CommandHistory(bus)
+    before_dir = objects["tg_001"].direction
+
+    history.push(MovePointCommand(objects, graph, bus, "pt_002", easting=0.0, northing=3.0))
+    tangent = objects["tg_001"]
+    assert tangent.direction != before_dir  # azimuth refreshed
+    assert tangent.elevation == pytest.approx(0.3)  # user elevation preserved
+
+
+def test_move_point_ball_dependent_is_noop_but_fires_modified():
+    # A Ball stores no point-derived scalar, so a center move returns it
+    # unchanged — yet it is a dependent and must still fire OBJECT_MODIFIED.
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0),
+        "ba_001": make_ball("ba_001", "pt_001", radius=5.0),
+    }
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+    bus = EventBus()
+    counter = _EventCounter()
+    counter.subscribe_all(bus)
+    cmd = MovePointCommand(objects, graph, bus, "pt_001", easting=20.0, northing=20.0)
+    cmd.do()
+    assert objects["ba_001"].radius == pytest.approx(5.0)  # unchanged
+    assert objects["ba_001"].center_id == "pt_001"
+    assert set(counter.modified) == {"pt_001", "ba_001"}
+
+
+def test_move_point_cylinder_dependent_is_noop_but_fires_modified():
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0),
+        "cy_001": make_cylinder("cy_001", "pt_001"),
+    }
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+    bus = EventBus()
+    counter = _EventCounter()
+    counter.subscribe_all(bus)
+    cmd = MovePointCommand(objects, graph, bus, "pt_001", easting=7.0, northing=8.0)
+    cmd.do()
+    assert objects["cy_001"].radius == pytest.approx(5.0)  # unchanged
+    assert objects["cy_001"].height == pytest.approx(10.0)
+    assert set(counter.modified) == {"pt_001", "cy_001"}
+
+
+def test_move_point_solid_dependent_is_noop_but_fires_modified():
+    # A Solid stacks a base polygon and an apex point; moving a shared base
+    # vertex leaves the solid's stored fields unchanged but it is a dependent
+    # (via the polygon and via the apex point) and must fire OBJECT_MODIFIED.
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0),
+        "pt_002": make_point("pt_002", 10.0, 0.0),
+        "pt_003": make_point("pt_003", 0.0, 10.0),
+        "pt_004": make_point("pt_004", 3.0, 3.0, 10.0),  # apex
+        "pg_001": make_polygon("pg_001", ("pt_001", "pt_002", "pt_003")),
+        "so_001": make_solid("so_001", ("pg_001", "pt_004")),
+    }
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+    bus = EventBus()
+    counter = _EventCounter()
+    counter.subscribe_all(bus)
+    cmd = MovePointCommand(objects, graph, bus, "pt_001", easting=-2.0, northing=-2.0)
+    cmd.do()
+    assert objects["so_001"].layers == ("pg_001", "pt_004")  # unchanged
+    assert "so_001" in counter.modified
+
+
+def test_move_point_rejected_when_it_invalidates_tangent():
+    # Moving the circle CENTER onto the tangent's surface point horizontally
+    # makes the radius zero, so tangent_direction raises; the move must be
+    # rejected in __init__ with a contextual ValueError and the store/graph
+    # left untouched (the command never applies).
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0, 0.0),  # circle center
+        "pt_002": make_point("pt_002", 5.0, 0.0, 0.0),  # surface point
+        "ci_001": make_circle("ci_001", "pt_001"),
+        "tg_001": make_tangent("tg_001", "ci_001", "pt_002"),
+    }
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+    before = {k: (v.easting, v.northing) for k, v in objects.items() if isinstance(v, Point)}
+
+    with pytest.raises(ValueError, match=r"pt_001.*tg_001.*rejected"):
+        # Move the center onto the surface point horizontally (same E/N): the
+        # radius collapses to zero in the horizontal plane.
+        MovePointCommand(objects, graph, EventBus(), "pt_001", easting=5.0, northing=0.0)
+
+    # Nothing moved: __init__ raised before any mutation.
+    after = {k: (v.easting, v.northing) for k, v in objects.items() if isinstance(v, Point)}
+    assert after == before
+    assert graph.dependents_of("pt_001") == {"ci_001", "tg_001"}
 
 
 def test_move_point_recomputes_dependent_ray_is_noop():
@@ -791,3 +1065,152 @@ def test_bulk_import_default_description():
 def test_bulk_import_custom_description():
     cmd = BulkImportCommand({}, DependencyGraph(), EventBus(), [], description="Load survey")
     assert cmd.description == "Load survey"
+
+
+def test_bulk_import_rolls_back_on_mid_batch_failure():
+    # A graph whose unregister never fails, but a duplicate id in the batch makes
+    # the second create overwrite the first; instead we force a failure by having
+    # one create target a graph that rejects it. Simpler: a create whose object
+    # has a non-str reference makes DependencyGraph.add raise mid-batch.
+    objects: dict = {}
+    graph = DependencyGraph()
+    bus = EventBus()
+    good = make_point("pt_001", 0.0, 0.0)
+    # A line with a non-str point reference makes graph.add raise TypeError when
+    # its CreateObjectCommand.do registers edges.
+    bad_line = make_line("ln_bad", "pt_001", "pt_002")
+    object.__setattr__(bad_line, "point_b_id", 123)  # corrupt to force add() failure
+    with pytest.raises(TypeError):
+        BulkImportCommand(objects, graph, bus, [good, bad_line]).do()
+    # The good point created before the failure was rolled back.
+    assert not objects
+    assert not graph.is_registered("pt_001")
+
+
+# ---------------------------------------------------------------------------
+# CascadeDeleteCommand atomicity (rollback on mid-cascade failure)
+# ---------------------------------------------------------------------------
+
+
+def test_cascade_delete_rolls_back_on_mid_cascade_failure():
+    objects, _ = _point_line_polygon_scene()
+    # Rebuild the graph with one whose unregister raises on a chosen dependent.
+    graph = _FailingUnregisterGraph(fail_id="ln_001")
+    for obj in objects.values():
+        graph.add(obj)
+    before_objects = dict(objects)
+    bus = EventBus()
+    counter = _EventCounter()
+    counter.subscribe_all(bus)
+
+    cmd = CascadeDeleteCommand(objects, graph, bus, "pt_001")
+    with pytest.raises(RuntimeError, match="induced unregister failure"):
+        cmd.do()
+
+    # Full rollback: store is exactly as before, and every object is still
+    # registered (graph restored). No delete event fired for the failed cascade.
+    assert objects == before_objects
+    assert graph.is_registered("pt_001")
+    assert graph.is_registered("ln_001")
+    assert graph.is_registered("pg_001")
+    assert graph.dependents_of("pt_001") == {"ln_001", "pg_001"}
+    assert not counter.deleted
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
+
+
+# ---------------------------------------------------------------------------
+# ModifyObjectCommand field validation (S2)
+# ---------------------------------------------------------------------------
+
+
+def test_modify_object_rejects_unknown_field():
+    objects = {"pt_001": make_point("pt_001", 0.0, 0.0)}
+    graph = DependencyGraph()
+    graph.add(objects["pt_001"])
+    with pytest.raises(ValueError, match=r"unknown field 'colour'"):
+        ModifyObjectCommand(objects, graph, EventBus(), "pt_001", {"colour": "#ff0000"})
+    # Construction raised before any mutation: the store is unchanged.
+    assert objects["pt_001"].color == "#abcdef"
+
+
+# ---------------------------------------------------------------------------
+# ModifyPolygonVerticesCommand: CCW reorder + simplicity/degeneracy validation
+# ---------------------------------------------------------------------------
+
+
+def _square_scene() -> tuple[dict, DependencyGraph]:
+    """Four corner points of a unit-ish square plus a triangle polygon on three."""
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0),
+        "pt_002": make_point("pt_002", 10.0, 0.0),
+        "pt_003": make_point("pt_003", 10.0, 10.0),
+        "pt_004": make_point("pt_004", 0.0, 10.0),
+        "pg_001": make_polygon("pg_001", ("pt_001", "pt_002", "pt_003")),
+    }
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+    return objects, graph
+
+
+def test_modify_polygon_vertices_reorders_cw_input_to_ccw():
+    objects, graph = _square_scene()
+    # Clockwise order of the square (negative signed area) must be stored CCW
+    # (reversed) by the command.
+    cw_order = ("pt_001", "pt_004", "pt_003", "pt_002")
+    cmd = ModifyPolygonVerticesCommand(objects, graph, EventBus(), "pg_001", cw_order)
+    cmd.do()
+    assert objects["pg_001"].point_ids == tuple(reversed(cw_order))
+    assert objects["pg_001"].is_convex is True
+
+
+def test_modify_polygon_vertices_keeps_ccw_input():
+    objects, graph = _square_scene()
+    ccw_order = ("pt_001", "pt_002", "pt_003", "pt_004")
+    cmd = ModifyPolygonVerticesCommand(objects, graph, EventBus(), "pg_001", ccw_order)
+    cmd.do()
+    # Already CCW (positive signed area): order is preserved.
+    assert objects["pg_001"].point_ids == ccw_order
+
+
+def test_modify_polygon_vertices_rejects_self_intersecting_bowtie():
+    # An asymmetric corner set whose bowtie ordering is non-simple yet
+    # non-degenerate (|signed area| = 30 > EPS_AREA), so the simplicity check —
+    # not the degeneracy check — is what rejects it.
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0),
+        "pt_002": make_point("pt_002", 10.0, 2.0),
+        "pt_003": make_point("pt_003", 10.0, 0.0),
+        "pt_004": make_point("pt_004", 0.0, 8.0),
+        "pg_001": make_polygon("pg_001", ("pt_001", "pt_003", "pt_002", "pt_004")),
+    }
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+    before_ids = objects["pg_001"].point_ids
+    before_deps = graph.dependents_of("pt_004")
+    # The (pt_001, pt_002, pt_003, pt_004) ordering crosses itself (a bowtie).
+    bowtie = ("pt_001", "pt_002", "pt_003", "pt_004")
+    with pytest.raises(ValueError, match="simple"):
+        ModifyPolygonVerticesCommand(objects, graph, EventBus(), "pg_001", bowtie)
+    # Construction raised before any mutation: store and graph are unchanged.
+    assert objects["pg_001"].point_ids == before_ids
+    assert graph.dependents_of("pt_004") == before_deps
+
+
+def test_modify_polygon_vertices_rejects_degenerate_collinear():
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0),
+        "pt_002": make_point("pt_002", 5.0, 0.0),
+        "pt_003": make_point("pt_003", 10.0, 0.0),  # all three collinear
+        "pg_001": make_polygon("pg_001", ("pt_001", "pt_002", "pt_003"), is_convex=False),
+    }
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+    before_ids = objects["pg_001"].point_ids
+    with pytest.raises(ValueError, match="degenerate"):
+        ModifyPolygonVerticesCommand(
+            objects, graph, EventBus(), "pg_001", ("pt_001", "pt_002", "pt_003")
+        )
+    assert objects["pg_001"].point_ids == before_ids
