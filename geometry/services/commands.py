@@ -11,3 +11,717 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Command pattern and undo/redo history for GeoSketch mutations.
+
+Every user-visible change to the object store — create, delete, modify, move,
+re-vertex, bulk-import — is expressed as a :class:`Command`: an object that
+knows how to apply itself (:meth:`Command.do`) and how to reverse itself
+(:meth:`Command.undo`). :class:`CommandHistory` records the applied commands in
+a bounded undo buffer and a redo stack, so the UI can step backwards and
+forwards through the edit history.
+
+Why a command per mutation, rather than diffing snapshots
+---------------------------------------------------------
+The object store is a flat ``dict[str, GeoObject]`` keyed by ID string, and
+every inter-object reference is an ID string rather than a memory pointer (see
+``CLAUDE.md`` §4). That means a command can swap a whole object *instance* in
+and out of the dict on do/undo without breaking any referrer — nobody holds a
+pointer to the old instance. Commands therefore snapshot the affected objects
+with :func:`copy.deepcopy` and restore those snapshots verbatim, which is both
+simpler and more robust than computing field-level diffs.
+
+Collaborators, not a Project
+----------------------------
+``geometry/project.py`` is still an empty stub, so there is no ``Project`` class
+to own the store. Each command is instead constructed with the three live
+collaborators it needs:
+
+* ``objects`` — the ``dict[str, GeoObject]`` object store (ID -> object);
+* ``graph`` — the :class:`~geometry.services.dep_graph.DependencyGraph` that
+  tracks reference edges for cascade delete and point-move recompute;
+* ``bus`` — the :class:`~geometry.utils.events.EventBus` that notifies the UI.
+
+A future ``Project`` will own all three and push commands into a
+:class:`CommandHistory`; until then the command layer stands alone and the tests
+wire the collaborators directly. This module imports only models, services, and
+utils — never ``tkinter`` or ``matplotlib``.
+
+Recompute on point move
+-----------------------
+A :class:`MovePointCommand` is the one command that derives new field values
+rather than merely restoring a snapshot: moving a Point changes the stored
+directions/distances of everything that references it. The per-type recompute
+rules live in :func:`MovePointCommand._recompute_dependent`; its docstring is
+the reference for which derived scalars each dependent type caches.
+"""
+
+from __future__ import annotations
+
+import copy
+import logging
+from collections import deque
+from collections.abc import Sequence
+from typing import Any, Protocol, runtime_checkable
+
+from geometry.models import GeoObject
+from geometry.models.common import DirectionMode
+from geometry.models.line import Line
+from geometry.models.polygon import Polygon
+from geometry.models.tangent import Tangent
+from geometry.models.vector import Vector
+from geometry.services.dep_graph import DependencyGraph
+from geometry.services.geometry import azimuth as _azimuth
+from geometry.services.geometry import distance as _distance
+from geometry.services.geometry import elevation as _elevation
+from geometry.services.geometry import is_convex as _is_convex
+from geometry.services.geometry import tangent_direction as _tangent_direction
+from geometry.utils.angles import azimuth_to_angle, normalize_to_2pi
+from geometry.utils.events import (
+    HISTORY_CHANGED,
+    OBJECT_CREATED,
+    OBJECT_DELETED,
+    OBJECT_MODIFIED,
+    PROJECT_LOADED,
+    EventBus,
+)
+
+__all__ = [
+    "MAX_HISTORY",
+    "Command",
+    "CommandHistory",
+    "CreateObjectCommand",
+    "CascadeDeleteCommand",
+    "ModifyObjectCommand",
+    "MovePointCommand",
+    "ModifyPolygonVerticesCommand",
+    "BulkImportCommand",
+]
+
+_logger = logging.getLogger(__name__)
+
+#: Maximum number of commands retained in the undo buffer. Older commands are
+#: silently dropped once this bound is exceeded (the ``deque`` ``maxlen``
+#: semantics). Redo is unbounded between actions but is cleared whenever a fresh
+#: command is pushed, so it never grows past the undo bound either.
+MAX_HISTORY = 100
+
+
+@runtime_checkable
+class Command(Protocol):
+    """Structural protocol for an undoable mutation.
+
+    Any object exposing a ``description`` string plus :meth:`do` and
+    :meth:`undo` methods satisfies this protocol; :class:`CommandHistory` relies
+    only on these three members and never on a concrete base class, so command
+    classes need not inherit from anything. ``@runtime_checkable`` lets tests
+    assert ``isinstance(cmd, Command)`` structurally.
+
+    The contract is that :meth:`undo` exactly reverses the state change made by
+    the most recent :meth:`do`, so that an arbitrary ``do``/``undo``/``do`` …
+    sequence is always consistent with the object store.
+
+    Fields
+    ------
+    description : str
+        Short human-readable label for the command (e.g. shown in an Edit menu
+        "Undo <description>" item).
+    """
+
+    description: str
+
+    def do(self) -> None:
+        """Apply the mutation to the object store, graph, and event bus."""
+
+    def undo(self) -> None:
+        """Reverse the mutation applied by the most recent :meth:`do`."""
+
+
+class CommandHistory:
+    """Bounded undo buffer plus redo stack over :class:`Command` objects.
+
+    The undo buffer is a :class:`collections.deque` capped at :data:`MAX_HISTORY`
+    entries: pushing past the cap silently discards the oldest command, which is
+    the standard "you can only undo the last N actions" behaviour. The redo
+    stack is an ordinary list, cleared every time a *new* command is pushed —
+    once you take a fresh action, the branch you had undone is no longer
+    reachable.
+
+    Every state-changing method fires :data:`~geometry.utils.events.HISTORY_CHANGED`
+    (when a bus is configured) carrying the current :attr:`can_undo` /
+    :attr:`can_redo` flags, so a toolbar can enable/disable its Undo/Redo
+    controls without polling. If a bus is supplied, the history also subscribes
+    to :data:`~geometry.utils.events.PROJECT_LOADED` and clears itself when a new
+    project is loaded — undo history from the previous project is meaningless
+    against the new object store.
+
+    Fields
+    ------
+    _bus : EventBus | None
+        Event bus used to publish :data:`HISTORY_CHANGED` and to receive
+        :data:`PROJECT_LOADED`. ``None`` disables both (useful in unit tests that
+        do not exercise eventing).
+    _undo : collections.deque[Command]
+        Applied commands, oldest at the left, newest at the right. Capped at
+        :data:`MAX_HISTORY`; overflow drops the oldest entry.
+    _redo : list[Command]
+        Commands that have been undone and may be re-applied, newest on top
+        (end of the list). Cleared by :meth:`push`.
+    """
+
+    def __init__(self, bus: EventBus | None = None) -> None:
+        self._bus = bus
+        self._undo: deque[Command] = deque(maxlen=MAX_HISTORY)
+        self._redo: list[Command] = []
+        if bus is not None:
+            # Clear history on project load: undo entries reference objects from
+            # the previous project and would corrupt the freshly loaded store.
+            bus.subscribe(PROJECT_LOADED, self._on_project_loaded)
+
+    def _on_project_loaded(self) -> None:
+        """Clear all history when a new project is loaded (bus handler)."""
+        self.clear()
+
+    def _fire_history_changed(self) -> None:
+        """Publish :data:`HISTORY_CHANGED` with the current undo/redo flags."""
+        if self._bus is not None:
+            self._bus.fire(HISTORY_CHANGED, can_undo=self.can_undo, can_redo=self.can_redo)
+
+    @property
+    def can_undo(self) -> bool:
+        """Whether at least one command is available to undo."""
+        return bool(self._undo)
+
+    @property
+    def can_redo(self) -> bool:
+        """Whether at least one undone command is available to redo."""
+        return bool(self._redo)
+
+    def push(self, cmd: Command) -> None:
+        """Apply ``cmd`` and record it as the newest undoable command.
+
+        Calls ``cmd.do()`` first so a command that raises mid-apply never enters
+        the history (the buffers stay consistent with the store). On success the
+        command is appended to the undo buffer and the redo stack is cleared —
+        taking a new action invalidates any previously undone branch.
+
+        Parameters
+        ----------
+        cmd : Command
+            The command to apply and record.
+        """
+        cmd.do()
+        self._undo.append(cmd)
+        self._redo.clear()
+        self._fire_history_changed()
+
+    def undo(self) -> Command | None:
+        """Reverse the newest command and move it to the redo stack.
+
+        Returns
+        -------
+        Command or None
+            The command that was undone, or ``None`` if the undo buffer was
+            empty (no-op).
+        """
+        if not self._undo:
+            return None
+        cmd = self._undo.pop()
+        cmd.undo()
+        self._redo.append(cmd)
+        self._fire_history_changed()
+        return cmd
+
+    def redo(self) -> Command | None:
+        """Re-apply the most recently undone command.
+
+        Returns
+        -------
+        Command or None
+            The command that was re-applied, or ``None`` if the redo stack was
+            empty (no-op).
+        """
+        if not self._redo:
+            return None
+        cmd = self._redo.pop()
+        cmd.do()
+        self._undo.append(cmd)
+        self._fire_history_changed()
+        return cmd
+
+    def clear(self) -> None:
+        """Empty both the undo buffer and the redo stack.
+
+        Fires :data:`HISTORY_CHANGED` so listeners disable their controls. Used
+        directly and as the :data:`PROJECT_LOADED` handler.
+        """
+        self._undo.clear()
+        self._redo.clear()
+        self._fire_history_changed()
+
+
+class CreateObjectCommand:
+    """Create a single object: insert it into the store and register its edges.
+
+    :meth:`do` adds ``obj`` to the store and registers its dependency edges via
+    :meth:`DependencyGraph.add` (which derives the edge set from ``obj.type``),
+    then fires :data:`OBJECT_CREATED`. :meth:`undo` removes the object and
+    unregisters it, firing :data:`OBJECT_DELETED`. Because references are ID
+    strings, re-inserting the same instance on redo restores every referrer
+    automatically.
+
+    Fields
+    ------
+    description : str
+        ``"Create <type> '<name>'"``, captured from ``obj`` at construction.
+    _objects : dict[str, GeoObject]
+        The object store this command mutates.
+    _graph : DependencyGraph
+        The dependency graph kept in sync with the store.
+    _bus : EventBus
+        Event bus for create/delete notifications.
+    _obj : GeoObject
+        The object to create. The same instance is re-used across do/undo/redo.
+    """
+
+    def __init__(
+        self,
+        objects: dict[str, GeoObject],
+        graph: DependencyGraph,
+        bus: EventBus,
+        obj: GeoObject,
+    ) -> None:
+        self._objects = objects
+        self._graph = graph
+        self._bus = bus
+        self._obj = obj
+        self.description = f"Create {obj.type} '{obj.name}'"
+
+    def do(self) -> None:
+        """Insert the object, register its edges, fire :data:`OBJECT_CREATED`."""
+        self._objects[self._obj.id] = self._obj
+        self._graph.add(self._obj)
+        self._bus.fire(OBJECT_CREATED, obj_id=self._obj.id)
+
+    def undo(self) -> None:
+        """Remove the object, unregister it, fire :data:`OBJECT_DELETED`."""
+        del self._objects[self._obj.id]
+        self._graph.unregister(self._obj.id)
+        self._bus.fire(OBJECT_DELETED, obj_ids=[self._obj.id])
+
+
+class CascadeDeleteCommand:
+    """Delete an object and its full transitive dependent closure.
+
+    Deleting a Point must also delete every Line/Ray/Vector/Circle/Tangent/
+    Polygon that references it, transitively (``CLAUDE.md`` §5). :meth:`do`
+    computes the closure from the graph, snapshots every affected live instance,
+    removes them all from the store and graph, then fires a single
+    :data:`OBJECT_DELETED` carrying the whole removed ID set. :meth:`undo`
+    re-inserts every snapshot and re-registers its edges, firing
+    :data:`OBJECT_CREATED` per restored object.
+
+    The closure is recomputed inside :meth:`do` (not captured once at
+    construction), so a redo after an intervening undo re-derives the identical
+    set from the restored graph. The deleted instances are never mutated while
+    out of the store, so the snapshot preserves their original IDs and field
+    state for a faithful restore.
+
+    Fields
+    ------
+    description : str
+        ``"Delete <type> '<name>'"`` for the root, captured at construction
+        (the root is gone from the store after :meth:`do`, so the label cannot
+        be derived lazily).
+    _objects : dict[str, GeoObject]
+        The object store this command mutates.
+    _graph : DependencyGraph
+        The dependency graph kept in sync with the store.
+    _bus : EventBus
+        Event bus for create/delete notifications.
+    _root_id : str
+        ID of the object whose deletion triggers the cascade.
+    _snapshot : dict[str, GeoObject]
+        Live instances removed by the most recent :meth:`do`, keyed by ID, used
+        to restore them on :meth:`undo`. Empty until the first :meth:`do`.
+    """
+
+    def __init__(
+        self,
+        objects: dict[str, GeoObject],
+        graph: DependencyGraph,
+        bus: EventBus,
+        root_id: str,
+    ) -> None:
+        self._objects = objects
+        self._graph = graph
+        self._bus = bus
+        self._root_id = root_id
+        root = objects[root_id]
+        self.description = f"Delete {root.type} '{root.name}'"
+        self._snapshot: dict[str, GeoObject] = {}
+
+    def do(self) -> None:
+        """Remove the root plus its dependent closure; fire one delete event."""
+        closure = self._graph.dependents_of(self._root_id) | {self._root_id}
+        # Store the live instances directly: they are not mutated while deleted,
+        # so their original IDs/state are preserved for a faithful undo.
+        self._snapshot = {oid: self._objects[oid] for oid in closure if oid in self._objects}
+        for oid in self._snapshot:
+            del self._objects[oid]
+            self._graph.unregister(oid)
+        self._bus.fire(OBJECT_DELETED, obj_ids=list(self._snapshot))
+
+    def undo(self) -> None:
+        """Re-insert every removed object and re-register its edges."""
+        for obj in self._snapshot.values():
+            self._objects[obj.id] = obj
+            self._graph.add(obj)
+            self._bus.fire(OBJECT_CREATED, obj_id=obj.id)
+
+
+class ModifyObjectCommand:
+    """Edit envelope/property fields of one object (no reference change).
+
+    Covers display-envelope and direction-metadata edits such as ``name``,
+    ``color``, ``line_color``, ``fill_color``, ``alpha``, ``visibility``,
+    ``direction_mode``, and ``direction_units`` — fields whose change does **not**
+    alter which other objects this one references. Because no reference changes,
+    the dependency graph is left untouched.
+
+    :meth:`do` swaps in an ``after`` copy with the requested changes applied;
+    :meth:`undo` swaps the original ``before`` copy back. Both fire
+    :data:`OBJECT_MODIFIED`. Changes are applied with :func:`setattr` on a
+    deep copy, so the read-only ``id``/``type`` guard is respected and the
+    original instance is never mutated in place.
+
+    Fields
+    ------
+    description : str
+        ``"Modify <type> '<name>'"`` derived from the pre-edit object.
+    _objects : dict[str, GeoObject]
+        The object store this command mutates.
+    _obj_id : str
+        ID of the object being edited.
+    _bus : EventBus
+        Event bus for modify notifications.
+    _before : GeoObject
+        Deep copy of the object as it was before the edit.
+    _after : GeoObject
+        Deep copy of the object with ``changes`` applied.
+    """
+
+    def __init__(
+        self,
+        objects: dict[str, GeoObject],
+        graph: DependencyGraph,
+        bus: EventBus,
+        obj_id: str,
+        changes: dict[str, Any],
+    ) -> None:
+        # ``graph`` is accepted but unused: an envelope/property edit changes no
+        # references, so the dependency graph never needs updating. Keeping it in
+        # the signature lets the (future) Project construct every command the
+        # same way.
+        del graph
+        self._objects = objects
+        self._obj_id = obj_id
+        self._bus = bus
+        before = copy.deepcopy(objects[obj_id])
+        after = copy.deepcopy(before)
+        for key, value in changes.items():
+            setattr(after, key, value)
+        self._before = before
+        self._after = after
+        self.description = f"Modify {before.type} '{before.name}'"
+
+    def do(self) -> None:
+        """Install the edited copy and fire :data:`OBJECT_MODIFIED`."""
+        self._objects[self._obj_id] = self._after
+        self._bus.fire(OBJECT_MODIFIED, obj_id=self._obj_id)
+
+    def undo(self) -> None:
+        """Restore the pre-edit copy and fire :data:`OBJECT_MODIFIED`."""
+        self._objects[self._obj_id] = self._before
+        self._bus.fire(OBJECT_MODIFIED, obj_id=self._obj_id)
+
+
+class MovePointCommand:
+    """Move a Point's coordinates and recompute every dependent's derived values.
+
+    Moving a Point changes the geometry of everything that references it: a
+    Line's stored ``direction``/``elevation``, a Vector's recomputed
+    ``length``/``direction``/``elevation`` (endpoint mode only), a Tangent's
+    ``direction``, and a Polygon's cached ``is_convex`` (``CLAUDE.md`` §5). This
+    command snapshots the point plus every dependent both *before* the move and,
+    using a recompute pass, *after* it; :meth:`do` installs the after-state and
+    :meth:`undo` restores the before-state, firing :data:`OBJECT_MODIFIED` for
+    the point and each affected dependent in turn.
+
+    The graph is **not** touched: a move changes no references, only coordinates,
+    so the edge set is invariant. Both snapshots are computed once at
+    construction, so do/undo/redo are pure dict swaps with no recomputation.
+
+    Fields
+    ------
+    description : str
+        ``"Move <name>"`` for the moved point.
+    _objects : dict[str, GeoObject]
+        The object store this command mutates.
+    _bus : EventBus
+        Event bus for modify notifications.
+    _ids : list[str]
+        IDs touched by the move: the point first, then each recomputed
+        dependent. Drives the per-object :data:`OBJECT_MODIFIED` fan-out.
+    _before : dict[str, GeoObject]
+        Pre-move deep copies of the point and every dependent, keyed by ID.
+    _after : dict[str, GeoObject]
+        Post-move deep copies (point with new coords; dependents recomputed
+        against the moved store), keyed by ID.
+    """
+
+    def __init__(
+        self,
+        objects: dict[str, GeoObject],
+        graph: DependencyGraph,
+        bus: EventBus,
+        point_id: str,
+        *,
+        easting: float,
+        northing: float,
+        altitude: float | None = None,
+    ) -> None:
+        self._objects = objects
+        self._bus = bus
+        point = objects[point_id]
+        self.description = f"Move {point.name}"
+
+        dependent_ids = [dep_id for dep_id in graph.dependents_of(point_id) if dep_id in objects]
+
+        # Snapshot the before-state: the point and every dependent, untouched.
+        self._before: dict[str, GeoObject] = {point_id: copy.deepcopy(point)}
+        for dep_id in dependent_ids:
+            self._before[dep_id] = copy.deepcopy(objects[dep_id])
+
+        # Build the moved point, then a store view that reflects the move so the
+        # recompute helper resolves dependents against the new coordinates.
+        moved_point = copy.deepcopy(point)
+        moved_point.easting = easting
+        moved_point.northing = northing
+        if altitude is not None:
+            moved_point.altitude = altitude
+        moved_store = {**objects, point_id: moved_point}
+
+        self._after: dict[str, GeoObject] = {point_id: moved_point}
+        for dep_id in dependent_ids:
+            self._after[dep_id] = self._recompute_dependent(objects[dep_id], moved_store)
+
+        # Point first so the UI updates the marker before its dependents.
+        self._ids = [point_id, *dependent_ids]
+
+    @staticmethod
+    def _recompute_dependent(obj: GeoObject, store: dict[str, GeoObject]) -> GeoObject:
+        """Return a deep copy of ``obj`` with its point-derived scalars refreshed.
+
+        ``store`` must already reflect the moved point's new coordinates. The
+        per-type rules:
+
+        * **Line** — recompute ``direction`` (azimuth ``point_a -> point_b``,
+          converted to the line's ``direction_mode``) and ``elevation``.
+        * **Vector** — only in Origin+Endpoint mode (``endpoint_id is not None``):
+          recompute ``direction``, ``elevation``, and ``length`` from
+          ``origin -> endpoint``. In Length+Direction mode the vector merely
+          translates with its origin, so it is returned unchanged.
+        * **Ray** — a ray is an origin plus an *intrinsic* direction, so moving
+          its origin only translates it; nothing point-derived is stored, hence
+          a no-op copy (this is why Ray differs from Line/Vector despite the
+          issue grouping them together).
+        * **Tangent** — recompute ``direction`` from
+          :func:`~geometry.services.geometry.tangent_direction` (center -> point),
+          converted to the tangent's mode. ``elevation`` is intentionally left
+          as-is: a Circle tangent keeps ``elevation == 0.0`` and a Ball tangent
+          keeps its user-supplied elevation.
+        * **Polygon** — recompute the cached ``is_convex`` flag.
+        * **Circle / Ball / Cylinder / Solid** — no point-derived stored scalar,
+          returned as an unchanged copy.
+
+        Parameters
+        ----------
+        obj : GeoObject
+            The dependent to recompute (not mutated; a copy is returned).
+        store : dict[str, GeoObject]
+            Object store already reflecting the moved point's coordinates.
+
+        Returns
+        -------
+        GeoObject
+            A deep copy of ``obj`` with refreshed derived scalars.
+        """
+        result = copy.deepcopy(obj)
+        if isinstance(result, Line):
+            az = float(_azimuth(store[result.point_a_id], store[result.point_b_id]))
+            result.direction = MovePointCommand._directed_value(az, result.direction_mode)
+            result.elevation = float(_elevation(store[result.point_a_id], store[result.point_b_id]))
+        elif isinstance(result, Vector):
+            # Length+Direction vectors (endpoint_id is None) translate with the
+            # origin and store no point-derived geometry, so leave them as-is.
+            if result.endpoint_id is not None:
+                origin = store[result.origin_id]
+                endpoint = store[result.endpoint_id]
+                az = float(_azimuth(origin, endpoint))
+                result.direction = MovePointCommand._directed_value(az, result.direction_mode)
+                result.elevation = float(_elevation(origin, endpoint))
+                result.length = float(_distance(origin, endpoint))
+        elif isinstance(result, Tangent):
+            shape = store[result.shape_id]
+            center = store[shape.center_id]
+            point = store[result.point_id]
+            az = float(_tangent_direction(center, point))
+            result.direction = MovePointCommand._directed_value(az, result.direction_mode)
+            # elevation is deliberately not recomputed (see method docstring).
+        elif isinstance(result, Polygon):
+            result.is_convex = bool(_is_convex(result, store))
+        # Ray / Circle / Ball / Cylinder / Solid: unchanged copy.
+        return result
+
+    @staticmethod
+    def _directed_value(az: float, mode: DirectionMode) -> float:
+        """Convert an azimuth (radians) into the stored value for ``mode``.
+
+        In :attr:`DirectionMode.AZIMUTH` the azimuth is stored directly
+        (normalised into ``[0, 2π)``); in :attr:`DirectionMode.ANGLE` it is first
+        converted to a math angle. Mirrors the conversion the creation path uses
+        so a moved object's stored ``direction`` matches a freshly created one.
+
+        Parameters
+        ----------
+        az : float
+            Azimuth in radians (CW from North).
+        mode : DirectionMode
+            The dependent object's stored direction convention.
+
+        Returns
+        -------
+        float
+            The value to store in the object's ``direction`` field.
+        """
+        if mode is DirectionMode.AZIMUTH:
+            return float(normalize_to_2pi(az))
+        return float(normalize_to_2pi(azimuth_to_angle(az)))
+
+    def do(self) -> None:
+        """Install the moved point and recomputed dependents; fire per object."""
+        for oid in self._ids:
+            self._objects[oid] = self._after[oid]
+        for oid in self._ids:
+            self._bus.fire(OBJECT_MODIFIED, obj_id=oid)
+
+    def undo(self) -> None:
+        """Restore the pre-move point and dependents; fire per object."""
+        for oid in self._ids:
+            self._objects[oid] = self._before[oid]
+        for oid in self._ids:
+            self._bus.fire(OBJECT_MODIFIED, obj_id=oid)
+
+
+class ModifyPolygonVerticesCommand:
+    """Replace a Polygon's vertex list and refresh its cached convexity.
+
+    Changing ``point_ids`` alters which Points the polygon references, so unlike
+    :class:`ModifyObjectCommand` this command **does** update the dependency
+    graph: :meth:`DependencyGraph.add` re-registers the new edge set (and
+    restores the old set on undo). The cached ``is_convex`` flag is recomputed
+    against the new vertex order so it stays coherent with ``point_ids`` (the two
+    are co-owned by this command per the ``Polygon`` model contract).
+
+    Fields
+    ------
+    description : str
+        ``"Edit vertices of '<name>'"``.
+    _objects : dict[str, GeoObject]
+        The object store this command mutates.
+    _graph : DependencyGraph
+        The dependency graph re-registered on do/undo.
+    _bus : EventBus
+        Event bus for modify notifications.
+    _polygon_id : str
+        ID of the polygon being re-vertexed.
+    _before : Polygon
+        Deep copy with the original ``point_ids``/``is_convex``.
+    _after : Polygon
+        Deep copy with the new ``point_ids`` and recomputed ``is_convex``.
+    """
+
+    def __init__(
+        self,
+        objects: dict[str, GeoObject],
+        graph: DependencyGraph,
+        bus: EventBus,
+        polygon_id: str,
+        new_point_ids: Sequence[str],
+    ) -> None:
+        self._objects = objects
+        self._graph = graph
+        self._bus = bus
+        self._polygon_id = polygon_id
+        before = copy.deepcopy(objects[polygon_id])
+        after = copy.deepcopy(before)
+        after.point_ids = tuple(new_point_ids)
+        # Recompute convexity against the *current* store: the move/edit of the
+        # referenced points is out of scope here, only the vertex set changes.
+        after.is_convex = bool(_is_convex(after, objects))
+        self._before = before
+        self._after = after
+        self.description = f"Edit vertices of '{before.name}'"
+
+    def do(self) -> None:
+        """Install the new vertex set, re-register edges, fire modify."""
+        self._objects[self._polygon_id] = self._after
+        self._graph.add(self._after)
+        self._bus.fire(OBJECT_MODIFIED, obj_id=self._polygon_id)
+
+    def undo(self) -> None:
+        """Restore the original vertex set, re-register edges, fire modify."""
+        self._objects[self._polygon_id] = self._before
+        self._graph.add(self._before)
+        self._bus.fire(OBJECT_MODIFIED, obj_id=self._polygon_id)
+
+
+class BulkImportCommand:
+    """Apply many object creations as a single undoable unit.
+
+    Wraps one :class:`CreateObjectCommand` per imported object so a whole file
+    import is one entry in the undo history rather than dozens. :meth:`do`
+    applies the wrapped creations in order; :meth:`undo` reverses them in the
+    opposite order, so an object is never removed before something created after
+    it (which, with ID-string references, would not matter for correctness but
+    keeps the event order intuitive).
+
+    Fields
+    ------
+    description : str
+        Caller-supplied label, or ``"Import <n> object(s)"`` by default.
+    _commands : list[CreateObjectCommand]
+        The per-object create commands, in import order.
+    """
+
+    def __init__(
+        self,
+        objects: dict[str, GeoObject],
+        graph: DependencyGraph,
+        bus: EventBus,
+        objs: Sequence[GeoObject],
+        description: str | None = None,
+    ) -> None:
+        self._commands = [CreateObjectCommand(objects, graph, bus, obj) for obj in objs]
+        self.description = description or f"Import {len(objs)} object(s)"
+
+    def do(self) -> None:
+        """Apply each wrapped creation in import order."""
+        for cmd in self._commands:
+            cmd.do()
+
+    def undo(self) -> None:
+        """Reverse each wrapped creation in the opposite order."""
+        for cmd in reversed(self._commands):
+            cmd.undo()

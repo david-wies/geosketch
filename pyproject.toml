@@ -26,6 +26,12 @@ disable = ["C0114", "C0115", "C0116"]
 
 [tool.pylint.design]
 max-args = 8
+# Command constructors share a uniform ``(objects, graph, bus, ...)`` collaborator
+# preamble (see geometry/services/commands.py) before their own positional args,
+# so they exceed pylint's default positional-arg cap of 5. Match it to max-args:
+# the uniform signature is a deliberate design choice (a future Project builds
+# every command the same way), not an accident worth flagging per call site.
+max-positional-arguments = 8
 # Vector has 13 attributes total (5 inherited from GeoObject + 3 from
 # DirectedObject + 5 own fields). 15 leaves a small margin for future models
 # without bumping the default 7 too aggressively.
