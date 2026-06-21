@@ -362,6 +362,7 @@ class CreateObjectCommand:
                 "CreateObjectCommand.do: graph registration failed for %r; "
                 "removing the just-inserted store entry",
                 self._obj.id,
+                exc_info=True,
             )
             del self._objects[self._obj.id]
             raise
@@ -371,18 +372,25 @@ class CreateObjectCommand:
         """Remove the object, unregister it, fire :data:`OBJECT_DELETED`.
 
         Guards the store removal: if the object was already removed out-of-band
-        (so ``self._obj.id`` is absent from the store) the removal is a logged
-        no-op rather than a bare ``KeyError``, and the graph is left untouched —
-        unregistering an id this command did not remove would deepen the
-        store/graph inconsistency. Only when this command actually removes the
-        object does it unregister the matching edges, keeping the two in sync.
+        (so ``self._obj.id`` is absent from the store) the store removal is a
+        logged no-op rather than a bare ``KeyError``. The graph is still
+        unregistered in that branch: :meth:`DependencyGraph.unregister` is
+        idempotent at its default ``strict=False``, so unregistering an id whose
+        store entry is already gone simply prunes any stale graph edge and keeps
+        the store and graph in sync (whereas skipping it would leave a dangling
+        edge for an object the store no longer holds). No :data:`OBJECT_DELETED`
+        fires in that branch — nothing was removed from the store — so it returns
+        immediately after the idempotent unregister. On the normal path the
+        object is removed, unregistered, and the delete event fired.
         """
         if self._obj.id not in self._objects:
             _logger.warning(
                 "CreateObjectCommand.undo: object %r already absent from the store; "
-                "treating removal as a no-op and leaving the graph untouched",
+                "treating store removal as a no-op and unregistering (idempotently) "
+                "to keep the graph in sync",
                 self._obj.id,
             )
+            self._graph.unregister(self._obj.id)
             return
         del self._objects[self._obj.id]
         self._graph.unregister(self._obj.id)
@@ -478,26 +486,85 @@ class CascadeDeleteCommand:
             # the fully-removed ones would leave those siblings missing edges.
             # ``add`` replaces (it does not accumulate), so re-adding an object
             # that is still registered is a safe no-op that reinstates its edges.
+            #
+            # The rollback itself is fault-tolerant: each restore step is guarded
+            # so a step that raises is logged and skipped rather than aborting the
+            # remaining steps or masking the ORIGINAL exception. The bare ``raise``
+            # at the end re-raises that original exception; ``_snapshot`` is always
+            # cleared first, so even a partially-failed rollback cannot leave a
+            # later ``undo`` re-applying this failed delete.
             _logger.error(
                 "CascadeDeleteCommand.do: failed mid-cascade for root %r after "
                 "removing %d store entr(ies); rolling back",
                 self._root_id,
                 len(store_removed),
+                exc_info=True,
             )
             for obj in store_removed:
-                self._objects[obj.id] = obj
+                try:
+                    self._objects[obj.id] = obj
+                except Exception:  # noqa: BLE001  pylint: disable=broad-exception-caught
+                    _logger.error(
+                        "CascadeDeleteCommand.do: rollback failed to restore store "
+                        "entry %r; continuing",
+                        obj.id,
+                        exc_info=True,
+                    )
             for obj in self._snapshot.values():
-                self._graph.add(obj)
+                try:
+                    self._graph.add(obj)
+                except Exception:  # noqa: BLE001  pylint: disable=broad-exception-caught
+                    _logger.error(
+                        "CascadeDeleteCommand.do: rollback failed to re-register "
+                        "edges for %r; continuing",
+                        obj.id,
+                        exc_info=True,
+                    )
             self._snapshot = {}
             raise
         self._bus.fire(OBJECT_DELETED, obj_ids=list(self._snapshot))
 
     def undo(self) -> None:
-        """Re-insert every removed object and re-register its edges."""
-        for obj in self._snapshot.values():
-            self._objects[obj.id] = obj
-            self._graph.add(obj)
-            self._bus.fire(OBJECT_CREATED, obj_id=obj.id)
+        """Re-insert every removed object and re-register its edges.
+
+        Restoration is atomic and mirrors the hardened :meth:`do` rollback: each
+        snapshot object is re-inserted into the store and re-registered in the
+        graph in turn, firing :data:`OBJECT_CREATED` per object. If any step
+        raises mid-restore, the partial restore is rolled back — the store
+        entries re-inserted so far are removed and their graph edges unregistered
+        (idempotently, at ``strict=False``) — and the ORIGINAL exception is
+        re-raised. Each rollback step is itself guarded so one failing step
+        neither aborts the others nor masks the original exception.
+        ``_snapshot`` is left intact so the command stays recoverable for a later
+        :meth:`undo` retry.
+        """
+        restored: list[GeoObject] = []
+        try:
+            for obj in self._snapshot.values():
+                self._objects[obj.id] = obj
+                restored.append(obj)  # record before the graph call can raise
+                self._graph.add(obj)
+                self._bus.fire(OBJECT_CREATED, obj_id=obj.id)
+        except Exception:  # pylint: disable=broad-exception-caught
+            _logger.error(
+                "CascadeDeleteCommand.undo: failed mid-restore for root %r after "
+                "restoring %d object(s); rolling back the partial restore",
+                self._root_id,
+                len(restored),
+                exc_info=True,
+            )
+            for obj in restored:
+                try:
+                    self._objects.pop(obj.id, None)
+                    self._graph.unregister(obj.id)
+                except Exception:  # noqa: BLE001  pylint: disable=broad-exception-caught
+                    _logger.error(
+                        "CascadeDeleteCommand.undo: rollback failed to remove "
+                        "partial restore of %r; continuing",
+                        obj.id,
+                        exc_info=True,
+                    )
+            raise
 
 
 class ModifyObjectCommand:
@@ -661,10 +728,31 @@ class MovePointCommand:
                     point_id,
                     dep_id,
                     exc,
+                    exc_info=True,
                 )
                 raise ValueError(
                     f"Cannot move point {point_id!r}: it would invalidate dependent "
                     f"{dep_id!r} ({exc}); the move was rejected"
+                ) from exc
+            except (KeyError, AttributeError) as exc:
+                # A dangling reference rather than invalid geometry: e.g. the
+                # dependent names a store id (an endpoint, a circle center) that
+                # is absent, so ``_recompute_dependent`` raises ``KeyError`` (or
+                # ``AttributeError`` resolving a field on a missing object). This
+                # is a structural inconsistency, not a user-rejectable geometry
+                # error, so surface it as a ``RuntimeError`` naming the move and
+                # the offending dependent, chained from the original exception.
+                _logger.error(
+                    "MovePointCommand: recompute of dependent %r for moved point %r "
+                    "hit a dangling reference (%r)",
+                    dep_id,
+                    point_id,
+                    exc,
+                    exc_info=True,
+                )
+                raise RuntimeError(
+                    f"Cannot move point {point_id!r}: dependent {dep_id!r} has a "
+                    f"dangling reference ({exc!r}); the store is inconsistent"
                 ) from exc
 
         # Point first so the UI updates the marker before its dependents.
@@ -924,9 +1012,21 @@ class BulkImportCommand:
                 "BulkImportCommand.do: failed after applying %d of %d creation(s); rolling back",
                 len(applied),
                 len(self._commands),
+                exc_info=True,
             )
+            # Fault-tolerant rollback: a wrapped ``undo`` that itself raises is
+            # logged and skipped so every remaining applied create is still
+            # reversed, and the ORIGINAL exception (re-raised by the bare
+            # ``raise``) is never masked by a rollback-step exception.
             for cmd in reversed(applied):
-                cmd.undo()
+                try:
+                    cmd.undo()
+                except Exception:  # noqa: BLE001  pylint: disable=broad-exception-caught
+                    _logger.error(
+                        "BulkImportCommand.do: rollback undo of %r failed; continuing",
+                        cmd.description,
+                        exc_info=True,
+                    )
             raise
 
     def undo(self) -> None:
@@ -946,7 +1046,19 @@ class BulkImportCommand:
                 "BulkImportCommand.undo: failed after reversing %d of %d creation(s); restoring",
                 len(reversed_so_far),
                 len(self._commands),
+                exc_info=True,
             )
+            # Fault-tolerant restoration: a wrapped ``do`` that itself raises is
+            # logged and skipped so every already-reversed create is still
+            # restored, and the ORIGINAL exception (re-raised by the bare
+            # ``raise``) is never masked by a restoration-step exception.
             for cmd in reversed(reversed_so_far):
-                cmd.do()
+                try:
+                    cmd.do()
+                except Exception:  # noqa: BLE001  pylint: disable=broad-exception-caught
+                    _logger.error(
+                        "BulkImportCommand.undo: restoration do of %r failed; continuing",
+                        cmd.description,
+                        exc_info=True,
+                    )
             raise

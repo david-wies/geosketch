@@ -304,6 +304,68 @@ class _FailingUnregisterGraph(DependencyGraph):
         super().unregister(obj_id, strict=strict)
 
 
+class _FaultInjectGraph(DependencyGraph):
+    """A graph that can be armed to raise from :meth:`unregister` and :meth:`add`.
+
+    ``unregister_fail_id`` raises a ``RuntimeError`` the first time that id is
+    unregistered (the *primary* fault that triggers a rollback). ``add_fail_id``
+    raises a ``RuntimeError`` the first time that id is (re-)added, simulating a
+    *rollback step* that itself fails. Both fire at most once, so the rollback
+    can still make progress on its remaining steps and the original exception is
+    the one that must surface.
+
+    Used to prove the rollback loops in :class:`CascadeDeleteCommand` are
+    fault-tolerant: an exception thrown by one rollback step neither aborts the
+    remaining steps nor replaces the original (primary) exception.
+    """
+
+    def __init__(self, *, unregister_fail_id: str | None = None, add_fail_id: str | None = None):
+        super().__init__()
+        self._unregister_fail_id = unregister_fail_id
+        self._add_fail_id = add_fail_id
+        self.add_attempts: list[str] = []
+
+    def unregister(self, obj_id: str, *, strict: bool = False) -> None:
+        if obj_id == self._unregister_fail_id:
+            self._unregister_fail_id = None  # fire once
+            raise RuntimeError(f"induced unregister failure for {obj_id!r}")
+        super().unregister(obj_id, strict=strict)
+
+    def add(self, obj) -> None:  # noqa: ANN001 - GeoObject, matches base signature
+        self.add_attempts.append(obj.id)
+        if obj.id == self._add_fail_id:
+            self._add_fail_id = None  # fire once
+            raise RuntimeError(f"induced add failure for {obj.id!r}")
+        super().add(obj)
+
+
+class _RaisingUndoCreate:
+    """A wrapped-create stand-in whose :meth:`do`/:meth:`undo` can be armed to raise.
+
+    Mirrors :class:`CreateObjectCommand`'s ``do``/``undo`` contract closely
+    enough for :class:`BulkImportCommand` to drive it, while letting a test arm
+    a specific call to raise. ``log`` records every ``do``/``undo`` so the test
+    can assert which rollback steps actually ran.
+    """
+
+    def __init__(self, label: str, log: list[str]) -> None:
+        self.description = f"Create {label}"
+        self._label = label
+        self._log = log
+        self.raise_on_do = False
+        self.raise_on_undo = False
+
+    def do(self) -> None:
+        self._log.append(f"do:{self._label}")
+        if self.raise_on_do:
+            raise RuntimeError(f"do failed for {self._label}")
+
+    def undo(self) -> None:
+        self._log.append(f"undo:{self._label}")
+        if self.raise_on_undo:
+            raise RuntimeError(f"undo failed for {self._label}")
+
+
 # ---------------------------------------------------------------------------
 # CommandHistory mechanics
 # ---------------------------------------------------------------------------
@@ -511,6 +573,50 @@ def test_create_line_registers_edges_to_both_points():
     cmd.undo()
     assert graph.dependents_of("pt_001") == set()
     graph._test_only_assert_consistent()  # pylint: disable=protected-access
+
+
+def test_create_object_do_rolls_back_store_when_graph_add_raises():
+    # Test gap: a direct CreateObjectCommand.do whose graph.add raises must
+    # remove the just-inserted store entry before the exception propagates, so a
+    # failed create never leaves an orphan in the store with no graph edges.
+    objects: dict = {}
+    graph = _FaultInjectGraph(add_fail_id="pt_001")
+    point = make_point("pt_001", 0.0, 0.0)
+    cmd = CreateObjectCommand(objects, graph, EventBus(), point)
+    with pytest.raises(RuntimeError, match="induced add failure"):
+        cmd.do()
+    assert "pt_001" not in objects  # the inserted entry was rolled back
+
+
+def test_create_object_undo_unregisters_even_when_already_absent():
+    # H4: when the object is already absent from the store, undo must still call
+    # graph.unregister (idempotent) so store and graph stay consistent — no
+    # stale graph edge is left behind — and it must NOT fire OBJECT_DELETED
+    # (nothing was removed from the store).
+    objects: dict = {}
+    graph = DependencyGraph()
+    point = make_point("pt_001", 0.0, 0.0)
+    bus = EventBus()
+    counter = _EventCounter()
+    counter.subscribe_all(bus)
+    cmd = CreateObjectCommand(objects, graph, bus, point)
+    cmd.do()  # inserts pt_001 and registers its edge
+    del objects["pt_001"]  # remove out-of-band; graph edge now stale
+
+    unregistered: list[str] = []
+    original_unregister = graph.unregister
+
+    def _spy(obj_id: str, *, strict: bool = False) -> None:
+        unregistered.append(obj_id)
+        original_unregister(obj_id, strict=strict)
+
+    graph.unregister = _spy  # type: ignore[method-assign]
+    counter.deleted.clear()
+
+    cmd.undo()
+    assert unregistered == ["pt_001"]  # idempotent unregister still called
+    assert not graph.is_registered("pt_001")  # store and graph back in sync
+    assert not counter.deleted  # no OBJECT_DELETED for the no-op branch
 
 
 # ---------------------------------------------------------------------------
@@ -923,6 +1029,27 @@ def test_move_point_rejected_when_it_invalidates_tangent():
     assert graph.dependents_of("pt_001") == {"ci_001", "tg_001"}
 
 
+def test_move_point_dangling_dependent_reference_raises_runtime_error():
+    # H5: a dependent referencing a missing store id makes ``_recompute_dependent``
+    # raise a KeyError (not a ValueError). The move must surface a contextual
+    # RuntimeError naming the moved point and the offending dependent, chained
+    # from the original KeyError — rather than letting a bare KeyError escape.
+    line = make_line("ln_001", "pt_001", "pt_missing")
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0),
+        "ln_001": line,
+    }
+    graph = DependencyGraph()
+    graph.add(objects["pt_001"])
+    # Register the line manually so it is a dependent of pt_001 even though its
+    # other endpoint (pt_missing) is absent from the store.
+    graph.add(line)
+
+    with pytest.raises(RuntimeError, match=r"pt_001.*ln_001") as excinfo:
+        MovePointCommand(objects, graph, EventBus(), "pt_001", easting=1.0, northing=1.0)
+    assert isinstance(excinfo.value.__cause__, (KeyError, AttributeError))
+
+
 def test_move_point_recomputes_dependent_ray_is_noop():
     objects = {
         "pt_001": make_point("pt_001", 0.0, 0.0),
@@ -1087,6 +1214,49 @@ def test_bulk_import_rolls_back_on_mid_batch_failure():
     assert not graph.is_registered("pt_001")
 
 
+def test_bulk_import_do_rollback_is_fault_tolerant():
+    # H1: a wrapped create fails mid-batch, triggering the rollback, and a
+    # rollback ``undo()`` of an already-applied create ALSO raises. The ORIGINAL
+    # exception must propagate (not the rollback one) and every remaining
+    # rollback step must still run.
+    log: list[str] = []
+    cmd = BulkImportCommand({}, DependencyGraph(), EventBus(), [])
+    a = _RaisingUndoCreate("a", log)
+    b = _RaisingUndoCreate("b", log)
+    c = _RaisingUndoCreate("c", log)
+    c.raise_on_do = True  # the batch fails on c's create
+    a.raise_on_undo = True  # and a's rollback undo ALSO raises
+    cmd._commands = [a, b, c]  # pylint: disable=protected-access
+
+    with pytest.raises(RuntimeError, match="do failed for c"):
+        cmd.do()
+    # a and b were applied, c failed; rollback runs newest-first over the
+    # applied set (b then a) and still attempts a's undo despite it raising.
+    assert log == ["do:a", "do:b", "do:c", "undo:b", "undo:a"]
+
+
+def test_bulk_import_undo_rollback_is_fault_tolerant():
+    # Test gap: a wrapped ``undo`` fails mid-batch during BulkImport.undo, and
+    # the restoring ``do()`` ALSO raises. The ORIGINAL exception must propagate
+    # and restoration must be attempted for every already-reversed command.
+    log: list[str] = []
+    cmd = BulkImportCommand({}, DependencyGraph(), EventBus(), [])
+    a = _RaisingUndoCreate("a", log)
+    b = _RaisingUndoCreate("b", log)
+    c = _RaisingUndoCreate("c", log)
+    # undo iterates newest-first: c, b, a. Make a's undo fail (the batch fault);
+    # then restoration redoes the already-reversed c and b — make c's do raise.
+    a.raise_on_undo = True
+    c.raise_on_do = True
+    cmd._commands = [a, b, c]  # pylint: disable=protected-access
+
+    with pytest.raises(RuntimeError, match="undo failed for a"):
+        cmd.undo()
+    # undo order c, b, a (a raises). reversed_so_far == [c, b]; restoration runs
+    # newest-first (b then c) and still attempts c's do despite it raising.
+    assert log == ["undo:c", "undo:b", "undo:a", "do:b", "do:c"]
+
+
 # ---------------------------------------------------------------------------
 # CascadeDeleteCommand atomicity (rollback on mid-cascade failure)
 # ---------------------------------------------------------------------------
@@ -1116,6 +1286,69 @@ def test_cascade_delete_rolls_back_on_mid_cascade_failure():
     assert graph.dependents_of("pt_001") == {"ln_001", "pg_001"}
     assert not counter.deleted
     graph._test_only_assert_consistent()  # pylint: disable=protected-access
+
+
+def test_cascade_delete_do_rollback_is_fault_tolerant():
+    # H1: a primary mid-cascade unregister failure triggers the rollback, and a
+    # rollback-step ``add`` ALSO raises once. The ORIGINAL exception must still
+    # propagate (not the rollback one), every remaining rollback ``add`` must
+    # still run, and ``_snapshot`` must end empty so a later undo cannot re-apply
+    # a failed delete.
+    objects, _ = _point_line_polygon_scene()
+    graph = _FaultInjectGraph(unregister_fail_id="ln_001")
+    for obj in objects.values():
+        graph.add(obj)
+    graph.add_attempts.clear()
+    # Arm the rollback-step failure only after the initial registration, so it
+    # fires during the rollback's re-add rather than during setup.
+    graph._add_fail_id = "pt_001"  # pylint: disable=protected-access
+    bus = EventBus()
+
+    cmd = CascadeDeleteCommand(objects, graph, bus, "pt_001")
+    with pytest.raises(RuntimeError, match="induced unregister failure"):
+        cmd.do()
+
+    # The rollback attempted to re-add every snapshot object despite pt_001's add
+    # raising — the closure is {pt_001, ln_001, pg_001}.
+    assert set(graph.add_attempts) >= {"pt_001", "ln_001", "pg_001"}
+    # Snapshot is cleared even though a rollback step failed: a later undo must
+    # not re-apply the failed delete.
+    assert not cmd._snapshot  # pylint: disable=protected-access
+
+
+def test_cascade_delete_undo_rolls_back_partial_restore():
+    # H2: ``undo`` re-inserts each snapshot object and calls ``graph.add``. If an
+    # ``add`` raises mid-restore, the partial restore must be rolled back (the
+    # just-re-inserted store entries removed, their edges unregistered) and the
+    # ORIGINAL exception must propagate, with ``_snapshot`` left intact so the
+    # command stays recoverable.
+    objects, _ = _point_line_polygon_scene()
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+    bus = EventBus()
+
+    cmd = CascadeDeleteCommand(objects, graph, bus, "pt_001")
+    cmd.do()  # removes pt_001, ln_001, pg_001 cleanly
+    snapshot_ids = set(cmd._snapshot)  # pylint: disable=protected-access
+    assert snapshot_ids == {"pt_001", "ln_001", "pg_001"}
+
+    # Arm one snapshot object's re-add to fail during undo.
+    fail_id = next(iter(snapshot_ids))
+    graph_fault = _FaultInjectGraph(add_fail_id=fail_id)
+    # Re-register the survivors so the fault graph mirrors the real one's state.
+    for obj in objects.values():
+        graph_fault.add(obj)
+    cmd._graph = graph_fault  # pylint: disable=protected-access
+
+    with pytest.raises(RuntimeError, match="induced add failure"):
+        cmd.undo()
+
+    # Partial restore was rolled back: none of the snapshot ids leaked into the
+    # store, and the snapshot is intact for a later retry.
+    for oid in snapshot_ids:
+        assert oid not in objects
+    assert set(cmd._snapshot) == snapshot_ids  # pylint: disable=protected-access
 
 
 # ---------------------------------------------------------------------------
