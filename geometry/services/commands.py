@@ -103,6 +103,7 @@ from geometry.utils.events import (
 
 __all__ = [
     "MAX_HISTORY",
+    "REFERENCE_FIELDS",
     "Command",
     "CommandHistory",
     "CreateObjectCommand",
@@ -120,6 +121,32 @@ _logger = logging.getLogger(__name__)
 #: semantics). Redo is unbounded between actions but is cleared whenever a fresh
 #: command is pushed, so it never grows past the undo bound either.
 MAX_HISTORY = 100
+
+#: Names of fields that hold inter-object **references** (ID strings or ID
+#: sequences). Mutating any of these changes which objects an object depends on,
+#: which means the dependency graph's edge set must be rebuilt — work that
+#: :class:`ModifyObjectCommand` deliberately does NOT do. Changing one through
+#: that command would leave the graph stale (a cascade delete or point-move would
+#: silently miss the new/old referent), so :class:`ModifyObjectCommand` rejects
+#: any change whose key is in this set and steers callers to the create/delete or
+#: vertex commands, which keep the graph in sync. The set is the union of every
+#: reference field consumed by :func:`geometry.services.dep_graph.deps_for_type`
+#: (line, polygon, ray, vector, circle, ball, cylinder, solid, tangent); keep it
+#: in lockstep with that function if a new reference field is ever added.
+REFERENCE_FIELDS = frozenset(
+    {
+        "point_a_id",  # Line
+        "point_b_id",  # Line
+        "point_ids",  # Polygon
+        "origin_id",  # Ray, Vector
+        "endpoint_id",  # Vector
+        "center_id",  # Circle, Ball
+        "base_center_id",  # Cylinder
+        "shape_id",  # Tangent
+        "point_id",  # Tangent
+        "layers",  # Solid
+    }
+)
 
 
 @runtime_checkable
@@ -246,8 +273,19 @@ class CommandHistory:
         either stack is mutated. If ``undo`` raises (e.g. a bus handler throws —
         :meth:`EventBus.fire` propagates — or a partial mutation fails) the
         command stays on the undo stack and :data:`HISTORY_CHANGED` never fires,
-        so the failed transition is fully recoverable rather than losing the
-        command from both stacks.
+        so the command remains on its originating stack and can be retried.
+
+        Recoverability is scoped to the store/graph mutation, not the event
+        fan-out. Each command's own do/undo restores the object store and
+        dependency graph to a consistent state when its mutation phase fails,
+        and leaving the command on the undo stack lets the caller retry it. The
+        **event fan-out phase is outside that atomic region**: a command that
+        notifies several subscribers (or whose mutation succeeds but a later
+        :meth:`EventBus.fire` raises) may already have delivered events to some
+        subscribers before the failure, and a retry re-fires the whole set —
+        so already-notified subscribers can receive the same event twice. The
+        store/graph stay consistent across a retry; subscriber-visible event
+        delivery is not guaranteed exactly-once.
 
         Returns
         -------
@@ -271,8 +309,19 @@ class CommandHistory:
         either stack is mutated. If ``do`` raises (e.g. a bus handler throws —
         :meth:`EventBus.fire` propagates — or a partial mutation fails) the
         command stays on the redo stack and :data:`HISTORY_CHANGED` never fires,
-        so the failed transition is fully recoverable rather than losing the
-        command from both stacks.
+        so the command remains on its originating stack and can be retried.
+
+        Recoverability is scoped to the store/graph mutation, not the event
+        fan-out. Each command's own do/undo restores the object store and
+        dependency graph to a consistent state when its mutation phase fails,
+        and leaving the command on the redo stack lets the caller retry it. The
+        **event fan-out phase is outside that atomic region**: a command that
+        notifies several subscribers (or whose mutation succeeds but a later
+        :meth:`EventBus.fire` raises) may already have delivered events to some
+        subscribers before the failure, and a retry re-fires the whole set —
+        so already-notified subscribers can receive the same event twice. The
+        store/graph stay consistent across a retry; subscriber-visible event
+        delivery is not guaranteed exactly-once.
 
         Returns
         -------
@@ -532,11 +581,19 @@ class CascadeDeleteCommand:
         graph in turn, firing :data:`OBJECT_CREATED` per object. If any step
         raises mid-restore, the partial restore is rolled back — the store
         entries re-inserted so far are removed and their graph edges unregistered
-        (idempotently, at ``strict=False``) — and the ORIGINAL exception is
-        re-raised. Each rollback step is itself guarded so one failing step
-        neither aborts the others nor masks the original exception.
-        ``_snapshot`` is left intact so the command stays recoverable for a later
-        :meth:`undo` retry.
+        (idempotently, at ``strict=False``).
+
+        Rollback symmetry with :meth:`do`. The rollback loop still *attempts*
+        every cleanup step even when one fails (fault-tolerant intent), but —
+        unlike a silently swallowed failure — a rollback step that itself raises
+        is **not** discarded: its exception is collected and, after the remaining
+        steps have been attempted, surfaced as a distinct :class:`RuntimeError`
+        chained (via ``raise ... from``) to the original mid-restore exception.
+        This prevents the store and graph drifting into silent disagreement when
+        cleanup partially fails. When every rollback step succeeds the ORIGINAL
+        exception is re-raised unchanged. Mirroring :meth:`do`, ``_snapshot`` is
+        cleared on any restore failure so a later :meth:`undo`/redo never
+        re-applies this failed restore against a now-inconsistent store.
         """
         restored: list[GeoObject] = []
         try:
@@ -545,7 +602,7 @@ class CascadeDeleteCommand:
                 restored.append(obj)  # record before the graph call can raise
                 self._graph.add(obj)
                 self._bus.fire(OBJECT_CREATED, obj_id=obj.id)
-        except Exception:  # pylint: disable=broad-exception-caught
+        except Exception as original_exc:  # pylint: disable=broad-exception-caught
             _logger.error(
                 "CascadeDeleteCommand.undo: failed mid-restore for root %r after "
                 "restoring %d object(s); rolling back the partial restore",
@@ -553,17 +610,33 @@ class CascadeDeleteCommand:
                 len(restored),
                 exc_info=True,
             )
+            # Attempt every cleanup step, but record (do not swallow) any step
+            # that itself raises so a partially-failed rollback is surfaced
+            # rather than silently leaving store/graph disagreeing.
+            rollback_failures: list[tuple[str, BaseException]] = []
             for obj in restored:
                 try:
                     self._objects.pop(obj.id, None)
                     self._graph.unregister(obj.id)
-                except Exception:  # noqa: BLE001  pylint: disable=broad-exception-caught
+                except Exception as rollback_exc:  # noqa: BLE001  pylint: disable=broad-exception-caught
                     _logger.error(
                         "CascadeDeleteCommand.undo: rollback failed to remove "
                         "partial restore of %r; continuing",
                         obj.id,
                         exc_info=True,
                     )
+                    rollback_failures.append((obj.id, rollback_exc))
+            # Mirror do()'s contract: clear the snapshot on any restore failure.
+            self._snapshot = {}
+            if rollback_failures:
+                failed_ids = [oid for oid, _ in rollback_failures]
+                raise RuntimeError(
+                    f"CascadeDeleteCommand.undo: rollback of a failed restore for "
+                    f"root {self._root_id!r} could not be completed; "
+                    f"the original mid-restore op raised {original_exc!r} and "
+                    f"rollback of object(s) {failed_ids!r} also failed "
+                    f"({rollback_failures[0][1]!r}); store and graph may disagree"
+                ) from original_exc
             raise
 
 
@@ -581,6 +654,29 @@ class ModifyObjectCommand:
     :data:`OBJECT_MODIFIED`. Changes are applied with :func:`setattr` on a
     deep copy, so the read-only ``id``/``type`` guard is respected and the
     original instance is never mutated in place.
+
+    Rejected changes
+    ----------------
+    The constructor rejects (with :class:`ValueError`, before any mutation) any
+    change to: an unknown field; the immutable identity fields ``id``/``type``;
+    or any reference field in :data:`REFERENCE_FIELDS` — those alter the
+    dependency graph, which this command does not touch, so they must go through
+    the create/delete or :class:`ModifyPolygonVerticesCommand` paths. Because the
+    deep-copy + :func:`setattr` path bypasses the model ``__post_init__``, the
+    constructor also re-validates ``alpha`` (real number in ``[0.0, 1.0]``) and
+    ``visibility`` (a ``bool``) so a corrupt envelope value cannot be installed.
+
+    Direction convention caveat
+    ---------------------------
+    ``direction`` is stored in radians but its meaning depends on
+    ``direction_mode``: azimuth-radians (CW from North) under
+    :attr:`DirectionMode.AZIMUTH` versus math-angle-radians (CCW from East) under
+    :attr:`DirectionMode.ANGLE`. Toggling ``direction_mode`` **alone** leaves the
+    stored ``direction`` numerically unchanged but silently *reinterpreted* under
+    the new convention — a different physical bearing. Callers (future dialogs)
+    MUST send ``direction_mode`` and a freshly converted ``direction`` together
+    as a consistent pair; this command does not convert ``direction`` when only
+    the mode changes.
 
     Fields
     ------
@@ -627,6 +723,58 @@ class ModifyObjectCommand:
                     f"ModifyObjectCommand: unknown field {key!r} for type "
                     f"{before.type!r} (object {obj_id!r})"
                 )
+        # ``id`` and ``type`` are identity, not editable state: ``type`` is
+        # read-only post-construction (the setattr below would raise) and
+        # changing ``id`` would orphan every ID-string referrer. Reject both up
+        # front with a clear message rather than letting ``type`` surface a raw
+        # AttributeError or ``id`` silently break references.
+        for identity_field in ("id", "type"):
+            if identity_field in changes:
+                raise ValueError(
+                    f"ModifyObjectCommand: cannot change identity field "
+                    f"{identity_field!r} (object {obj_id!r}); id/type are immutable"
+                )
+        # Reject reference/identity field changes: mutating one alters which
+        # objects this one depends on, but ModifyObjectCommand intentionally
+        # leaves the dependency graph untouched (it handles only envelope and
+        # property fields). Editing a reference here would leave the graph stale
+        # — a later cascade delete or point-move would miss the new/old referent
+        # — a silent corruption. Reference edits must go through the
+        # create/delete commands or :class:`ModifyPolygonVerticesCommand`, which
+        # re-register the graph edges.
+        offending_refs = sorted(changes.keys() & REFERENCE_FIELDS)
+        if offending_refs:
+            raise ValueError(
+                f"ModifyObjectCommand: cannot change reference field(s) "
+                f"{offending_refs} (object {obj_id!r}); this command handles "
+                f"envelope/property fields only and does not update the "
+                f"dependency graph. Route reference changes through the "
+                f"create/delete or vertex commands, which re-register graph edges."
+            )
+        # Envelope value guards. ``ModifyObjectCommand`` applies changes with
+        # ``setattr`` on a deep copy, which does NOT re-run the model's
+        # ``__post_init__`` — so the model-level alpha/visibility checks in
+        # ``GeoObject.__post_init__`` (alpha) are bypassed here, and visibility
+        # is not validated at the model level at all. Re-validate the two
+        # envelope fields whose corruption would silently break rendering before
+        # any mutation, so a bad value is rejected rather than installed.
+        if "alpha" in changes:
+            alpha = changes["alpha"]
+            if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+                raise ValueError(
+                    f"ModifyObjectCommand: alpha must be a real number in "
+                    f"[0.0, 1.0]; got {alpha!r} (object {obj_id!r})"
+                )
+            if not 0.0 <= float(alpha) <= 1.0:
+                raise ValueError(
+                    f"ModifyObjectCommand: alpha must be in [0.0, 1.0]; got "
+                    f"{alpha!r} (object {obj_id!r})"
+                )
+        if "visibility" in changes and not isinstance(changes["visibility"], bool):
+            raise ValueError(
+                f"ModifyObjectCommand: visibility must be a bool; got "
+                f"{changes['visibility']!r} (object {obj_id!r})"
+            )
         for key, value in changes.items():
             setattr(after, key, value)
         self._before = before
@@ -659,6 +807,17 @@ class MovePointCommand:
     The graph is **not** touched: a move changes no references, only coordinates,
     so the edge set is invariant. Both snapshots are computed once at
     construction, so do/undo/redo are pure dict swaps with no recomputation.
+
+    Eager-snapshot contract
+    -----------------------
+    The ``_before`` and ``_after`` snapshots are captured **eagerly at
+    construction** — ``_before`` from the store as it stands when the command is
+    built, ``_after`` from a recompute against that same store. The command must
+    therefore be pushed (and applied) immediately after construction: any
+    mutation of the store between construction and :meth:`CommandHistory.push`
+    is invisible to these frozen snapshots, so a later redo would reinstate stale
+    state that overwrites the intervening change. Do not build a
+    ``MovePointCommand``, mutate the store, then push it.
 
     Fields
     ------
@@ -694,7 +853,13 @@ class MovePointCommand:
         point = objects[point_id]
         self.description = f"Move {point.name}"
 
-        dependent_ids = [dep_id for dep_id in graph.dependents_of(point_id) if dep_id in objects]
+        # ``dependents_of`` returns a frozenset, so iterating it directly would
+        # make the recompute order — and therefore the OBJECT_MODIFIED fan-out
+        # order in do()/undo() — non-deterministic. Sort the ids so do/undo fire
+        # events in a stable, reproducible order across runs.
+        dependent_ids = sorted(
+            dep_id for dep_id in graph.dependents_of(point_id) if dep_id in objects
+        )
 
         # Snapshot the before-state: the point and every dependent, untouched.
         self._before: dict[str, GeoObject] = {point_id: copy.deepcopy(point)}
@@ -734,25 +899,27 @@ class MovePointCommand:
                     f"Cannot move point {point_id!r}: it would invalidate dependent "
                     f"{dep_id!r} ({exc}); the move was rejected"
                 ) from exc
-            except (KeyError, AttributeError) as exc:
-                # A dangling reference rather than invalid geometry: e.g. the
+            except (KeyError, AttributeError, TypeError) as exc:
+                # A structural inconsistency rather than invalid geometry: the
                 # dependent names a store id (an endpoint, a circle center) that
-                # is absent, so ``_recompute_dependent`` raises ``KeyError`` (or
-                # ``AttributeError`` resolving a field on a missing object). This
-                # is a structural inconsistency, not a user-rejectable geometry
-                # error, so surface it as a ``RuntimeError`` naming the move and
-                # the offending dependent, chained from the original exception.
+                # is absent, so ``_recompute_dependent`` raises ``KeyError``; or
+                # it resolves a field on a missing/malformed object, raising
+                # ``AttributeError``; or a malformed dependent yields a value of
+                # the wrong type to a geometry helper, raising ``TypeError``.
+                # None of these is a user-rejectable geometry error, so surface
+                # them all as a ``RuntimeError`` naming the move and the
+                # offending dependent, chained from the original exception.
                 _logger.error(
                     "MovePointCommand: recompute of dependent %r for moved point %r "
-                    "hit a dangling reference (%r)",
+                    "hit a structural inconsistency (%r)",
                     dep_id,
                     point_id,
                     exc,
                     exc_info=True,
                 )
                 raise RuntimeError(
-                    f"Cannot move point {point_id!r}: dependent {dep_id!r} has a "
-                    f"dangling reference ({exc!r}); the store is inconsistent"
+                    f"Cannot move point {point_id!r}: dependent {dep_id!r} is "
+                    f"structurally inconsistent ({exc!r}); the store is inconsistent"
                 ) from exc
 
         # Point first so the UI updates the marker before its dependents.
@@ -819,11 +986,14 @@ class MovePointCommand:
             result.direction = MovePointCommand._directed_value(az, result.direction_mode)
             # elevation is deliberately not recomputed (see method docstring).
         elif isinstance(result, Polygon):
-            # Per spec (MVP.md:1087-1088) a point move refreshes only the cached
-            # convexity flag; it deliberately does NOT re-wind or re-validate
-            # simplicity of a polygon containing the moved point. Re-winding and
-            # simplicity validation are ModifyPolygonVerticesCommand's job (a
-            # vertex-set edit), not a coordinate move's — do not "fix" this to
+            # A point move refreshes only the cached convexity flag; it
+            # deliberately does NOT re-wind or re-validate simplicity of a
+            # polygon containing the moved point. MVP.md:1088 lists the
+            # point-move recomputes (line directions, vector endpoints,
+            # intersection points) and is silent on polygons, while re-winding
+            # and simplicity validation are spelled out as the vertex-edit
+            # command's job (MVP.md:1073, restored on undo per MVP.md:1089) —
+            # so a coordinate move only touches is_convex. Do not "fix" this to
             # call the polygon validators here.
             result.is_convex = bool(_is_convex(result, store))
         # Ray / Circle / Ball / Cylinder / Solid: unchanged copy.

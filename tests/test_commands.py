@@ -32,6 +32,11 @@ The model builders below intentionally use small explicit factory functions
 (one per type that a test needs) rather than the spread-dict style, so each test
 reads as a self-contained scene.
 """
+# The command suite exercises six command classes plus history mechanics, a
+# ten-type parametrized create round-trip, and per-type recompute rules, so it
+# legitimately exceeds pylint's default module-length cap; splitting it would
+# scatter the shared builders/fault-injection fixtures across modules.
+# pylint: disable=too-many-lines
 
 import math
 
@@ -43,6 +48,7 @@ from geometry.models import (
     Cylinder,
     DirectionMode,
     DirectionUnits,
+    GeoObject,
     Line,
     Point,
     Polygon,
@@ -53,6 +59,7 @@ from geometry.models import (
 )
 from geometry.services.commands import (
     MAX_HISTORY,
+    REFERENCE_FIELDS,
     BulkImportCommand,
     CascadeDeleteCommand,
     Command,
@@ -619,6 +626,91 @@ def test_create_object_undo_unregisters_even_when_already_absent():
     assert not counter.deleted  # no OBJECT_DELETED for the no-op branch
 
 
+def _create_round_trip_scene(kind: str) -> tuple[list[GeoObject], GeoObject, frozenset[str]]:
+    """Build the prerequisites and target object for a create round-trip.
+
+    Returns ``(prereqs, target, expected_edges)``: ``prereqs`` are the
+    already-created objects ``target`` references, ``target`` is the object whose
+    ``CreateObjectCommand`` is under test, and ``expected_edges`` is the exact
+    forward-edge set ``deps_for_type`` should derive for ``target`` (asserted
+    independently so a per-type edge-extraction regression surfaces here).
+    """
+    pts = [make_point(f"pt_{i:03d}", float(i), 0.0) for i in range(1, 5)]
+    p1, p2, p3, p4 = (p.id for p in pts)
+    polygon = make_polygon("pg_001", (p1, p2, p3))
+    circle = make_circle("ci_001", p1)
+    # Each entry: prerequisite objects, target object, expected forward edges.
+    table: dict[str, tuple[list[GeoObject], GeoObject, set[str]]] = {
+        "point": ([], make_point("pt_001", 0.0, 0.0), set()),
+        "line": (pts[:2], make_line("ln_001", p1, p2), {p1, p2}),
+        "polygon": (pts[:3], polygon, {p1, p2, p3}),
+        "ray": (pts[:1], make_ray("ry_001", p1), {p1}),
+        "vector": (pts[:2], make_vector("vc_001", p1, 10.0, p2), {p1, p2}),
+        "circle": (pts[:1], make_circle("ci_001", p1), {p1}),
+        "ball": (pts[:1], make_ball("ba_001", p1), {p1}),
+        "cylinder": (pts[:1], make_cylinder("cy_001", p1), {p1}),
+        "solid": ([*pts, polygon], make_solid("so_001", ("pg_001", p4)), {"pg_001", p4}),
+        "tangent": ([pts[0], pts[1], circle], make_tangent("tg_001", "ci_001", p2), {"ci_001", p2}),
+    }
+    prereqs, target, edges = table[kind]
+    return prereqs, target, frozenset(edges)
+
+
+_ALL_KINDS = (
+    "point",
+    "line",
+    "polygon",
+    "ray",
+    "vector",
+    "circle",
+    "ball",
+    "cylinder",
+    "solid",
+    "tangent",
+)
+
+
+@pytest.mark.parametrize("kind", _ALL_KINDS)
+def test_create_object_round_trip_all_types(kind: str):
+    # Round-trip CreateObjectCommand for every one of the ten object types:
+    # create installs the object and registers its exact dependency edges; undo
+    # removes it and unregisters those edges; redo restores both. The asserted
+    # edge set mirrors deps_for_type, so a type-specific edge-extraction bug
+    # surfaces here rather than silently in a later cascade.
+    prereqs, target, expected_edges = _create_round_trip_scene(kind)
+    objects: dict = {obj.id: obj for obj in prereqs}
+    graph = DependencyGraph()
+    for obj in prereqs:
+        graph.add(obj)
+    bus = EventBus()
+    history = CommandHistory(bus)
+
+    history.push(CreateObjectCommand(objects, graph, bus, target))
+    assert objects[target.id] is target
+    assert graph.is_registered(target.id)
+    # Forward edges: exactly the dependency set deps_for_type derives.
+    assert graph._test_only_dep_ids_of(target.id) == expected_edges  # pylint: disable=protected-access
+    # Reverse edges: the target is a dependent of each id it references.
+    for dep_id in expected_edges:
+        assert target.id in graph.dependents_of(dep_id)
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
+
+    history.undo()
+    assert target.id not in objects
+    assert not graph.is_registered(target.id)
+    for dep_id in expected_edges:
+        assert target.id not in graph.dependents_of(dep_id)
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
+
+    history.redo()
+    assert objects[target.id] is target
+    assert graph.is_registered(target.id)
+    assert graph._test_only_dep_ids_of(target.id) == expected_edges  # pylint: disable=protected-access
+    for dep_id in expected_edges:
+        assert target.id in graph.dependents_of(dep_id)
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
+
+
 # ---------------------------------------------------------------------------
 # CascadeDeleteCommand
 # ---------------------------------------------------------------------------
@@ -809,6 +901,14 @@ def test_move_point_recomputes_dependent_line_direction_and_elevation():
     history.undo()
     assert objects["ln_001"].direction == pytest.approx(before_dir)
     assert objects["ln_001"].elevation == pytest.approx(before_el)
+
+    # Redo must reinstate the recomputed DEPENDENT geometry, not just the moved
+    # point's coordinates: the line's direction/elevation return to the moved
+    # values, proving the after-snapshot carries the recomputed dependent.
+    history.redo()
+    assert objects["pt_002"].easting == 10.0
+    assert objects["ln_001"].direction == pytest.approx(math.pi / 4)
+    assert objects["ln_001"].elevation == pytest.approx(math.atan2(10.0, math.hypot(10.0, 10.0)))
 
 
 def test_move_point_recomputes_line_direction_in_angle_mode():
@@ -1110,6 +1210,61 @@ def test_move_point_fires_modified_for_point_and_dependents():
     assert counter.modified[0] == "pt_001"
 
 
+def test_move_point_fires_modified_in_deterministic_sorted_order():
+    # With several dependents, OBJECT_MODIFIED must fire point-first then the
+    # dependents in sorted id order on BOTH do and undo — a stable, reproducible
+    # fan-out independent of the graph's (unordered) reverse-edge set. The
+    # dependents are registered out of sorted order to prove the command sorts.
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0),  # shared origin/center
+        "pt_002": make_point("pt_002", 10.0, 0.0),
+        "ln_002": make_line("ln_002", "pt_001", "pt_002"),
+        "ci_001": make_circle("ci_001", "pt_001"),
+        "ln_001": make_line("ln_001", "pt_001", "pt_002"),
+    }
+    graph = DependencyGraph()
+    # Register in a deliberately non-sorted dependent order.
+    for obj in objects.values():
+        graph.add(obj)
+    bus = EventBus()
+    counter = _EventCounter()
+    counter.subscribe_all(bus)
+    history = CommandHistory(bus)
+
+    expected_order = ["pt_001", "ci_001", "ln_001", "ln_002"]  # point first, then sorted
+    history.push(MovePointCommand(objects, graph, bus, "pt_001", easting=1.0, northing=1.0))
+    assert counter.modified == expected_order
+
+    counter.modified.clear()
+    history.undo()
+    assert counter.modified == expected_order
+
+
+def test_move_point_dependent_typeerror_surfaces_runtime_error():
+    # A dependent whose recompute raises TypeError (structural inconsistency, not
+    # invalid geometry) must surface as the contextual RuntimeError naming the
+    # moved point and the offending dependent, chained from the TypeError —
+    # rather than letting a bare TypeError escape from __init__.
+    endpoint = make_point("pt_002", 10.0, 0.0)
+    # Corrupt the endpoint's easting to a non-numeric value: the line's recompute
+    # feeds it to ``azimuth`` -> ``np.arctan2``, which raises TypeError on a str.
+    object.__setattr__(endpoint, "easting", "not-a-number")
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0),
+        "pt_002": endpoint,
+        "ln_001": make_line("ln_001", "pt_001", "pt_002"),
+    }
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+
+    with pytest.raises(RuntimeError, match=r"structurally inconsistent") as excinfo:
+        MovePointCommand(objects, graph, EventBus(), "pt_001", easting=1.0, northing=1.0)
+    assert "pt_001" in str(excinfo.value)
+    assert "ln_001" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, TypeError)
+
+
 # ---------------------------------------------------------------------------
 # ModifyPolygonVerticesCommand
 # ---------------------------------------------------------------------------
@@ -1121,7 +1276,10 @@ def test_modify_polygon_vertices_round_trip_updates_graph_and_convexity():
         "pt_002": make_point("pt_002", 10.0, 0.0),
         "pt_003": make_point("pt_003", 10.0, 10.0),
         "pt_004": make_point("pt_004", 0.0, 10.0),
-        # Start as a degenerate-ish concave triangle subset flagged convex=False.
+        # Start as a valid right triangle on three of the square's corners,
+        # arranged with is_convex=False so the round-trip can assert the command
+        # recomputes it to True (every triangle is convex). The flag is a
+        # deliberately-wrong starting value, not a real concave/degenerate ring.
         "pg_001": make_polygon("pg_001", ("pt_001", "pt_002", "pt_003"), is_convex=False),
     }
     graph = DependencyGraph()
@@ -1320,8 +1478,9 @@ def test_cascade_delete_undo_rolls_back_partial_restore():
     # H2: ``undo`` re-inserts each snapshot object and calls ``graph.add``. If an
     # ``add`` raises mid-restore, the partial restore must be rolled back (the
     # just-re-inserted store entries removed, their edges unregistered) and the
-    # ORIGINAL exception must propagate, with ``_snapshot`` left intact so the
-    # command stays recoverable.
+    # ORIGINAL exception must propagate. Mirroring ``do``'s contract, ``_snapshot``
+    # is cleared on any restore failure so a later undo/redo never re-applies this
+    # failed restore against a now-inconsistent store.
     objects, _ = _point_line_polygon_scene()
     graph = DependencyGraph()
     for obj in objects.values():
@@ -1345,10 +1504,91 @@ def test_cascade_delete_undo_rolls_back_partial_restore():
         cmd.undo()
 
     # Partial restore was rolled back: none of the snapshot ids leaked into the
-    # store, and the snapshot is intact for a later retry.
+    # store, and the snapshot was cleared (do()'s contract) so a failed restore
+    # cannot be re-applied by a later undo/redo.
     for oid in snapshot_ids:
         assert oid not in objects
-    assert set(cmd._snapshot) == snapshot_ids  # pylint: disable=protected-access
+    assert not cmd._snapshot  # pylint: disable=protected-access
+
+
+def test_cascade_delete_undo_rollback_failure_chains_runtime_error():
+    # When undo's mid-restore ``add`` raises AND a rollback step's ``unregister``
+    # of an already-restored object ALSO raises, undo must surface a contextual
+    # RuntimeError whose ``__cause__`` is the ORIGINAL mid-restore exception. The
+    # message names "rollback" and the root id.
+    objects, _ = _point_line_polygon_scene()
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+    bus = EventBus()
+
+    cmd = CascadeDeleteCommand(objects, graph, bus, "pt_001")
+    cmd.do()  # removes pt_001, ln_001, pg_001 cleanly
+    snapshot_order = list(cmd._snapshot)  # pylint: disable=protected-access
+    # The first snapshot object restores cleanly; the second's re-add raises
+    # (the primary mid-restore fault), then the rollback's unregister of the
+    # first (already-restored) object ALSO raises.
+    first_restored, second_added = snapshot_order[0], snapshot_order[1]
+    graph_fault = _FaultInjectGraph(unregister_fail_id=first_restored, add_fail_id=second_added)
+    # Mirror the real graph's surviving state into the fault graph.
+    for obj in objects.values():
+        graph_fault.add(obj)
+    cmd._graph = graph_fault  # pylint: disable=protected-access
+
+    with pytest.raises(RuntimeError, match="rollback") as excinfo:
+        cmd.undo()
+    # The contextual RuntimeError names the root and chains the original fault.
+    assert "pt_001" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    assert "induced add failure" in str(excinfo.value.__cause__)
+
+
+# ---------------------------------------------------------------------------
+# Multi-hop transitive cascade-delete closure
+# ---------------------------------------------------------------------------
+
+
+def test_cascade_delete_multi_hop_transitive_closure_round_trip():
+    # Deleting a point cascades through a 2+ hop chain:
+    #   pt_001 -> pg_001 (polygon vertex) -> so_001 (solid layer on the polygon).
+    # The full transitive closure {pg_001, so_001} plus the root must be deleted
+    # on do and fully restored (with edges re-registered) on undo.
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0),
+        "pt_002": make_point("pt_002", 10.0, 0.0),
+        "pt_003": make_point("pt_003", 0.0, 10.0),
+        "pt_004": make_point("pt_004", 3.0, 3.0, 10.0),  # solid apex
+        "pg_001": make_polygon("pg_001", ("pt_001", "pt_002", "pt_003")),
+        "so_001": make_solid("so_001", ("pg_001", "pt_004")),
+    }
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+    bus = EventBus()
+    counter = _EventCounter()
+    counter.subscribe_all(bus)
+    history = CommandHistory(bus)
+
+    # pt_001 -> pg_001 -> so_001 is a two-hop chain through the graph.
+    assert graph.dependents_of("pt_001") == {"pg_001", "so_001"}
+
+    history.push(CascadeDeleteCommand(objects, graph, bus, "pt_001"))
+    # The whole transitive closure (root + both hops) is removed.
+    for oid in ("pt_001", "pg_001", "so_001"):
+        assert oid not in objects
+        assert not graph.is_registered(oid)
+    # Unrelated points and the apex (a solid dep, not a pt_001 dependent) survive.
+    for oid in ("pt_002", "pt_003", "pt_004"):
+        assert oid in objects
+    assert len(counter.deleted) == 1
+    assert set(counter.deleted[0]) == {"pt_001", "pg_001", "so_001"}
+
+    history.undo()
+    assert set(objects) == {"pt_001", "pt_002", "pt_003", "pt_004", "pg_001", "so_001"}
+    # Edges re-registered: the two-hop closure resolves again.
+    assert graph.dependents_of("pt_001") == {"pg_001", "so_001"}
+    assert graph.dependents_of("pg_001") == {"so_001"}
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
 
 # ---------------------------------------------------------------------------
@@ -1364,6 +1604,124 @@ def test_modify_object_rejects_unknown_field():
         ModifyObjectCommand(objects, graph, EventBus(), "pt_001", {"colour": "#ff0000"})
     # Construction raised before any mutation: the store is unchanged.
     assert objects["pt_001"].color == "#abcdef"
+
+
+def test_reference_fields_set_matches_expected():
+    # Pin the exported set so a drift between REFERENCE_FIELDS and
+    # deps_for_type's reference fields is caught here. The set is the union of
+    # every inter-object reference field the dependency graph consumes. Written
+    # as a whitespace-split string to avoid duplicating commands.py's frozenset
+    # block (which would otherwise trip pylint's duplicate-code check).
+    expected = (
+        "point_a_id point_b_id point_ids origin_id endpoint_id "
+        "center_id base_center_id shape_id point_id layers"
+    )
+    assert REFERENCE_FIELDS == frozenset(expected.split())
+
+
+def _line_scene_for_modify() -> tuple[dict, DependencyGraph]:
+    """Two points plus a line on them, all registered — for ModifyObject tests."""
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0),
+        "pt_002": make_point("pt_002", 10.0, 0.0),
+        "ln_001": make_line("ln_001", "pt_001", "pt_002"),
+    }
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+    return objects, graph
+
+
+def test_modify_object_rejects_identity_field_id():
+    objects, graph = _line_scene_for_modify()
+    with pytest.raises(ValueError, match="cannot change identity field"):
+        ModifyObjectCommand(objects, graph, EventBus(), "ln_001", {"id": "ln_999"})
+    assert objects["ln_001"].id == "ln_001"
+
+
+def test_modify_object_rejects_identity_field_type():
+    objects, graph = _line_scene_for_modify()
+    with pytest.raises(ValueError, match="cannot change identity field"):
+        ModifyObjectCommand(objects, graph, EventBus(), "ln_001", {"type": "ray"})
+    assert objects["ln_001"].type == "line"
+
+
+@pytest.mark.parametrize(
+    ("obj_id", "changes"),
+    [
+        ("ln_001", {"point_a_id": "pt_002"}),
+        ("pg_001", {"point_ids": ("pt_001", "pt_002", "pt_003")}),
+        ("ci_001", {"center_id": "pt_002"}),
+    ],
+)
+def test_modify_object_rejects_reference_field(obj_id: str, changes: dict):
+    # Mutating a reference field would change which objects this one depends on,
+    # but ModifyObjectCommand never touches the graph, so it rejects the edit.
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0),
+        "pt_002": make_point("pt_002", 10.0, 0.0),
+        "pt_003": make_point("pt_003", 0.0, 10.0),
+        "ln_001": make_line("ln_001", "pt_001", "pt_002"),
+        "pg_001": make_polygon("pg_001", ("pt_001", "pt_002", "pt_003")),
+        "ci_001": make_circle("ci_001", "pt_001"),
+    }
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+    with pytest.raises(ValueError, match="cannot change reference field"):
+        ModifyObjectCommand(objects, graph, EventBus(), obj_id, changes)
+
+
+@pytest.mark.parametrize("bad_alpha", [-0.1, 1.5, True, float("nan")])
+def test_modify_object_rejects_bad_alpha(bad_alpha: object):
+    # alpha must be a real number in [0, 1]: a bool, a NaN, or an out-of-range
+    # value is rejected before the deep-copy setattr can install it.
+    objects = {"pt_001": make_point("pt_001", 0.0, 0.0)}
+    graph = DependencyGraph()
+    graph.add(objects["pt_001"])
+    with pytest.raises(ValueError, match="alpha must be"):
+        ModifyObjectCommand(objects, graph, EventBus(), "pt_001", {"alpha": bad_alpha})
+    assert objects["pt_001"].alpha == 1.0
+
+
+def test_modify_object_rejects_non_bool_visibility():
+    objects = {"pt_001": make_point("pt_001", 0.0, 0.0)}
+    graph = DependencyGraph()
+    graph.add(objects["pt_001"])
+    with pytest.raises(ValueError, match="visibility must be a bool"):
+        ModifyObjectCommand(objects, graph, EventBus(), "pt_001", {"visibility": "yes"})
+    assert objects["pt_001"].visibility is True
+
+
+def test_modify_object_valid_envelope_change_leaves_graph_untouched():
+    # A valid envelope edit (name + alpha + visibility) round-trips do/undo and
+    # never mutates the dependency graph — the line's edges are invariant.
+    objects, graph = _line_scene_for_modify()
+    before_edges = graph._test_only_dep_ids_of("ln_001")  # pylint: disable=protected-access
+    before_deps_a = graph.dependents_of("pt_001")
+    bus = EventBus()
+    history = CommandHistory(bus)
+
+    history.push(
+        ModifyObjectCommand(
+            objects,
+            graph,
+            bus,
+            "ln_001",
+            {"name": "renamed", "alpha": 0.5, "visibility": False},
+        )
+    )
+    edited = objects["ln_001"]
+    assert (edited.name, edited.alpha, edited.visibility) == ("renamed", 0.5, False)
+    # Graph edges unchanged by the envelope edit.
+    assert graph._test_only_dep_ids_of("ln_001") == before_edges  # pylint: disable=protected-access
+    assert graph.dependents_of("pt_001") == before_deps_a
+
+    history.undo()
+    restored = objects["ln_001"]
+    assert (restored.name, restored.alpha, restored.visibility) == ("ln_001", 1.0, True)
+    assert graph._test_only_dep_ids_of("ln_001") == before_edges  # pylint: disable=protected-access
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
 
 
 # ---------------------------------------------------------------------------
