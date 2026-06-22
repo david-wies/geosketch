@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Communication style
+
+**Use caveman mode by default** for all conversational responses (the `caveman` plugin, `full` level). Drop articles, filler, pleasantries, and hedging; fragments are fine; keep all technical substance and exact terms. **Exceptions — write normal prose for:** code, commit messages, PR/issue bodies and comments, security warnings, and irreversible-action confirmations. The user can override per-session with "stop caveman" / "normal mode" or change level with `/caveman lite|full|ultra`.
+
 ## Keeping this file current
 
 This document describes a moving target. The repo will grow source code, a package manifest, a test suite, and a git remote over time. **When you make a change that invalidates anything here, update this file in the same turn** — do not leave future Claude instances reading stale guidance. In particular, revise the sections below as soon as the relevant condition flips:
