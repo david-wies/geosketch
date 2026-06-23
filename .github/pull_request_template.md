@@ -9,8 +9,8 @@
 
 ## Test plan
 
-- [ ] Ran `ruff check .` — no new lint errors
-- [ ] Ran `pytest` — all tests pass
+- [ ] Ran `./scripts/check.sh` — all four CI checks (ruff check, ruff format, pylint, pytest) pass locally
+- [ ] `git add`-ed any new files before running the gate (pylint/CI only sees tracked files)
 - [ ] Manually verified the feature / fix on the canvas
 
 ## Checklist

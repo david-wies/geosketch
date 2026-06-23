@@ -8,24 +8,36 @@ on:
   schedule:
     - cron: "0 3 * * 1"  # every Monday at 03:00 UTC
 
+# Cancel superseded analyses on the same ref; CodeQL runs are expensive.
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+# Backstop: deny all by default at the workflow level; each job re-grants only
+# what it needs. Guards any future job added to this file.
+permissions: {}
+
 jobs:
   analyze:
     name: Analyze (python)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       security-events: write
       actions: read
       contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@dd903d2e4f5405488e5ef1422510ee31c8b32357  # v3.36.2
         with:
           languages: python
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@dd903d2e4f5405488e5ef1422510ee31c8b32357  # v3.36.2
         with:
           category: "/language:python"

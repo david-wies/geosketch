@@ -114,7 +114,7 @@ The project has a Python 3.14 virtualenv at `.venv/` (gitignored). Dependencies 
 source .venv/bin/activate          # or: .venv/bin/python <cmd>
 ```
 
-- **`./scripts/check.sh` — run the full CI gate locally. Run this before every commit/push.** It mirrors the `lint-and-test` job in `.github/workflows/ci.yml` step-for-step and in order. Keep the script and `ci.yml` in lockstep — if one changes, change the other.
+- **`./scripts/check.sh` — run the full CI gate locally. Run this before every commit/push.** It mirrors the `lint-and-test` job in `.github/workflows/ci.yml` step-for-step and in order. The same four checks are mirrored **a third time** in `.github/workflows/release.yml` (run before building a release artifact). Keep all three in lockstep — `check.sh`, `ci.yml`, and `release.yml` — if one changes, change the others. **One deliberate divergence:** the `release.yml` copy is stricter on `pytest` exit code 5 (no tests collected) — it *fails* the release rather than passing, so a wheel never ships unverified. `check.sh`/`ci.yml` treat exit 5 as success.
 - `python3 -m venv .venv && .venv/bin/python -m pip install -r requirements-dev.txt` — recreate the venv from scratch (e.g. on a fresh clone). Use the **venv's own pip** (`.venv/bin/python -m pip`), not the system pip — system pip on Debian redirects `--prefix` installs to a `local/` subdirectory and skips entry-point script creation.
 - `.venv/bin/python spec/design/_generate_drawio.py` — regenerate `spec/design/geometry-app-ui-ux.drawio` from the Python source. Run this whenever you change the generator; never hand-edit the drawio XML.
 
@@ -124,6 +124,8 @@ CI runs **four** checks, all of which must pass (any one failing fails the build
 2. `.venv/bin/ruff format --check .` — formatting is verified, not applied. Run `.venv/bin/ruff format .` first to apply it.
 3. `.venv/bin/pylint $(git ls-files '*.py')` — runs over **every tracked `.py` file** with no `--fail-under`, so *any* message (including refactor/convention messages like `duplicate-code` across test files) fails CI. Lint config lives under `[tool.pylint.*]` in `pyproject.toml`.
 4. `.venv/bin/pytest` — run tests.
+
+**GitHub Actions conventions.** Third-party actions are **pinned to a full commit SHA** with a trailing `# vX.Y.Z` comment (e.g. `actions/checkout@34e1148…  # v4.3.1`) — never a floating tag. Match this when adding or bumping an action. `.github/dependabot.yml` runs weekly `pip` and `github-actions` update groups; the latter keeps these SHA pins current (so review/merge those PRs rather than hand-bumping). Dependabot PRs carry the `dependencies` label. Other workflows beyond `ci.yml`: `codeql.yml` (weekly CodeQL scan), `dependency-review.yml` (PR license/vuln gate, denies GPL/AGPL/LGPL), `release.yml` (tag-triggered build + GitHub Release).
 
 The target stack:
 
