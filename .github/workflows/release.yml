@@ -8,9 +8,16 @@ on:
 permissions:
   contents: write
 
+# Serialize releases: never cancel an in-flight publish (cancelling mid
+# `gh release create` is worse than queueing the next tag).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
@@ -23,7 +30,9 @@ jobs:
           cache: "pip"
 
       # Gate: never publish an artifact that fails the CI checks. Mirrors the
-      # lint-and-test job so a bad tag cannot ship a broken release.
+      # lint-and-test job, but the release gate is intentionally STRICTER than
+      # ci.yml/check.sh on one point: a tree that collects zero tests (exit 5)
+      # blocks the release instead of passing, so a wheel never ships unverified.
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
 
@@ -36,8 +45,11 @@ jobs:
       - name: Lint (pylint)
         run: pylint $(git ls-files '*.py')
 
-      - name: Test (pytest)
-        run: pytest --tb=short || { code=$?; [ $code -eq 5 ] && echo "No tests collected." || exit $code; }
+      - name: Test (pytest — release-strict, fails on no tests collected)
+        run: |
+          pytest --tb=short || { code=$?; if [ "$code" -eq 5 ]; then
+            echo "::error::Release blocked: pytest collected no tests."; exit 1;
+          else exit "$code"; fi; }
 
       - name: Install build tool
         run: pip install build
@@ -47,9 +59,16 @@ jobs:
 
       - name: Smoke-test built wheel
         run: |
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly 1 wheel in dist/, found ${#wheels[@]}."; exit 1
+          fi
           python -m venv /tmp/smoke
-          /tmp/smoke/bin/pip install dist/*.whl
-          /tmp/smoke/bin/python -c "import geometry; print('import geometry OK')"
+          /tmp/smoke/bin/pip install "${wheels[0]}"
+          # Import subpackages (not just the top-level __init__) so a packaging
+          # bug that drops geometry.models / geometry.services is caught here.
+          /tmp/smoke/bin/python -c "import geometry, geometry.models, geometry.services; print('import geometry subpackages OK')"
 
       - name: Create GitHub Release
         env:

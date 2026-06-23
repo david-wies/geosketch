@@ -10,6 +10,21 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - "dependencies"
+    # Bundle bumps into one PR per group so the PR limit isn't eaten by
+    # individual version bumps.
+    groups:
+      python-runtime:
+        patterns:
+          - "numpy"
+          - "matplotlib"
+          - "shapely"
+          - "scipy"
+      python-dev:
+        patterns:
+          - "ruff"
+          - "pylint"
+          - "pytest"
+          - "flake8"
 
   # GitHub Actions — keeps the SHA-pinned action refs current.
   - package-ecosystem: "github-actions"
@@ -21,3 +36,7 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - "dependencies"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
