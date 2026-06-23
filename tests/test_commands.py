@@ -469,6 +469,33 @@ def test_clear_empties_both_stacks_and_fires():
     assert recorder.events == [(False, False)]
 
 
+def test_close_unsubscribes_from_project_loaded():
+    # CommandHistory subscribes to PROJECT_LOADED in __init__, and the bus holds
+    # subscribers by strong reference. close() must unsubscribe that handler so a
+    # later PROJECT_LOADED no longer reaches (and clears) the closed history.
+    bus = EventBus()
+    history = CommandHistory(bus)
+    log: list[str] = []
+    history.push(_NoOpCommand("a", log))
+    assert history.can_undo
+
+    history.close()
+    # After close the history detaches from the bus: firing PROJECT_LOADED must
+    # not invoke the (now-unsubscribed) handler. close() itself cleared the
+    # stacks, so push a fresh command to prove the firing is a true no-op.
+    history.push(_NoOpCommand("b", log))
+    bus.fire(PROJECT_LOADED)
+    assert history.can_undo  # not cleared — the handler is gone
+
+
+def test_close_is_idempotent():
+    bus = EventBus()
+    history = CommandHistory(bus)
+    history.close()
+    history.close()  # second call is a no-op (handler already absent)
+    assert not history.can_undo
+
+
 def test_project_loaded_clears_history():
     bus = EventBus()
     history = CommandHistory(bus)
@@ -478,6 +505,26 @@ def test_project_loaded_clears_history():
     bus.fire(PROJECT_LOADED)
     assert not history.can_undo
     assert not history.can_redo
+
+
+def test_push_does_not_enter_history_when_do_raises():
+    # push() calls cmd.do() first, so a command that raises mid-apply must never
+    # be recorded: the buffers stay consistent with the (unchanged) store. After
+    # a failed push the history must be exactly as empty as before — not undoable.
+    bus = EventBus()
+    recorder = _HistoryRecorder()
+    bus.subscribe(HISTORY_CHANGED, recorder)
+    history = CommandHistory(bus)
+    cmd = _RaisingCommand()
+    cmd.raise_on_do = True
+
+    with pytest.raises(RuntimeError, match="do failed on purpose"):
+        history.push(cmd)
+    # The failed command never entered the undo buffer and no HISTORY_CHANGED
+    # fired for the aborted push.
+    assert not history.can_undo
+    assert not history.can_redo
+    assert not recorder.events
 
 
 def test_redo_keeps_command_when_do_raises():
@@ -868,6 +915,52 @@ def test_move_point_without_altitude_preserves_altitude():
     assert objects["pt_001"].altitude == 9.0
 
 
+@pytest.mark.parametrize(
+    ("axis", "kwargs"),
+    [
+        ("easting", {"easting": float("nan"), "northing": 1.0}),
+        ("northing", {"easting": 1.0, "northing": float("inf")}),
+        ("altitude", {"easting": 1.0, "northing": 1.0, "altitude": float("nan")}),
+    ],
+)
+def test_move_point_rejects_non_finite_coordinate(axis: str, kwargs: dict):
+    # do() installs the moved point via deep copy + attribute writes, which
+    # bypasses Point.__post_init__'s finiteness check, so a NaN/inf coordinate
+    # would silently install a corrupt Point. __init__ must reject it up front
+    # (before any snapshot/mutation), naming the axis and the point id.
+    objects = {"pt_001": make_point("pt_001", 0.0, 0.0)}
+    graph = DependencyGraph()
+    graph.add(objects["pt_001"])
+    with pytest.raises(ValueError, match=rf"{axis} must be finite.*pt_001"):
+        MovePointCommand(objects, graph, EventBus(), "pt_001", **kwargs)
+    # Construction raised before any mutation: the point is unmoved.
+    assert (objects["pt_001"].easting, objects["pt_001"].northing) == (0.0, 0.0)
+
+
+def test_move_point_rejects_non_point_target():
+    # The models are unslotted dataclasses, so a wrong-type target would let the
+    # coordinate writes graft stray easting/northing onto a non-Point. __init__
+    # must reject it with a clear TypeError naming the id and expected type.
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0),
+        "ln_001": make_line("ln_001", "pt_001", "pt_001"),
+    }
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+    with pytest.raises(TypeError, match=r"ln_001.*not a Point"):
+        MovePointCommand(objects, graph, EventBus(), "ln_001", easting=1.0, northing=1.0)
+
+
+def test_move_point_missing_id_raises_contextual_key_error():
+    # A missing point id must raise a KeyError whose message names the command
+    # and the missing id (via the shared _require helper), not a bare KeyError
+    # carrying only the key.
+    graph = DependencyGraph()
+    with pytest.raises(KeyError, match=r"MovePointCommand.*pt_404"):
+        MovePointCommand({}, graph, EventBus(), "pt_404", easting=1.0, northing=1.0)
+
+
 def test_move_point_recomputes_dependent_line_direction_and_elevation():
     # Line pt_001 -> pt_002 starts pointing due East (azimuth π/2), flat.
     objects = {
@@ -950,6 +1043,33 @@ def test_move_point_recomputes_endpoint_vector_length():
     assert objects["vc_001"].length == pytest.approx(5.0)
 
 
+def test_move_point_recomputes_endpoint_vector_direction_in_angle_mode():
+    # _directed_value's DirectionMode.ANGLE branch (azimuth_to_angle) was only
+    # covered for Line. Exercise it for an Origin+Endpoint Vector: move the
+    # endpoint due East of the origin so the azimuth is π/2; under ANGLE mode the
+    # stored direction is azimuth_to_angle(π/2) == π/2 - π/2 == 0.0 (East is
+    # math-angle 0). Pin the exact converted value.
+    origin = make_point("pt_001", 0.0, 0.0, 0.0)
+    endpoint = make_point("pt_002", 0.0, 5.0, 0.0)  # starts due North
+    vec = Vector(
+        **_env("vc_001"),
+        **_bearing(mode=DirectionMode.ANGLE),
+        origin_id="pt_001",
+        length=5.0,
+        endpoint_id="pt_002",
+        **_colors(),
+    )
+    objects = {"pt_001": origin, "pt_002": endpoint, "vc_001": vec}
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+
+    # Move the endpoint due East of the origin: azimuth π/2 -> math angle 0.0.
+    cmd = MovePointCommand(objects, graph, EventBus(), "pt_002", easting=10.0, northing=0.0)
+    cmd.do()
+    assert objects["vc_001"].direction == pytest.approx(0.0)
+
+
 def test_move_point_does_not_recompute_length_direction_vector():
     # A Length+Direction vector (endpoint_id None) translates with its origin;
     # nothing point-derived is stored, so length stays put.
@@ -980,15 +1100,51 @@ def test_move_point_recomputes_tangent_direction():
     history = CommandHistory(bus)
     before_dir = objects["tg_001"].direction
 
-    # Move the surface point due North; the tangent azimuth rotates by 90°.
+    # Move the surface point due North; the radius (center -> point) now points
+    # due North (azimuth 0), so the tangent azimuth is 0 + π/2 == π/2. Under
+    # AZIMUTH mode the value is stored directly. Pin the exact expected azimuth
+    # rather than asserting only that it changed.
     history.push(MovePointCommand(objects, graph, bus, "pt_002", easting=0.0, northing=5.0))
     after_dir = objects["tg_001"].direction
     assert after_dir != before_dir
+    assert after_dir == pytest.approx(math.pi / 2)
     # Circle tangents stay horizontal.
     assert objects["tg_001"].elevation == 0.0
 
     history.undo()
     assert objects["tg_001"].direction == pytest.approx(before_dir)
+
+
+def test_move_point_recomputes_tangent_direction_in_angle_mode():
+    # _directed_value's DirectionMode.ANGLE branch (azimuth_to_angle) was only
+    # covered for Line. Exercise it for a Tangent: with the circle centred at the
+    # origin and the surface point moved due East, the radius azimuth is π/2 so
+    # the tangent azimuth is π/2 + π/2 == π; under ANGLE mode the stored direction
+    # is azimuth_to_angle(π) == π/2 - π == -π/2 -> 3π/2 after normalisation. Pin
+    # the exact converted value.
+    tangent = Tangent(
+        **_env("tg_001"),
+        **_bearing(mode=DirectionMode.ANGLE),
+        shape_id="ci_001",
+        shape_type="circle",
+        point_id="pt_002",
+        **_colors(),
+    )
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0),  # circle center
+        "pt_002": make_point("pt_002", 0.0, 5.0),  # surface point, starts due North
+        "ci_001": make_circle("ci_001", "pt_001"),
+        "tg_001": tangent,
+    }
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+
+    # Move the surface point due East of the center: radius azimuth π/2, tangent
+    # azimuth π, math angle 3π/2.
+    cmd = MovePointCommand(objects, graph, EventBus(), "pt_002", easting=5.0, northing=0.0)
+    cmd.do()
+    assert objects["tg_001"].direction == pytest.approx(3.0 * math.pi / 2.0)
 
 
 def test_move_circle_center_recomputes_tangent_direction_transitively():
@@ -1268,6 +1424,41 @@ def test_move_point_dependent_typeerror_surfaces_runtime_error():
 # ---------------------------------------------------------------------------
 # ModifyPolygonVerticesCommand
 # ---------------------------------------------------------------------------
+
+
+def test_modify_polygon_vertices_rejects_non_polygon_target():
+    # A wrong-type target would let the point_ids/is_convex writes graft stray
+    # attributes onto a non-Polygon (unslotted dataclass). __init__ must reject
+    # it with a clear TypeError naming the id and expected type.
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0),
+        "ln_001": make_line("ln_001", "pt_001", "pt_001"),
+    }
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+    with pytest.raises(TypeError, match=r"ln_001.*not a Polygon"):
+        ModifyPolygonVerticesCommand(objects, graph, EventBus(), "ln_001", ("pt_001",))
+
+
+def test_modify_polygon_vertices_missing_id_raises_contextual_key_error():
+    graph = DependencyGraph()
+    with pytest.raises(KeyError, match=r"ModifyPolygonVerticesCommand.*pg_404"):
+        ModifyPolygonVerticesCommand(
+            {}, graph, EventBus(), "pg_404", ("pt_001", "pt_002", "pt_003")
+        )
+
+
+def test_cascade_delete_missing_root_raises_contextual_key_error():
+    graph = DependencyGraph()
+    with pytest.raises(KeyError, match=r"CascadeDeleteCommand.*pt_404"):
+        CascadeDeleteCommand({}, graph, EventBus(), "pt_404")
+
+
+def test_modify_object_missing_id_raises_contextual_key_error():
+    graph = DependencyGraph()
+    with pytest.raises(KeyError, match=r"ModifyObjectCommand.*pt_404"):
+        ModifyObjectCommand({}, graph, EventBus(), "pt_404", {"name": "x"})
 
 
 def test_modify_polygon_vertices_round_trip_updates_graph_and_convexity():

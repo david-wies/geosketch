@@ -73,6 +73,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import logging
+import math
 from collections import deque
 from collections.abc import Sequence
 from typing import Any, Protocol, runtime_checkable
@@ -80,6 +81,7 @@ from typing import Any, Protocol, runtime_checkable
 from geometry.models import GeoObject
 from geometry.models.common import DirectionMode
 from geometry.models.line import Line
+from geometry.models.point import Point
 from geometry.models.polygon import Polygon
 from geometry.models.tangent import Tangent
 from geometry.models.vector import Vector
@@ -115,6 +117,75 @@ __all__ = [
 ]
 
 _logger = logging.getLogger(__name__)
+
+
+def _require(objects: dict[str, GeoObject], obj_id: str, cmd_name: str) -> GeoObject:
+    """Return ``objects[obj_id]`` or raise a contextual :class:`KeyError`.
+
+    The command constructors look up their target object by ID before
+    snapshotting it. A plain ``objects[obj_id]`` lookup raises a bare
+    :class:`KeyError` carrying only the missing key, which gives no hint about
+    *which* command failed or *why* the id matters. This helper centralises the
+    lookup so every missing-id precondition fails with the command name and the
+    missing id named in the message, while preserving the :class:`KeyError`
+    type that callers already expect from a dict miss.
+
+    Parameters
+    ----------
+    objects : dict[str, GeoObject]
+        The object store to look the id up in.
+    obj_id : str
+        The id the command requires to be present.
+    cmd_name : str
+        Human-readable command name, used only to contextualise the error.
+
+    Returns
+    -------
+    GeoObject
+        The live object stored under ``obj_id``.
+
+    Raises
+    ------
+    KeyError
+        If ``obj_id`` is absent from ``objects``. The exception message names
+        ``cmd_name`` and ``obj_id``.
+    """
+    try:
+        return objects[obj_id]
+    except KeyError as exc:
+        raise KeyError(f"{cmd_name}: no object with id {obj_id!r} in the store") from exc
+
+
+def _require_finite_move(
+    point_id: str, easting: float, northing: float, altitude: float | None
+) -> None:
+    """Reject a non-finite requested coordinate for :class:`MovePointCommand`.
+
+    :meth:`MovePointCommand.do` installs the moved point via a deep copy plus
+    attribute writes, which bypasses ``Point.__post_init__`` and therefore its
+    finiteness check — so a NaN/inf easting/northing/altitude would silently
+    install a corrupt Point. This mirrors the model-level guard (and is
+    symmetric with :class:`ModifyObjectCommand`'s envelope guards), raising
+    before any snapshot or mutation. ``altitude`` of ``None`` means "leave the
+    existing altitude untouched" and is skipped.
+
+    Raises
+    ------
+    ValueError
+        If any supplied coordinate is not finite. The message names the
+        offending axis and the point id.
+    """
+    for axis_name, axis_value in (
+        ("easting", easting),
+        ("northing", northing),
+        ("altitude", altitude),
+    ):
+        if axis_value is not None and not math.isfinite(axis_value):
+            raise ValueError(
+                f"MovePointCommand: {axis_name} must be finite; got "
+                f"{axis_value!r} (point {point_id!r})"
+            )
+
 
 #: Maximum number of commands retained in the undo buffer. Older commands are
 #: silently dropped once this bound is exceeded (the ``deque`` ``maxlen``
@@ -209,6 +280,28 @@ class CommandHistory:
     bus. Event-agnostic tests can simply pass a fresh ``EventBus()`` with no
     subscribers, which makes every ``fire`` a no-op.
 
+    .. _history-retry-caveat:
+
+    Retry recoverability vs. event fan-out
+    --------------------------------------
+    Both :meth:`undo` and :meth:`redo` *peek* the top command and apply its
+    reversing/applying side **before** either stack is mutated, so if that call
+    raises (e.g. a bus handler throws — :meth:`EventBus.fire` propagates — or a
+    partial mutation fails) the command stays on its originating stack,
+    :data:`HISTORY_CHANGED` never fires for the aborted transition, and the
+    caller can retry.
+
+    Recoverability is scoped to the store/graph mutation, not the event fan-out.
+    Each command's own do/undo restores the object store and dependency graph to
+    a consistent state when its mutation phase fails, and leaving the command on
+    its stack lets the caller retry it. The **event fan-out phase is outside that
+    atomic region**: a command that notifies several subscribers (or whose
+    mutation succeeds but a later :meth:`EventBus.fire` raises) may already have
+    delivered events to some subscribers before the failure, and a retry re-fires
+    the whole set — so already-notified subscribers can receive the same event
+    twice. The store/graph stay consistent across a retry; subscriber-visible
+    event delivery is not guaranteed exactly-once.
+
     Fields
     ------
     _bus : EventBus
@@ -270,22 +363,11 @@ class CommandHistory:
         """Reverse the newest command and move it to the redo stack.
 
         The top command is *peeked* and :meth:`Command.undo` is applied before
-        either stack is mutated. If ``undo`` raises (e.g. a bus handler throws —
-        :meth:`EventBus.fire` propagates — or a partial mutation fails) the
-        command stays on the undo stack and :data:`HISTORY_CHANGED` never fires,
-        so the command remains on its originating stack and can be retried.
-
-        Recoverability is scoped to the store/graph mutation, not the event
-        fan-out. Each command's own do/undo restores the object store and
-        dependency graph to a consistent state when its mutation phase fails,
-        and leaving the command on the undo stack lets the caller retry it. The
-        **event fan-out phase is outside that atomic region**: a command that
-        notifies several subscribers (or whose mutation succeeds but a later
-        :meth:`EventBus.fire` raises) may already have delivered events to some
-        subscribers before the failure, and a retry re-fires the whole set —
-        so already-notified subscribers can receive the same event twice. The
-        store/graph stay consistent across a retry; subscriber-visible event
-        delivery is not guaranteed exactly-once.
+        either stack is mutated; a raising ``undo`` leaves the command on the
+        undo stack with no :data:`HISTORY_CHANGED`, so it can be retried. See
+        the class docstring's :ref:`retry recoverability caveat
+        <history-retry-caveat>` for the full store/graph-vs-event-fan-out
+        contract that governs that retry.
 
         Returns
         -------
@@ -306,22 +388,11 @@ class CommandHistory:
         """Re-apply the most recently undone command.
 
         The top command is *peeked* and :meth:`Command.do` is applied before
-        either stack is mutated. If ``do`` raises (e.g. a bus handler throws —
-        :meth:`EventBus.fire` propagates — or a partial mutation fails) the
-        command stays on the redo stack and :data:`HISTORY_CHANGED` never fires,
-        so the command remains on its originating stack and can be retried.
-
-        Recoverability is scoped to the store/graph mutation, not the event
-        fan-out. Each command's own do/undo restores the object store and
-        dependency graph to a consistent state when its mutation phase fails,
-        and leaving the command on the redo stack lets the caller retry it. The
-        **event fan-out phase is outside that atomic region**: a command that
-        notifies several subscribers (or whose mutation succeeds but a later
-        :meth:`EventBus.fire` raises) may already have delivered events to some
-        subscribers before the failure, and a retry re-fires the whole set —
-        so already-notified subscribers can receive the same event twice. The
-        store/graph stay consistent across a retry; subscriber-visible event
-        delivery is not guaranteed exactly-once.
+        either stack is mutated; a raising ``do`` leaves the command on the redo
+        stack with no :data:`HISTORY_CHANGED`, so it can be retried. See the
+        class docstring's :ref:`retry recoverability caveat
+        <history-retry-caveat>` for the full store/graph-vs-event-fan-out
+        contract that governs that retry.
 
         Returns
         -------
@@ -347,6 +418,23 @@ class CommandHistory:
         self._undo.clear()
         self._redo.clear()
         self._fire_history_changed()
+
+    def close(self) -> None:
+        """Detach from the bus and drop all history, releasing the instance.
+
+        The constructor subscribes :meth:`_on_project_loaded` to
+        :data:`PROJECT_LOADED`, and :meth:`EventBus.subscribe` retains its
+        handlers by strong reference — so a ``CommandHistory`` that is simply
+        dropped would stay alive (and keep firing its handler) as long as the
+        bus does. Call ``close`` on teardown to unsubscribe that handler and
+        clear both stacks; afterwards the history no longer reacts to any event
+        and is safe to discard. ``close`` is idempotent: a second call merely
+        unsubscribes an already-absent handler (a no-op) and re-clears empty
+        stacks.
+        """
+        self._bus.unsubscribe(PROJECT_LOADED, self._on_project_loaded)
+        self._undo.clear()
+        self._redo.clear()
 
 
 class CreateObjectCommand:
@@ -504,7 +592,7 @@ class CascadeDeleteCommand:
         self._graph = graph
         self._bus = bus
         self._root_id = root_id
-        root = objects[root_id]
+        root = _require(objects, root_id, "CascadeDeleteCommand")
         self.description = f"Delete {root.type} '{root.name}'"
         self._snapshot: dict[str, GeoObject] = {}
 
@@ -526,52 +614,74 @@ class CascadeDeleteCommand:
                 del self._objects[oid]
                 store_removed.append(obj)  # record before the graph call can raise
                 self._graph.unregister(oid)
-        except Exception:  # pylint: disable=broad-exception-caught
-            # Roll back so a failure on the k-th object never leaves the store
-            # and graph half-deleted and disagreeing. Restore the store from the
-            # objects removed so far, then re-register EVERY snapshot object's
-            # edges: unregistering one object collaterally prunes the forward
-            # back-edges of *other* objects that referenced it, so re-adding only
-            # the fully-removed ones would leave those siblings missing edges.
-            # ``add`` replaces (it does not accumulate), so re-adding an object
-            # that is still registered is a safe no-op that reinstates its edges.
-            #
-            # The rollback itself is fault-tolerant: each restore step is guarded
-            # so a step that raises is logged and skipped rather than aborting the
-            # remaining steps or masking the ORIGINAL exception. The bare ``raise``
-            # at the end re-raises that original exception; ``_snapshot`` is always
-            # cleared first, so even a partially-failed rollback cannot leave a
-            # later ``undo`` re-applying this failed delete.
-            _logger.error(
-                "CascadeDeleteCommand.do: failed mid-cascade for root %r after "
-                "removing %d store entr(ies); rolling back",
-                self._root_id,
-                len(store_removed),
-                exc_info=True,
-            )
-            for obj in store_removed:
-                try:
-                    self._objects[obj.id] = obj
-                except Exception:  # noqa: BLE001  pylint: disable=broad-exception-caught
-                    _logger.error(
-                        "CascadeDeleteCommand.do: rollback failed to restore store "
-                        "entry %r; continuing",
-                        obj.id,
-                        exc_info=True,
-                    )
-            for obj in self._snapshot.values():
-                try:
-                    self._graph.add(obj)
-                except Exception:  # noqa: BLE001  pylint: disable=broad-exception-caught
-                    _logger.error(
-                        "CascadeDeleteCommand.do: rollback failed to re-register "
-                        "edges for %r; continuing",
-                        obj.id,
-                        exc_info=True,
-                    )
-            self._snapshot = {}
-            raise
+        except Exception as original_exc:  # pylint: disable=broad-exception-caught
+            self._rollback_failed_do(store_removed, original_exc)
         self._bus.fire(OBJECT_DELETED, obj_ids=list(self._snapshot))
+
+    def _rollback_failed_do(
+        self, store_removed: list[GeoObject], original_exc: BaseException
+    ) -> None:
+        """Undo a partially-applied :meth:`do` cascade, then re-raise.
+
+        Restore the store from the objects removed so far, then re-register
+        EVERY snapshot object's edges: unregistering one object collaterally
+        prunes the forward back-edges of *other* objects that referenced it, so
+        re-adding only the fully-removed ones would leave those siblings missing
+        edges. ``add`` replaces (it does not accumulate), so re-adding an object
+        that is still registered is a safe no-op that reinstates its edges.
+
+        The rollback is fault-tolerant: every restore step is still attempted
+        even when one fails. But — mirroring :meth:`undo` — a rollback step that
+        itself raises is NOT silently swallowed: its exception is collected and,
+        after the remaining steps run, surfaced as a distinct
+        :class:`RuntimeError` chained to ``original_exc``, so a partially-failed
+        rollback cannot leave the store and graph silently disagreeing. When
+        every rollback step succeeds ``original_exc`` is re-raised unchanged.
+        ``_snapshot`` is always cleared first, so even a partially-failed
+        rollback cannot leave a later :meth:`undo` re-applying this failed
+        delete.
+        """
+        _logger.error(
+            "CascadeDeleteCommand.do: failed mid-cascade for root %r after "
+            "removing %d store entr(ies); rolling back",
+            self._root_id,
+            len(store_removed),
+            exc_info=True,
+        )
+        failures: list[tuple[str, BaseException]] = []
+        for obj in store_removed:
+            try:
+                self._objects[obj.id] = obj
+            except Exception as rollback_exc:  # noqa: BLE001  pylint: disable=broad-exception-caught
+                _logger.error(
+                    "CascadeDeleteCommand.do: rollback failed to restore store "
+                    "entry %r; continuing",
+                    obj.id,
+                    exc_info=True,
+                )
+                failures.append((obj.id, rollback_exc))
+        for obj in self._snapshot.values():
+            try:
+                self._graph.add(obj)
+            except Exception as rollback_exc:  # noqa: BLE001  pylint: disable=broad-exception-caught
+                _logger.error(
+                    "CascadeDeleteCommand.do: rollback failed to re-register "
+                    "edges for %r; continuing",
+                    obj.id,
+                    exc_info=True,
+                )
+                failures.append((obj.id, rollback_exc))
+        self._snapshot = {}
+        if failures:
+            failed_ids = [oid for oid, _ in failures]
+            raise RuntimeError(
+                f"CascadeDeleteCommand.do: rollback of a failed cascade for "
+                f"root {self._root_id!r} could not be completed; "
+                f"the original mid-cascade op raised {original_exc!r} and "
+                f"rollback of object(s) {failed_ids!r} also failed "
+                f"({failures[0][1]!r}); store and graph may disagree"
+            ) from original_exc
+        raise original_exc
 
     def undo(self) -> None:
         """Re-insert every removed object and re-register its edges.
@@ -710,7 +820,7 @@ class ModifyObjectCommand:
         self._objects = objects
         self._obj_id = obj_id
         self._bus = bus
-        before = copy.deepcopy(objects[obj_id])
+        before = copy.deepcopy(_require(objects, obj_id, "ModifyObjectCommand"))
         after = copy.deepcopy(before)
         # Validate every key against the model's declared fields before any
         # setattr, so a typo (e.g. ``"colour"``) raises rather than silently
@@ -850,7 +960,22 @@ class MovePointCommand:
     ) -> None:
         self._objects = objects
         self._bus = bus
-        point = objects[point_id]
+        point = _require(objects, point_id, "MovePointCommand")
+        # Assert the target is actually a Point before snapshotting. The models
+        # are unslotted dataclasses, so a wrong-type target would let the
+        # ``setattr``-style coordinate writes below silently graft ``easting``/
+        # ``northing``/``altitude`` onto an object that has no such fields,
+        # corrupting it instead of failing fast. Reject up front with the id and
+        # expected type named.
+        if not isinstance(point, Point):
+            raise TypeError(
+                f"MovePointCommand: object {point_id!r} is a {type(point).__name__}, "
+                f"not a Point; only Points can be moved"
+            )
+        # Reject a non-finite requested coordinate before snapshotting (see
+        # ``_require_finite_move``): the deep-copy + attribute-write install path
+        # in ``do`` bypasses ``Point.__post_init__``'s finiteness check.
+        _require_finite_move(point_id, easting, northing, altitude)
         self.description = f"Move {point.name}"
 
         # ``dependents_of`` returns a frozenset, so iterating it directly would
@@ -1102,7 +1227,18 @@ class ModifyPolygonVerticesCommand:
         self._graph = graph
         self._bus = bus
         self._polygon_id = polygon_id
-        before = copy.deepcopy(objects[polygon_id])
+        before = copy.deepcopy(_require(objects, polygon_id, "ModifyPolygonVerticesCommand"))
+        # Assert the target is actually a Polygon before re-vertexing. As with
+        # MovePointCommand, the models are unslotted dataclasses, so a wrong-type
+        # target would let the ``point_ids``/``is_convex`` writes below graft
+        # stray attributes onto an object that is not a polygon. Reject up front
+        # with the id and expected type named.
+        if not isinstance(before, Polygon):
+            raise TypeError(
+                f"ModifyPolygonVerticesCommand: object {polygon_id!r} is a "
+                f"{type(before).__name__}, not a Polygon; only Polygons can be "
+                f"re-vertexed"
+            )
         after = copy.deepcopy(before)
         after.point_ids = tuple(new_point_ids)
         # Mirror the polygon creation path: reject degeneracy, reorder CCW,
@@ -1177,26 +1313,42 @@ class BulkImportCommand:
             for cmd in self._commands:
                 cmd.do()
                 applied.append(cmd)
-        except Exception:  # pylint: disable=broad-exception-caught
+        except Exception as original_exc:  # pylint: disable=broad-exception-caught
             _logger.error(
                 "BulkImportCommand.do: failed after applying %d of %d creation(s); rolling back",
                 len(applied),
                 len(self._commands),
                 exc_info=True,
             )
-            # Fault-tolerant rollback: a wrapped ``undo`` that itself raises is
-            # logged and skipped so every remaining applied create is still
-            # reversed, and the ORIGINAL exception (re-raised by the bare
-            # ``raise``) is never masked by a rollback-step exception.
+            # Fault-tolerant rollback: every wrapped ``undo`` is still attempted
+            # even when one fails. Mirroring :class:`CascadeDeleteCommand`, a
+            # rollback ``undo`` that itself raises is NOT silently swallowed: its
+            # exception is collected and, after the remaining reversals run,
+            # surfaced as a distinct :class:`RuntimeError` chained to the
+            # ORIGINAL mid-batch exception, so a partially-failed rollback cannot
+            # leave a half-imported batch in the store unnoticed. When every
+            # rollback step succeeds the original exception is re-raised
+            # unchanged.
+            rollback_failures: list[tuple[str, BaseException]] = []
             for cmd in reversed(applied):
                 try:
                     cmd.undo()
-                except Exception:  # noqa: BLE001  pylint: disable=broad-exception-caught
+                except Exception as rollback_exc:  # noqa: BLE001  pylint: disable=broad-exception-caught
                     _logger.error(
                         "BulkImportCommand.do: rollback undo of %r failed; continuing",
                         cmd.description,
                         exc_info=True,
                     )
+                    rollback_failures.append((cmd.description, rollback_exc))
+            if rollback_failures:
+                failed = [desc for desc, _ in rollback_failures]
+                raise RuntimeError(
+                    f"BulkImportCommand.do: rollback of a failed import could not "
+                    f"be completed; the original mid-batch op raised "
+                    f"{original_exc!r} and rollback of {failed!r} also failed "
+                    f"({rollback_failures[0][1]!r}); the store may hold a partial "
+                    f"import"
+                ) from original_exc
             raise
 
     def undo(self) -> None:
@@ -1211,24 +1363,40 @@ class BulkImportCommand:
             for cmd in reversed(self._commands):
                 cmd.undo()
                 reversed_so_far.append(cmd)
-        except Exception:  # pylint: disable=broad-exception-caught
+        except Exception as original_exc:  # pylint: disable=broad-exception-caught
             _logger.error(
                 "BulkImportCommand.undo: failed after reversing %d of %d creation(s); restoring",
                 len(reversed_so_far),
                 len(self._commands),
                 exc_info=True,
             )
-            # Fault-tolerant restoration: a wrapped ``do`` that itself raises is
-            # logged and skipped so every already-reversed create is still
-            # restored, and the ORIGINAL exception (re-raised by the bare
-            # ``raise``) is never masked by a restoration-step exception.
+            # Fault-tolerant restoration: every wrapped ``do`` is still attempted
+            # even when one fails. Mirroring :class:`CascadeDeleteCommand`, a
+            # restoration ``do`` that itself raises is NOT silently swallowed:
+            # its exception is collected and, after the remaining restorations
+            # run, surfaced as a distinct :class:`RuntimeError` chained to the
+            # ORIGINAL mid-batch exception, so a partially-failed restoration
+            # cannot leave a partially-undone batch unnoticed. When every
+            # restoration step succeeds the original exception is re-raised
+            # unchanged.
+            rollback_failures: list[tuple[str, BaseException]] = []
             for cmd in reversed(reversed_so_far):
                 try:
                     cmd.do()
-                except Exception:  # noqa: BLE001  pylint: disable=broad-exception-caught
+                except Exception as rollback_exc:  # noqa: BLE001  pylint: disable=broad-exception-caught
                     _logger.error(
                         "BulkImportCommand.undo: restoration do of %r failed; continuing",
                         cmd.description,
                         exc_info=True,
                     )
+                    rollback_failures.append((cmd.description, rollback_exc))
+            if rollback_failures:
+                failed = [desc for desc, _ in rollback_failures]
+                raise RuntimeError(
+                    f"BulkImportCommand.undo: restoration of a failed reversal "
+                    f"could not be completed; the original mid-batch op raised "
+                    f"{original_exc!r} and restoration of {failed!r} also failed "
+                    f"({rollback_failures[0][1]!r}); the store may hold a "
+                    f"partially-undone batch"
+                ) from original_exc
             raise
