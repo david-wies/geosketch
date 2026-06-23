@@ -13,13 +13,31 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
 
       - name: Set up Python 3.14
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.14"
+          allow-prereleases: true
           cache: "pip"
+
+      # Gate: never publish an artifact that fails the CI checks. Mirrors the
+      # lint-and-test job so a bad tag cannot ship a broken release.
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint (ruff check)
+        run: ruff check .
+
+      - name: Format check (ruff format)
+        run: ruff format --check .
+
+      - name: Lint (pylint)
+        run: pylint $(git ls-files '*.py')
+
+      - name: Test (pytest)
+        run: pytest --tb=short || { code=$?; [ $code -eq 5 ] && echo "No tests collected." || exit $code; }
 
       - name: Install build tool
         run: pip install build
@@ -27,10 +45,17 @@ jobs:
       - name: Build wheel and sdist
         run: python -m build
 
+      - name: Smoke-test built wheel
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install dist/*.whl
+          /tmp/smoke/bin/python -c "import geometry; print('import geometry OK')"
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
         run: |
-          gh release create "${{ github.ref_name }}" dist/* \
-            --title "${{ github.ref_name }}" \
+          gh release create "$TAG" dist/* \
+            --title "$TAG" \
             --generate-notes
