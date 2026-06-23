@@ -1043,6 +1043,57 @@ def test_move_point_recomputes_endpoint_vector_length():
     assert objects["vc_001"].length == pytest.approx(5.0)
 
 
+def test_move_point_rejects_collapsing_endpoint_vector_onto_origin():
+    # Moving an endpoint-mode Vector's endpoint onto its origin makes length ~ 0.
+    # The deepcopy + setattr install path bypasses Vector.__post_init__, so the
+    # recompute guard must reject the move (ValueError) rather than install a
+    # degenerate vector. The failure happens in __init__ before any mutation, so
+    # the store is left untouched.
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0, 0.0),
+        "pt_002": make_point("pt_002", 3.0, 4.0, 0.0),
+        "vc_001": make_vector("vc_001", "pt_001", length=5.0, endpoint_id="pt_002"),
+    }
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+    bus = EventBus()
+
+    with pytest.raises(ValueError, match=r"vc_001.*degenerate"):
+        MovePointCommand(objects, graph, bus, "pt_002", easting=0.0, northing=0.0, altitude=0.0)
+    # The move was rejected in __init__: the point and vector are unchanged.
+    assert objects["pt_002"].easting == pytest.approx(3.0)
+    assert objects["pt_002"].northing == pytest.approx(4.0)
+    assert objects["vc_001"].length == pytest.approx(5.0)
+
+
+def test_move_point_multi_cycle_round_trip_is_stable():
+    # Repeated do/undo/do/undo with a dependent must leave both the moved point
+    # and its recomputed dependent exactly at their endpoint values each cycle.
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0, 0.0),
+        "pt_002": make_point("pt_002", 3.0, 4.0, 0.0),
+        "vc_001": make_vector("vc_001", "pt_001", length=5.0, endpoint_id="pt_002"),
+    }
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+    bus = EventBus()
+    history = CommandHistory(bus)
+    history.push(
+        MovePointCommand(objects, graph, bus, "pt_002", easting=0.0, northing=0.0, altitude=12.0)
+    )
+    for _ in range(2):
+        assert objects["pt_002"].altitude == pytest.approx(12.0)
+        assert objects["vc_001"].length == pytest.approx(12.0)
+        history.undo()
+        assert objects["pt_002"].altitude == pytest.approx(0.0)
+        assert objects["vc_001"].length == pytest.approx(5.0)
+        history.redo()
+    assert objects["pt_002"].altitude == pytest.approx(12.0)
+    assert objects["vc_001"].length == pytest.approx(12.0)
+
+
 def test_move_point_recomputes_endpoint_vector_direction_in_angle_mode():
     # _directed_value's DirectionMode.ANGLE branch (azimuth_to_angle) was only
     # covered for Line. Exercise it for an Origin+Endpoint Vector: move the
@@ -1441,6 +1492,52 @@ def test_modify_polygon_vertices_rejects_non_polygon_target():
         ModifyPolygonVerticesCommand(objects, graph, EventBus(), "ln_001", ("pt_001",))
 
 
+def test_modify_polygon_vertices_rejects_missing_vertex():
+    # A new vertex id that does not resolve to a live object must be rejected in
+    # __init__ (before any store/graph mutation) rather than leaking a bare
+    # KeyError out of the downstream signed-area/convexity validators.
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0),
+        "pt_002": make_point("pt_002", 10.0, 0.0),
+        "pt_003": make_point("pt_003", 10.0, 10.0),
+        "pg_001": make_polygon("pg_001", ("pt_001", "pt_002", "pt_003")),
+    }
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+    with pytest.raises(ValueError, match=r"pt_999.*does not exist"):
+        ModifyPolygonVerticesCommand(
+            objects, graph, EventBus(), "pg_001", ("pt_001", "pt_002", "pt_999")
+        )
+    # No mutation: the polygon keeps its original vertices and the bad edge was
+    # never registered.
+    assert objects["pg_001"].point_ids == ("pt_001", "pt_002", "pt_003")
+    assert "pt_999" not in graph.dependents_of("pg_001")
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
+
+
+def test_modify_polygon_vertices_rejects_non_point_vertex():
+    # A new vertex id that resolves to a non-Point would let the geometry
+    # validators read ``.easting`` off the wrong type (AttributeError). Reject it
+    # up front with a TypeError naming the id and its actual type.
+    objects = {
+        "pt_001": make_point("pt_001", 0.0, 0.0),
+        "pt_002": make_point("pt_002", 10.0, 0.0),
+        "pt_003": make_point("pt_003", 10.0, 10.0),
+        "ln_001": make_line("ln_001", "pt_001", "pt_002"),
+        "pg_001": make_polygon("pg_001", ("pt_001", "pt_002", "pt_003")),
+    }
+    graph = DependencyGraph()
+    for obj in objects.values():
+        graph.add(obj)
+    with pytest.raises(TypeError, match=r"vertex 'ln_001' is a Line, not a Point"):
+        ModifyPolygonVerticesCommand(
+            objects, graph, EventBus(), "pg_001", ("pt_001", "pt_002", "ln_001")
+        )
+    assert objects["pg_001"].point_ids == ("pt_001", "pt_002", "pt_003")
+    graph._test_only_assert_consistent()  # pylint: disable=protected-access
+
+
 def test_modify_polygon_vertices_missing_id_raises_contextual_key_error():
     graph = DependencyGraph()
     with pytest.raises(KeyError, match=r"ModifyPolygonVerticesCommand.*pg_404"):
@@ -1652,6 +1749,8 @@ def test_cascade_delete_do_rollback_is_fault_tolerant():
     # fires during the rollback's re-add rather than during setup.
     graph._add_fail_id = "pt_001"  # pylint: disable=protected-access
     bus = EventBus()
+    counter = _EventCounter()
+    counter.subscribe_all(bus)
 
     cmd = CascadeDeleteCommand(objects, graph, bus, "pt_001")
     with pytest.raises(RuntimeError, match="induced unregister failure"):
@@ -1660,6 +1759,10 @@ def test_cascade_delete_do_rollback_is_fault_tolerant():
     # The rollback attempted to re-add every snapshot object despite pt_001's add
     # raising — the closure is {pt_001, ln_001, pg_001}.
     assert set(graph.add_attempts) >= {"pt_001", "ln_001", "pg_001"}
+    # OBJECT_DELETED must NOT fire on the rollback path: the success fire is
+    # pinned to the try's ``else`` clause, so a faulted cascade never tells
+    # observers a deletion happened.
+    assert not counter.deleted
     # Snapshot is cleared even though a rollback step failed: a later undo must
     # not re-apply the failed delete.
     assert not cmd._snapshot  # pylint: disable=protected-access

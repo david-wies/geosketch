@@ -94,6 +94,7 @@ from geometry.services.geometry import is_convex as _is_convex
 from geometry.services.geometry import signed_area as _signed_area
 from geometry.services.geometry import tangent_direction as _tangent_direction
 from geometry.utils.angles import azimuth_to_angle, normalize_to_2pi
+from geometry.utils.constants import EPS_DISTANCE
 from geometry.utils.events import (
     HISTORY_CHANGED,
     OBJECT_CREATED,
@@ -616,7 +617,12 @@ class CascadeDeleteCommand:
                 self._graph.unregister(oid)
         except Exception as original_exc:  # pylint: disable=broad-exception-caught
             self._rollback_failed_do(store_removed, original_exc)
-        self._bus.fire(OBJECT_DELETED, obj_ids=list(self._snapshot))
+        else:
+            # Fire only on the success path. ``_rollback_failed_do`` always
+            # re-raises today, but pinning the fire to ``else`` keeps it
+            # structurally unreachable after a rollback even if that method is
+            # ever changed to recover instead of propagate.
+            self._bus.fire(OBJECT_DELETED, obj_ids=list(self._snapshot))
 
     def _rollback_failed_do(
         self, store_removed: list[GeoObject], original_exc: BaseException
@@ -1103,6 +1109,19 @@ class MovePointCommand:
                 result.direction = MovePointCommand._directed_value(az, result.direction_mode)
                 result.elevation = float(_elevation(origin, endpoint))
                 result.length = float(_distance(origin, endpoint))
+                # The deepcopy + setattr install path bypasses
+                # ``Vector.__post_init__``, so mirror its length guard here: a
+                # move that collapses the origin onto the endpoint yields
+                # length ~ 0 and would otherwise install a degenerate Vector
+                # silently. Raising ValueError routes through the ``except
+                # ValueError`` arm in ``__init__`` and surfaces as a rejected
+                # move (the Tangent zero-radius analogue does the same).
+                if not math.isfinite(result.length) or result.length <= EPS_DISTANCE:
+                    raise ValueError(
+                        f"moving the point collapses vector {result.id!r} onto its "
+                        f"endpoint (length {result.length!r} <= {EPS_DISTANCE}); the "
+                        f"vector would be degenerate"
+                    )
         elif isinstance(result, Tangent):
             shape = store[result.shape_id]
             center = store[shape.center_id]
@@ -1182,12 +1201,15 @@ class ModifyPolygonVerticesCommand:
     :meth:`__init__`, before any store mutation, the candidate ring is:
 
     1. built with the new ``point_ids``;
-    2. rejected if degenerate (``|signed_area| < EPS_AREA``);
-    3. reordered to CCW — if the signed area is negative (CW) the vertex tuple
+    2. checked that every new vertex id resolves to a live ``Point`` (a missing
+       id or a non-Point id is rejected up front rather than leaking a
+       ``KeyError``/``AttributeError`` out of the geometry validators);
+    3. rejected if degenerate (``|signed_area| < EPS_AREA``);
+    4. reordered to CCW — if the signed area is negative (CW) the vertex tuple
        is reversed, since a positive signed area is CCW;
-    4. validated for simplicity (no self-intersection) on the final, reordered
+    5. validated for simplicity (no self-intersection) on the final, reordered
        ring; and
-    5. only then has its cached ``is_convex`` recomputed (meaningful only on a
+    6. only then has its cached ``is_convex`` recomputed (meaningful only on a
        simple, CCW ring).
 
     Because every rejection happens in :meth:`__init__` before the store is
@@ -1241,6 +1263,18 @@ class ModifyPolygonVerticesCommand:
             )
         after = copy.deepcopy(before)
         after.point_ids = tuple(new_point_ids)
+        # Guard the new vertex references before the downstream validators index
+        # ``objects[pid]`` and read ``.easting`` directly: a nonexistent id would
+        # otherwise leak a bare ``KeyError`` and a non-Point id an ``AttributeError``
+        # out of ``_signed_area``/``_is_convex``. (The polygon target itself is
+        # type-guarded above; this guards the vertices it points at.)
+        for pid in after.point_ids:
+            validation.validate_reference_exists(pid, objects)
+            if not isinstance(objects[pid], Point):
+                raise TypeError(
+                    f"ModifyPolygonVerticesCommand: vertex {pid!r} is a "
+                    f"{type(objects[pid]).__name__}, not a Point (polygon {polygon_id!r})"
+                )
         # Mirror the polygon creation path: reject degeneracy, reorder CCW,
         # validate simplicity, then cache convexity — all before any mutation,
         # so a rejected edit never enters history. (CLAUDE.md §3, spec/MVP.md.)
