@@ -1326,3 +1326,406 @@ def test_convex_hull_3d_collinear_raises():
     pts = {f"p{i}": _pt(f"p{i}", i, i, 0.0) for i in range(4)}  # collinear in 3D
     with pytest.raises(ValueError):
         geo.convex_hull_3d(pts, list(pts), IDFactory())
+
+
+def test_convex_hull_3d_facets_wound_outward():
+    # Every facet normal (right-hand rule over its stored vertex order) must
+    # point away from the hull interior. The unit-cube test above uses abs() on
+    # the volume and so would not notice an inconsistently-wound facet; this
+    # checks each facet's orientation directly: the dot of the facet normal with
+    # the vector from the hull centroid to the facet centroid must be positive.
+    pts = {
+        f"p{i}": _pt(f"p{i}", x, y, z)
+        for i, (x, y, z) in enumerate(
+            [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
+        )
+    }
+    _solid, facets = geo.convex_hull_3d(pts, list(pts), IDFactory())
+    all_coords = np.array(
+        [geo._xyz(p) for p in pts.values()],  # pylint: disable=protected-access
+        dtype=np.float64,
+    )
+    hull_centroid = all_coords.mean(axis=0)
+    for facet in facets:
+        v0, v1, v2 = (geo._xyz(pts[pid]) for pid in facet.point_ids)  # pylint: disable=protected-access
+        normal = np.cross(v1 - v0, v2 - v0)
+        facet_centroid = (v0 + v1 + v2) / 3.0
+        assert float(np.dot(normal, facet_centroid - hull_centroid)) > 0.0
+
+
+def test_solid_volume_centroid_rejects_hull_facet_shell():
+    # The Solid returned by convex_hull_3d is a B-rep facet shell, not a
+    # bottom-to-top cross-section stack: its cube vertices are each shared by
+    # three or more facets, so _ensure_solid_is_stack must reject it rather than
+    # silently return a meaningless volume.
+    pts = {
+        f"p{i}": _pt(f"p{i}", x, y, z)
+        for i, (x, y, z) in enumerate(
+            [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
+        )
+    }
+    solid, facets = geo.convex_hull_3d(pts, list(pts), IDFactory())
+    objects = {f.id: f for f in facets}
+    with pytest.raises(ValueError, match="facet shell"):
+        geo.solid_volume_centroid(solid, objects, pts)
+
+
+def test_solid_volume_centroid_accepts_legitimate_stack():
+    # The mirror of the facet-shell rejection: a genuine cross-section stack
+    # (the unit cube via two square layers) still passes the stack guard and
+    # returns its volume, confirming _ensure_solid_is_stack is not over-eager.
+    solid, objects, pts = _unit_cube()
+    volume, _ = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# Solid pyramid (apex / point-layer) surface area & volume
+# ---------------------------------------------------------------------------
+
+
+def _square_pyramid(height: float = 4.0):
+    """Return (solid, objects, points) for a square pyramid with an apex layer.
+
+    The base is the axis-aligned square ``(0,0)-(2,2)`` at ``z=0`` and the apex
+    sits above the base centroid at ``(1, 1, height)``. The Solid stacks the
+    square base polygon under a single ``pt_`` apex layer, so it exercises the
+    ``_solid_layer_rings`` point-layer branch and the ``upper_is_pt`` apex
+    branch of ``_lateral_faces`` (triangle fan from base edges to the apex).
+
+    Closed forms for the chosen base
+    --------------------------------
+    * base area = ``2 * 2 = 4`` → volume = ``(1/3) * 4 * height``;
+    * base apothem (centre→edge midpoint) = ``1`` → slant height
+      ``= √(height² + 1)`` → lateral area = ``4 * √(height² + 1)`` (four
+      congruent isosceles triangles, each ``½ * 2 * slant``);
+    * total surface area = base + lateral = ``4 + 4·√(height² + 1)``.
+    """
+    pts = {
+        "pb0": _pt("pb0", 0, 0, 0.0),
+        "pb1": _pt("pb1", 2, 0, 0.0),
+        "pb2": _pt("pb2", 2, 2, 0.0),
+        "pb3": _pt("pb3", 0, 2, 0.0),
+        "pt_apex": _pt("pt_apex", 1, 1, height),
+    }
+    base = _poly("pg_base", ("pb0", "pb1", "pb2", "pb3"))
+    solid = _solid(("pg_base", "pt_apex"))
+    objects = {"pg_base": base}
+    return solid, objects, pts
+
+
+def test_solid_volume_square_pyramid():
+    height = 4.0
+    solid, objects, pts = _square_pyramid(height)
+    volume, _ = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(4.0 * height / 3.0)
+
+
+def test_solid_lateral_surface_area_square_pyramid():
+    # Four congruent isosceles faces fanned from the base edges to the apex.
+    # A flipped apex-face winding would corrupt the band normals; the closed
+    # form 4·√(h²+1) pins the lateral area so that regression is caught.
+    height = 4.0
+    solid, objects, pts = _square_pyramid(height)
+    expected = 4.0 * math.sqrt(height**2 + 1.0)
+    assert geo.solid_lateral_surface_area(solid, objects, pts) == pytest.approx(expected)
+
+
+def test_solid_total_surface_area_square_pyramid():
+    height = 4.0
+    solid, objects, pts = _square_pyramid(height)
+    expected = 4.0 + 4.0 * math.sqrt(height**2 + 1.0)  # base + lateral
+    assert geo.solid_total_surface_area(solid, objects, pts) == pytest.approx(expected)
+
+
+def test_solid_volume_square_pyramid_matches_wuttke():
+    # Independent Wuttke (2021) cross-check over the apex-fan B-rep guards the
+    # triangle-fan winding produced by the lower/upper apex branches.
+    solid, objects, pts = _square_pyramid(height=4.0)
+    volume, _ = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(_wuttke_volume(solid, objects, pts))
+
+
+def test_solid_volume_pyramid_apex_first_layer_matches():
+    # The apex as the FIRST layer (nadir) exercises the lower_is_pt branch of
+    # _lateral_faces, the reverse-wound triangle fan. Reordering the same
+    # pyramid must not change its volume or surface area.
+    _, objects, pts = _square_pyramid(height=4.0)
+    flipped = _solid(("pt_apex", "pg_base"))
+    volume, _ = geo.solid_volume_centroid(flipped, objects, pts)
+    assert volume == pytest.approx(4.0 * 4.0 / 3.0)
+    expected_total = 4.0 + 4.0 * math.sqrt(4.0**2 + 1.0)
+    assert geo.solid_total_surface_area(flipped, objects, pts) == pytest.approx(expected_total)
+
+
+def test_solid_volume_centroid_degenerate_returns_nan_not_origin():
+    # A coplanar, zero-extent Solid (two identical flat layers) returns volume
+    # 0.0 paired with a nan-filled centroid — NOT a fabricated (0,0,0), which in
+    # UTM metres would plant the centroid hundreds of km away in the ocean.
+    pts = {
+        "fb0": _pt("fb0", 0, 0, 0.0),
+        "fb1": _pt("fb1", 2, 0, 0.0),
+        "fb2": _pt("fb2", 2, 2, 0.0),
+        "fb3": _pt("fb3", 0, 2, 0.0),
+    }
+    flat = _poly("pg_flat", ("fb0", "fb1", "fb2", "fb3"))
+    objects = {"pg_flat": flat}
+    volume, centroid = geo.solid_volume_centroid(_solid(("pg_flat", "pg_flat")), objects, pts)
+    assert volume == pytest.approx(0.0)
+    assert np.isnan(centroid).all()
+
+
+# ---------------------------------------------------------------------------
+# Ball / cylinder measurement guards (non-finite, negative, exact-zero)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "func",
+    [geo.ball_volume, geo.ball_surface_area],
+    ids=["volume", "surface_area"],
+)
+@pytest.mark.parametrize(
+    "bad", [-1.0, math.nan, math.inf, -math.inf], ids=["neg", "nan", "inf", "-inf"]
+)
+def test_ball_measure_rejects_bad_radius(func, bad):
+    with pytest.raises(ValueError, match="Radius"):
+        func(bad)
+
+
+@pytest.mark.parametrize(
+    ("func", "expected"),
+    [(geo.ball_volume, 0.0), (geo.ball_surface_area, 0.0)],
+    ids=["volume", "surface_area"],
+)
+def test_ball_measure_zero_radius_is_zero(func, expected):
+    assert func(0.0) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "func",
+    [
+        geo.cylinder_volume,
+        geo.cylinder_lateral_surface_area,
+        geo.cylinder_total_surface_area,
+    ],
+    ids=["volume", "lateral", "total"],
+)
+@pytest.mark.parametrize(
+    "bad", [-1.0, math.nan, math.inf, -math.inf], ids=["neg", "nan", "inf", "-inf"]
+)
+def test_cylinder_measure_rejects_bad_radius(func, bad):
+    with pytest.raises(ValueError, match="Radius"):
+        func(bad, 5.0)
+
+
+@pytest.mark.parametrize(
+    "func",
+    [
+        geo.cylinder_volume,
+        geo.cylinder_lateral_surface_area,
+        geo.cylinder_total_surface_area,
+    ],
+    ids=["volume", "lateral", "total"],
+)
+@pytest.mark.parametrize(
+    "bad", [-1.0, math.nan, math.inf, -math.inf], ids=["neg", "nan", "inf", "-inf"]
+)
+def test_cylinder_measure_rejects_bad_height(func, bad):
+    with pytest.raises(ValueError, match="Height"):
+        func(2.0, bad)
+
+
+@pytest.mark.parametrize(
+    "func",
+    [
+        geo.cylinder_volume,
+        geo.cylinder_lateral_surface_area,
+        geo.cylinder_total_surface_area,
+    ],
+    ids=["volume", "lateral", "total"],
+)
+def test_cylinder_measure_zero_radius_is_zero(func):
+    # Radius exactly 0 collapses the cylinder to its axis segment: every
+    # measure is a well-defined 0.0, not a raise.
+    assert func(0.0, 5.0) == pytest.approx(0.0)
+
+
+def test_cylinder_measure_zero_height():
+    # Height 0 zeros the volume and the lateral wall, but the total surface
+    # area keeps the two end caps: 2*pi*r**2.
+    assert geo.cylinder_volume(2.0, 0.0) == pytest.approx(0.0)
+    assert geo.cylinder_lateral_surface_area(2.0, 0.0) == pytest.approx(0.0)
+    assert geo.cylinder_total_surface_area(2.0, 0.0) == pytest.approx(2 * math.pi * 4.0)
+
+
+# ---------------------------------------------------------------------------
+# CylinderCrossSection __post_init__ invariants
+# ---------------------------------------------------------------------------
+
+
+def test_cylinder_cross_section_accepts_valid_kinds():
+    assert geo.CylinderCrossSection("circle", (1.0,)).dimensions == (1.0,)
+    assert geo.CylinderCrossSection("ellipse", (2.0, 1.0)).kind == "ellipse"
+    assert geo.CylinderCrossSection("rectangle", (4.0, 5.0)).kind == "rectangle"
+
+
+@pytest.mark.parametrize(
+    ("kind", "dimensions"),
+    [
+        ("circle", (1.0, 2.0)),  # arity 1 expected, got 2
+        ("ellipse", (1.0,)),  # arity 2 expected, got 1
+        ("rectangle", (1.0, 2.0, 3.0)),  # arity 2 expected, got 3
+    ],
+    ids=["circle-too-many", "ellipse-too-few", "rectangle-too-many"],
+)
+def test_cylinder_cross_section_rejects_wrong_arity(kind, dimensions):
+    with pytest.raises(ValueError, match="dimension"):
+        geo.CylinderCrossSection(kind, dimensions)
+
+
+def test_cylinder_cross_section_rejects_unknown_kind():
+    with pytest.raises(ValueError, match="kind"):
+        geo.CylinderCrossSection("triangle", (1.0, 2.0))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("kind", "dimensions"),
+    [
+        ("circle", (0.0,)),
+        ("circle", (-1.0,)),
+        ("ellipse", (2.0, 0.0)),
+        ("rectangle", (-4.0, 5.0)),
+        ("rectangle", (4.0, math.inf)),
+    ],
+    ids=["circle-zero", "circle-neg", "ellipse-zero", "rect-neg", "rect-inf"],
+)
+def test_cylinder_cross_section_rejects_non_positive_dimensions(kind, dimensions):
+    with pytest.raises(ValueError, match="finite and > 0"):
+        geo.CylinderCrossSection(kind, dimensions)
+
+
+# ---------------------------------------------------------------------------
+# Cylinder cross-section boundary classification (cos-θ domain thresholds)
+# ---------------------------------------------------------------------------
+
+
+def test_cylinder_cross_section_near_circle_boundary_stays_circle():
+    # A normal tilted off the vertical axis by a tiny but realistic 1e-5 rad:
+    # 1 - cos(1e-5) ~ 5e-11 < EPS_ANGLE (1e-9), so it must still classify as a
+    # circle, NOT an ellipse with a blown-up semi_major. Uses a trig-derived
+    # inclined normal rather than the exact [0,0,1] axis.
+    tilt = 1e-5
+    normal = np.array([math.sin(tilt), 0.0, math.cos(tilt)], dtype=np.float64)
+    cs = geo.cylinder_cross_section(_cyl("vertical"), normal)
+    assert cs.kind == "circle"
+    assert cs.dimensions == pytest.approx((2.0,))
+
+
+def test_cylinder_cross_section_just_off_circle_boundary_is_ellipse():
+    # The ellipse side of the circle boundary: tilt 1e-3 rad gives
+    # 1 - cos(1e-3) ~ 5e-7 > EPS_ANGLE, so it is an ellipse with a finite
+    # semi_major = r / cos(tilt) and semi_minor = r.
+    tilt = 1e-3
+    normal = np.array([math.sin(tilt), 0.0, math.cos(tilt)], dtype=np.float64)
+    cs = geo.cylinder_cross_section(_cyl("vertical"), normal)
+    assert cs.kind == "ellipse"
+    assert cs.dimensions[0] == pytest.approx(2.0 / math.cos(tilt))
+    assert cs.dimensions[1] == pytest.approx(2.0)
+    assert math.isfinite(cs.dimensions[0])
+
+
+def test_cylinder_cross_section_near_rectangle_boundary_stays_rectangle():
+    # A normal nearly perpendicular to the axis: tilted only 1e-12 rad off
+    # horizontal, so cos_theta = sin(1e-12) ~ 1e-12 < EPS_ANGLE → rectangle.
+    off = 1e-12
+    normal = np.array([math.cos(off), 0.0, math.sin(off)], dtype=np.float64)
+    cs = geo.cylinder_cross_section(_cyl("vertical"), normal)
+    assert cs.kind == "rectangle"
+    assert cs.dimensions == pytest.approx((4.0, 5.0))
+
+
+def test_cylinder_cross_section_just_off_rectangle_boundary_is_ellipse():
+    # The ellipse side of the rectangle boundary: an axis–normal angle 1e-3 rad
+    # short of perpendicular gives cos_theta ~ 1e-3 > EPS_ANGLE, so it is a
+    # (very elongated but finite) ellipse rather than a rectangle.
+    off = 1e-3
+    normal = np.array([math.cos(off), 0.0, math.sin(off)], dtype=np.float64)
+    cs = geo.cylinder_cross_section(_cyl("vertical"), normal)
+    assert cs.kind == "ellipse"
+    assert cs.dimensions[0] == pytest.approx(2.0 / math.sin(off))
+    assert math.isfinite(cs.dimensions[0])
+
+
+def test_cylinder_cross_section_clearly_inclined_normal_is_finite_ellipse():
+    # A 45° normal is unambiguously an ellipse with semi_major = r / cos(π/4) =
+    # r·√2 — finite, not a degenerate blow-up.
+    inv_sqrt2 = 1.0 / math.sqrt(2.0)
+    normal = np.array([inv_sqrt2, 0.0, inv_sqrt2], dtype=np.float64)
+    cs = geo.cylinder_cross_section(_cyl("vertical"), normal)
+    assert cs.kind == "ellipse"
+    assert cs.dimensions[0] == pytest.approx(2.0 * math.sqrt(2.0))
+    assert cs.dimensions[1] == pytest.approx(2.0)
+
+
+# ---------------------------------------------------------------------------
+# Inclined-cylinder cross-section (axis → θ interaction)
+# ---------------------------------------------------------------------------
+
+
+def test_cylinder_cross_section_inclined_axis_circle_along_axis():
+    # Cutting an inclined cylinder with a plane whose normal IS the axis
+    # direction gives cos_theta = 1 → a circle of the cylinder radius,
+    # regardless of the (non-vertical) axis tilt.
+    cyl = _cyl("inclined", az=math.pi / 2, el=math.pi / 4)
+    axis = geo.cylinder_axis_vector(cyl)  # (1/√2, 0, 1/√2)
+    cs = geo.cylinder_cross_section(cyl, axis)
+    assert cs.kind == "circle"
+    assert cs.dimensions == pytest.approx((2.0,))
+
+
+def test_cylinder_cross_section_inclined_axis_horizontal_plane_is_ellipse():
+    # The inclined axis (1/√2, 0, 1/√2) cut by a horizontal plane normal
+    # (0,0,1): cos_theta = 1/√2 → θ = π/4 → ellipse with
+    # semi_major = r / cos(π/4) = r·√2 and semi_minor = r. This pins the
+    # axis→θ interaction for a non-vertical cylinder (all existing cross-section
+    # tests use a vertical cylinder).
+    cyl = _cyl("inclined", az=math.pi / 2, el=math.pi / 4)
+    cs = geo.cylinder_cross_section(cyl, np.array([0.0, 0.0, 1.0]))
+    assert cs.kind == "ellipse"
+    assert cs.dimensions[0] == pytest.approx(2.0 * math.sqrt(2.0))
+    assert cs.dimensions[1] == pytest.approx(2.0)
+
+
+def test_cylinder_cross_section_inclined_axis_perpendicular_plane_is_rectangle():
+    # A plane whose normal is perpendicular to the inclined axis cuts parallel
+    # to it → a rectangle 2r wide by h tall. The axis is (1/√2, 0, 1/√2); the
+    # easting unit vector (1,0,0) is not perpendicular to it, but (1,0,-1)/√2
+    # is (dot = 0), so use that.
+    cyl = _cyl("inclined", az=math.pi / 2, el=math.pi / 4)
+    perp = np.array([1.0, 0.0, -1.0], dtype=np.float64)  # ⟂ to (1,0,1)
+    cs = geo.cylinder_cross_section(cyl, perp)
+    assert cs.kind == "rectangle"
+    assert cs.dimensions == pytest.approx((4.0, 5.0))
+
+
+# ---------------------------------------------------------------------------
+# Ball extras: symmetric in-range cross-section, non-cardinal tangent azimuth
+# ---------------------------------------------------------------------------
+
+
+def test_ball_cross_section_radius_negative_distance_is_symmetric():
+    # The cross-section radius depends on |d|, so a negative in-range distance
+    # yields the same radius as its positive mirror (√(r² − d²) is even in d).
+    pos = geo.ball_cross_section_radius(5.0, 3.0)
+    neg = geo.ball_cross_section_radius(5.0, -3.0)
+    assert neg == pytest.approx(4.0)
+    assert neg == pytest.approx(pos)
+
+
+def test_ball_tangent_direction_non_cardinal_azimuth():
+    # A surface point NE of the centre (Δe = Δn = 1) has radius azimuth
+    # atan2(1, 1) = π/4 — a non-cardinal bearing the existing N/E cases miss.
+    center = _pt("c", 0, 0, 0.0)
+    ne = _pt("ne", 1, 1, 0.0)
+    assert geo.ball_tangent_direction(center, ne) == pytest.approx(math.pi / 4)
