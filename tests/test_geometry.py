@@ -26,6 +26,7 @@ tolerance.
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -1155,6 +1156,25 @@ def test_ball_cross_section_radius_outside_returns_none():
     assert geo.ball_cross_section_radius(5.0, -6.0) is None
 
 
+@pytest.mark.parametrize(
+    "bad", [-1.0, math.nan, math.inf, -math.inf], ids=["neg", "nan", "inf", "-inf"]
+)
+def test_ball_cross_section_radius_rejects_bad_radius(bad):
+    # ``ball_cross_section_radius`` now calls ``_require_non_negative_radius`` at
+    # entry. Without it a negative radius makes ``abs(distance) > ball_radius``
+    # always true and the function silently returns ``None``, masking the corrupt
+    # input. The guard raises instead — matching the other ball/cylinder measures.
+    with pytest.raises(ValueError, match="Radius"):
+        geo.ball_cross_section_radius(bad, 0.0)
+
+
+def test_ball_cross_section_radius_zero_radius_only_meets_at_center():
+    # Radius exactly 0 is permitted (a degenerate point ball): the plane meets it
+    # only at distance 0, where the cross-section radius is 0.0; any offset misses.
+    assert geo.ball_cross_section_radius(0.0, 0.0) == pytest.approx(0.0)
+    assert geo.ball_cross_section_radius(0.0, 1.0) is None
+
+
 def test_ball_tangent_direction_azimuth():
     center = _pt("c", 0, 0, 0.0)
     assert geo.ball_tangent_direction(center, _pt("n", 0, 1, 0.0)) == pytest.approx(0.0)
@@ -1328,6 +1348,24 @@ def test_convex_hull_3d_collinear_raises():
         geo.convex_hull_3d(pts, list(pts), IDFactory())
 
 
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf], ids=["nan", "inf", "-inf"])
+def test_convex_hull_3d_non_finite_coord_raises(bad):
+    # The up-front ``np.isfinite`` guard rejects non-finite input so a nan/inf
+    # cannot be funnelled into the coplanar fallback and masquerade as flat
+    # geometry. ``Point.__post_init__`` forbids non-finite coordinates, so the
+    # corrupt vertex is supplied via a minimal stand-in exposing only the three
+    # attributes ``_xyz`` reads — the exact seam the defense-in-depth guard
+    # exists to catch.
+    points = {
+        "p0": _pt("p0", 0, 0, 0.0),
+        "p1": _pt("p1", 1, 0, 0.0),
+        "p2": _pt("p2", 0, 1, 0.0),
+        "p3": SimpleNamespace(easting=0.0, northing=0.0, altitude=bad),
+    }
+    with pytest.raises(ValueError, match=r"nan or ±inf"):
+        geo.convex_hull_3d(points, list(points), IDFactory())
+
+
 def test_convex_hull_3d_facets_wound_outward():
     # Every facet normal (right-hand rule over its stored vertex order) must
     # point away from the hull interior. The unit-cube test above uses abs() on
@@ -1471,6 +1509,36 @@ def test_solid_volume_centroid_degenerate_returns_nan_not_origin():
     flat = _poly("pg_flat", ("fb0", "fb1", "fb2", "fb3"))
     objects = {"pg_flat": flat}
     volume, centroid = geo.solid_volume_centroid(_solid(("pg_flat", "pg_flat")), objects, pts)
+    assert volume == pytest.approx(0.0)
+    assert np.isnan(centroid).all()
+
+
+def test_solid_volume_centroid_non_finite_volume_returns_nan_centroid():
+    # The degeneracy gate has two halves: ``abs(signed_v) < EPS_VOLUME`` (the
+    # zero-extent case exercised above) and ``not isfinite(signed_v)``. This
+    # drives the second half. Point construction forbids non-finite coordinates,
+    # so a nan/inf cannot be injected as a vertex directly; instead huge-but-
+    # finite coordinates (cube ~1e480) overflow the signed-tetrahedron product
+    # ``dot(v0, cross(v1, v2))`` to ``inf``, making ``signed_v`` non-finite. The
+    # contract then returns volume 0.0 paired with a nan-filled centroid rather
+    # than ``(nan, moment / nan)``. ``np.errstate`` silences the expected
+    # overflow warning without depending on the global warning filter.
+    big = 1e160
+    pts = {
+        "hb0": _pt("hb0", 0, 0, 0.0),
+        "hb1": _pt("hb1", big, 0, 0.0),
+        "hb2": _pt("hb2", big, big, 0.0),
+        "hb3": _pt("hb3", 0, big, 0.0),
+        "ht0": _pt("ht0", 0, 0, big),
+        "ht1": _pt("ht1", big, 0, big),
+        "ht2": _pt("ht2", big, big, big),
+        "ht3": _pt("ht3", 0, big, big),
+    }
+    bottom = _poly("pg_b", ("hb0", "hb1", "hb2", "hb3"))
+    top = _poly("pg_t", ("ht0", "ht1", "ht2", "ht3"))
+    objects = {"pg_b": bottom, "pg_t": top}
+    with np.errstate(over="ignore", invalid="ignore"):
+        volume, centroid = geo.solid_volume_centroid(_solid(("pg_b", "pg_t")), objects, pts)
     assert volume == pytest.approx(0.0)
     assert np.isnan(centroid).all()
 

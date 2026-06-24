@@ -1114,12 +1114,23 @@ def _require_non_negative_radius(radius: float) -> None:
 
     Defense-in-depth for the measurement functions, which would otherwise turn
     a corrupt ``radius`` into a wrong-signed or ``nan`` result and propagate it
-    silently. The error wording mirrors
-    :func:`geometry.services.validation.validate_positive_radius`; this local
-    copy exists because :mod:`geometry.services.validation` imports this module,
-    so importing it back here would be circular. A radius of exactly ``0`` is
-    permitted (it yields a well-defined zero volume/area) — only ``< 0`` and
-    non-finite values are rejected.
+    silently. This local copy exists because
+    :mod:`geometry.services.validation` imports this module, so importing
+    :func:`~geometry.services.validation.validate_positive_radius` back here
+    would be circular.
+
+    The two helpers are deliberately **not** in lockstep, despite the similar
+    naming. Only the *finite* check matches word-for-word; the bound and its
+    message diverge on purpose:
+
+    * This helper rejects ``radius < 0.0`` with ``"Radius must be >= 0"`` — a
+      radius of exactly ``0`` is **permitted** (it yields a well-defined zero
+      volume/area).
+    * :func:`~geometry.services.validation.validate_positive_radius` rejects
+      ``radius <= EPS_DISTANCE`` with ``"Radius must be > 1e-06"`` — it
+      **forbids** zero (a degenerate object the user is constructing).
+
+    A maintainer should not assume these stay in sync.
     """
     if not math.isfinite(radius):
         raise ValueError(f"Radius must be finite; got {radius!r}")
@@ -1179,7 +1190,7 @@ def ball_cross_section_radius(ball_radius: float, distance_to_plane: float) -> n
     Parameters
     ----------
     ball_radius : float
-        Ball radius in metres (assumed non-negative).
+        Ball radius in metres.
     distance_to_plane : float
         Signed distance from the ball centre to the cutting plane.
 
@@ -1188,7 +1199,17 @@ def ball_cross_section_radius(ball_radius: float, distance_to_plane: float) -> n
     numpy.float64 or None
         The cross-section radius, or ``None`` if the plane does not meet the
         ball.
+
+    Raises
+    ------
+    ValueError
+        If ``ball_radius`` is non-finite or negative. Without this guard a
+        negative radius would make ``abs(distance_to_plane) > ball_radius``
+        always true and the function would silently return ``None``, masking
+        the corrupt input instead of rejecting it (consistent with
+        :func:`ball_volume` and the other ball/cylinder measures).
     """
+    _require_non_negative_radius(ball_radius)
     if abs(distance_to_plane) > ball_radius:
         return None
     return np.sqrt(np.float64(ball_radius) ** 2 - np.float64(distance_to_plane) ** 2)
@@ -1601,9 +1622,10 @@ def _solid_brep(
     ------
     ValueError
         If ``solid`` is a convex-hull facet shell rather than a cross-section
-        stack (see :func:`_ensure_solid_is_stack`), or if it resolves to fewer
-        than two layers (a malformed 0- or 1-layer Solid that cannot have a
-        cap/lateral structure).
+        stack (see :func:`_ensure_solid_is_stack`). The function also asserts
+        at least two layers, but this is belt-and-suspenders:
+        :meth:`Solid.__post_init__` already rejects a 0- or 1-layer Solid at
+        construction, so a real Solid can never reach that guard.
     """
     _ensure_solid_is_stack(solid, objects)
     rings = _solid_layer_rings(solid, objects, points)
@@ -1690,8 +1712,10 @@ def solid_volume_centroid(
     ------
     ValueError
         If ``solid`` is a convex-hull facet shell rather than a cross-section
-        stack, or resolves to fewer than two layers (propagated from
-        :func:`solid_faces`).
+        stack (propagated from :func:`solid_faces`). The underlying B-rep also
+        asserts at least two layers, but :meth:`Solid.__post_init__` already
+        rejects a 0- or 1-layer Solid at construction, so a real Solid can
+        never trigger that path.
     """
     signed_v = np.float64(0.0)
     moment = np.zeros(3, dtype=np.float64)
