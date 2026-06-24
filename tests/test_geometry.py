@@ -32,12 +32,15 @@ import pytest
 from scipy.spatial import QhullError  # pylint: disable=no-name-in-module
 
 from geometry.models.common import DirectionMode, DirectionUnits
+from geometry.models.cylinder import Cylinder
 from geometry.models.line import Line
 from geometry.models.point import Point
 from geometry.models.polygon import Polygon
 from geometry.models.ray import Ray
+from geometry.models.solid import Solid
 from geometry.services import geometry as geo
 from geometry.utils.constants import EPS_DISTANCE
+from geometry.utils.id_factory import IDFactory
 
 # ---------------------------------------------------------------------------
 # builders
@@ -1032,3 +1035,294 @@ def test_three_point_both_arms_vertical_positive_pi_elevation():
     az, el = geo.three_point_azimuth_elevation(a, b, c)
     assert az is None
     assert el == pytest.approx(math.pi)
+
+
+# ---------------------------------------------------------------------------
+# 3-D builders (issue #60)
+# ---------------------------------------------------------------------------
+
+
+def _cyl(
+    axis_mode: str,
+    az: float = 0.0,
+    el: float = math.pi / 2,
+    radius: float = 2.0,
+    height: float = 5.0,
+) -> Cylinder:
+    return Cylinder(
+        id="cy_001",
+        name="cyl",
+        alpha=1.0,
+        visibility=True,
+        base_center_id="pt_c",
+        radius=radius,
+        height=height,
+        axis_mode=axis_mode,
+        axis_azimuth=az,
+        axis_elevation=el,
+        direction_mode=DirectionMode.AZIMUTH,
+        direction_units=DirectionUnits.RADIANS,
+        line_color="#000000",
+        fill_color="#cccccc",
+    )
+
+
+def _solid(layers: tuple[str, ...]) -> Solid:
+    return Solid(
+        id="so_001",
+        name="solid",
+        alpha=1.0,
+        visibility=True,
+        layers=layers,
+        line_color="#000000",
+        fill_color="#cccccc",
+    )
+
+
+def _unit_cube():
+    """Return (solid, objects, points) for a unit cube via two square layers."""
+    pts = {
+        "pb0": _pt("pb0", 0, 0, 0.0),
+        "pb1": _pt("pb1", 1, 0, 0.0),
+        "pb2": _pt("pb2", 1, 1, 0.0),
+        "pb3": _pt("pb3", 0, 1, 0.0),
+        "pt0": _pt("pt0", 0, 0, 1.0),
+        "pt1": _pt("pt1", 1, 0, 1.0),
+        "pt2": _pt("pt2", 1, 1, 1.0),
+        "pt3": _pt("pt3", 0, 1, 1.0),
+    }
+    bottom = _poly("pg_b", ("pb0", "pb1", "pb2", "pb3"))
+    top = _poly("pg_t", ("pt0", "pt1", "pt2", "pt3"))
+    solid = _solid(("pg_b", "pg_t"))
+    objects = {"pg_b": bottom, "pg_t": top}
+    return solid, objects, pts
+
+
+def _tetra(height: float = 3.0):
+    """Return (solid, objects, points) for a triangular-base pyramid."""
+    pts = {
+        "pb0": _pt("pb0", 0, 0, 0.0),
+        "pb1": _pt("pb1", 1, 0, 0.0),
+        "pb2": _pt("pb2", 0, 1, 0.0),
+        "pt_apex": _pt("pt_apex", 0, 0, height),
+    }
+    base = _poly("pg_base", ("pb0", "pb1", "pb2"))
+    solid = _solid(("pg_base", "pt_apex"))
+    objects = {"pg_base": base}
+    return solid, objects, pts
+
+
+def _wuttke_volume(solid, objects, points) -> float:
+    """Independent Wuttke (2021) Eq. 22 cross-check: (1/3) Σ Ar(face)·r_perp."""
+    total = 0.0
+    for face in geo.solid_faces(solid, objects, points):
+        area_vec = geo._face_area_vector(face)  # pylint: disable=protected-access
+        area = float(np.linalg.norm(area_vec))
+        if area == 0.0:
+            continue
+        nhat = area_vec / area
+        total += area * float(np.dot(face[0], nhat)) / 3.0
+    return abs(total)
+
+
+# ---------------------------------------------------------------------------
+# Ball geometry
+# ---------------------------------------------------------------------------
+
+
+def test_ball_volume():
+    assert geo.ball_volume(2.0) == pytest.approx(4.0 / 3.0 * math.pi * 8.0)
+
+
+def test_ball_surface_area():
+    assert geo.ball_surface_area(3.0) == pytest.approx(4.0 * math.pi * 9.0)
+
+
+def test_ball_cross_section_radius_through_center():
+    assert geo.ball_cross_section_radius(5.0, 0.0) == pytest.approx(5.0)
+
+
+def test_ball_cross_section_radius_offset():
+    assert geo.ball_cross_section_radius(5.0, 3.0) == pytest.approx(4.0)
+
+
+def test_ball_cross_section_radius_tangent_plane():
+    assert geo.ball_cross_section_radius(5.0, 5.0) == pytest.approx(0.0)
+
+
+def test_ball_cross_section_radius_outside_returns_none():
+    assert geo.ball_cross_section_radius(5.0, 6.0) is None
+    assert geo.ball_cross_section_radius(5.0, -6.0) is None
+
+
+def test_ball_tangent_direction_azimuth():
+    center = _pt("c", 0, 0, 0.0)
+    assert geo.ball_tangent_direction(center, _pt("n", 0, 1, 0.0)) == pytest.approx(0.0)
+    assert geo.ball_tangent_direction(center, _pt("e", 1, 0, 0.0)) == pytest.approx(math.pi / 2)
+
+
+# ---------------------------------------------------------------------------
+# Cylinder geometry
+# ---------------------------------------------------------------------------
+
+
+def test_cylinder_volume():
+    assert geo.cylinder_volume(2.0, 5.0) == pytest.approx(math.pi * 4.0 * 5.0)
+
+
+def test_cylinder_lateral_surface_area():
+    assert geo.cylinder_lateral_surface_area(2.0, 5.0) == pytest.approx(2.0 * math.pi * 2.0 * 5.0)
+
+
+def test_cylinder_total_surface_area():
+    expected = 2.0 * math.pi * 2.0 * 5.0 + 2.0 * math.pi * 4.0
+    assert geo.cylinder_total_surface_area(2.0, 5.0) == pytest.approx(expected)
+
+
+def test_cylinder_axis_vector_vertical():
+    assert np.allclose(geo.cylinder_axis_vector(_cyl("vertical")), [0.0, 0.0, 1.0])
+
+
+def test_cylinder_axis_vector_inclined():
+    cyl = _cyl("inclined", az=math.pi / 2, el=math.pi / 4)
+    inv_sqrt2 = 1.0 / math.sqrt(2.0)
+    assert np.allclose(geo.cylinder_axis_vector(cyl), [inv_sqrt2, 0.0, inv_sqrt2])
+
+
+def test_cylinder_cross_section_circle():
+    cs = geo.cylinder_cross_section(_cyl("vertical"), np.array([0.0, 0.0, 1.0]))
+    assert cs.kind == "circle"
+    assert cs.dimensions == pytest.approx((2.0,))
+
+
+def test_cylinder_cross_section_rectangle():
+    cs = geo.cylinder_cross_section(_cyl("vertical"), np.array([1.0, 0.0, 0.0]))
+    assert cs.kind == "rectangle"
+    assert cs.dimensions == pytest.approx((4.0, 5.0))
+
+
+def test_cylinder_cross_section_ellipse():
+    cs = geo.cylinder_cross_section(_cyl("vertical"), np.array([1.0, 0.0, 1.0]))
+    assert cs.kind == "ellipse"
+    assert cs.dimensions == pytest.approx((2.0 * math.sqrt(2.0), 2.0))
+
+
+def test_cylinder_cross_section_zero_normal_raises():
+    with pytest.raises(ValueError):
+        geo.cylinder_cross_section(_cyl("vertical"), np.array([0.0, 0.0, 0.0]))
+
+
+# ---------------------------------------------------------------------------
+# Solid volume / centroid / area (Mirtich 1996)
+# ---------------------------------------------------------------------------
+
+
+def test_solid_volume_unit_cube():
+    solid, objects, pts = _unit_cube()
+    volume, centroid = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(1.0)
+    assert np.allclose(centroid, [0.5, 0.5, 0.5])
+
+
+def test_solid_volume_cube_matches_wuttke():
+    solid, objects, pts = _unit_cube()
+    volume, _ = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(_wuttke_volume(solid, objects, pts))
+
+
+def test_solid_volume_tetrahedron():
+    solid, objects, pts = _tetra(height=3.0)
+    # base area = 0.5, height = 3 → volume = 0.5 * 3 / 3 = 0.5
+    volume, _ = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(0.5)
+
+
+def test_solid_volume_tetra_matches_wuttke():
+    solid, objects, pts = _tetra(height=2.0)
+    volume, _ = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(_wuttke_volume(solid, objects, pts))
+
+
+def test_solid_total_surface_area_unit_cube():
+    solid, objects, pts = _unit_cube()
+    assert geo.solid_total_surface_area(solid, objects, pts) == pytest.approx(6.0)
+
+
+def test_solid_lateral_surface_area_unit_cube():
+    solid, objects, pts = _unit_cube()
+    assert geo.solid_lateral_surface_area(solid, objects, pts) == pytest.approx(4.0)
+
+
+def test_solid_lateral_band_differing_vertex_counts_raises():
+    pts = {
+        "pb0": _pt("pb0", 0, 0, 0.0),
+        "pb1": _pt("pb1", 2, 0, 0.0),
+        "pb2": _pt("pb2", 2, 2, 0.0),
+        "pb3": _pt("pb3", 0, 2, 0.0),
+        "pt0": _pt("pt0", 0, 0, 1.0),
+        "pt1": _pt("pt1", 1, 0, 1.0),
+        "pt2": _pt("pt2", 0, 1, 1.0),
+    }
+    objects = {
+        "pg_b": _poly("pg_b", ("pb0", "pb1", "pb2", "pb3")),
+        "pg_t": _poly("pg_t", ("pt0", "pt1", "pt2")),
+    }
+    with pytest.raises(ValueError):
+        geo.solid_volume_centroid(_solid(("pg_b", "pg_t")), objects, pts)
+
+
+# ---------------------------------------------------------------------------
+# 3-D convex hull
+# ---------------------------------------------------------------------------
+
+
+def _facet_volume(facets, points) -> float:
+    """Signed-tetra volume over outward-oriented hull triangle facets."""
+    total = 0.0
+    for facet in facets:
+        v0, v1, v2 = (geo._xyz(points[pid]) for pid in facet.point_ids)  # pylint: disable=protected-access
+        total += float(np.dot(v0, np.cross(v1, v2))) / 6.0
+    return abs(total)
+
+
+def test_convex_hull_3d_unit_cube():
+    pts = {
+        f"p{i}": _pt(f"p{i}", x, y, z)
+        for i, (x, y, z) in enumerate(
+            [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
+        )
+    }
+    solid, facets = geo.convex_hull_3d(pts, list(pts), IDFactory())
+    assert solid.id.startswith("so_")
+    assert all(f.id.startswith("pg_") for f in facets)
+    assert len(solid.layers) == len(facets)
+    assert all(len(f.point_ids) == 3 for f in facets)  # triangulated facets
+    assert _facet_volume(facets, pts) == pytest.approx(1.0)
+
+
+def test_convex_hull_3d_too_few_points_raises():
+    pts = {f"p{i}": _pt(f"p{i}", i, 0, 0.0) for i in range(3)}
+    with pytest.raises(ValueError):
+        geo.convex_hull_3d(pts, list(pts), IDFactory())
+
+
+def test_convex_hull_3d_coplanar_fallback_degenerate():
+    pts = {
+        "p0": _pt("p0", 0, 0, 0.0),
+        "p1": _pt("p1", 1, 0, 0.0),
+        "p2": _pt("p2", 1, 1, 0.0),
+        "p3": _pt("p3", 0, 1, 0.0),
+    }
+    solid, polygons = geo.convex_hull_3d(pts, list(pts), IDFactory())
+    assert len(polygons) == 1
+    assert len(solid.layers) == 2
+    assert solid.layers[0] == solid.layers[1]  # two identical flat layers
+    objects = {polygons[0].id: polygons[0]}
+    volume, _ = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(0.0)  # zero extent → flagged via EPS_VOLUME
+
+
+def test_convex_hull_3d_collinear_raises():
+    pts = {f"p{i}": _pt(f"p{i}", i, i, 0.0) for i in range(4)}  # collinear in 3D
+    with pytest.raises(ValueError):
+        geo.convex_hull_3d(pts, list(pts), IDFactory())

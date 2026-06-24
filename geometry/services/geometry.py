@@ -68,18 +68,22 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 import numpy as np
 import shapely
-from scipy.spatial import ConvexHull  # pylint: disable=no-name-in-module
+from scipy.spatial import ConvexHull, QhullError  # pylint: disable=no-name-in-module
 
-from geometry.models.common import ElevatedObject, DirectionMode
+from geometry.models.common import ElevatedObject, DirectionMode, GeoObject
+from geometry.models.cylinder import Cylinder
 from geometry.models.line import Line
 from geometry.models.point import Point
 from geometry.models.polygon import Polygon
 from geometry.models.ray import Ray
+from geometry.models.solid import Solid
 from geometry.utils.angles import azimuth_to_angle, normalize_to_2pi
-from geometry.utils.constants import EPS_ANGLE, EPS_DISTANCE, EPS_PARAM
+from geometry.utils.constants import EPS_ANGLE, EPS_DISTANCE, EPS_PARAM, EPS_VOLUME
+from geometry.utils.id_factory import IDFactory
 
 __all__ = [
     "azimuth",
@@ -98,6 +102,21 @@ __all__ = [
     "polygon_polygon_distance",
     "tangent_direction",
     "vector_endpoint",
+    "convex_hull_3d",
+    "ball_volume",
+    "ball_surface_area",
+    "ball_cross_section_radius",
+    "ball_tangent_direction",
+    "cylinder_volume",
+    "cylinder_lateral_surface_area",
+    "cylinder_total_surface_area",
+    "cylinder_axis_vector",
+    "cylinder_cross_section",
+    "CylinderCrossSection",
+    "solid_faces",
+    "solid_volume_centroid",
+    "solid_lateral_surface_area",
+    "solid_total_surface_area",
 ]
 
 _HALF_PI = math.pi / 2.0
@@ -884,3 +903,526 @@ def three_point_azimuth_elevation(
         azimuth_turn = normalize_to_2pi(np.arctan2(bc_e, bc_n) - np.arctan2(ba_e, ba_n))
 
     return azimuth_turn, elevation(b, c) - elevation(b, a)
+
+
+# ---------------------------------------------------------------------------
+# 3-D convex hull → Solid
+# ---------------------------------------------------------------------------
+
+
+def convex_hull_3d(
+    points_3d: Mapping[str, Point],
+    point_ids: Sequence[str],
+    id_factory: IDFactory,
+) -> tuple[Solid, list[Polygon]]:
+    """Convex hull of a 3-D point set as a :class:`Solid` of triangular facets.
+
+    Runs :class:`scipy.spatial.ConvexHull` on the ``(easting, northing,
+    altitude)`` coordinates of the named points (QHull is the Quickhull
+    implementation, Barber et al. 1996). Each hull facet becomes a new triangle
+    :class:`Polygon` referencing the original vertex Point IDs (QHull's
+    ``simplices`` index into the input set, so no new points are minted); the
+    returned :class:`Solid` lists those facet polygons as its ``layers``.
+
+    This is the one service function permitted to mint IDs (design doc §13.12):
+    the number of facets is unknown until QHull runs, so the function takes an
+    :class:`~geometry.utils.id_factory.IDFactory` and calls ``next_id`` for the
+    Solid (``so``) and each facet Polygon (``pg``). The command layer passes
+    ``project.id_factory``.
+
+    Facet triangles are wound so their right-hand normal matches the outward
+    normal QHull reports in ``hull.equations`` — consistent outward orientation
+    across the shell.
+
+    Coplanar fallback (design doc §13.7): if every input point is coplanar in
+    3-D, QHull raises :class:`~scipy.spatial.QhullError`. The function then
+    builds the 2-D hull on ``(easting, northing)`` and returns a *degenerate*
+    Solid with two identical Polygon layers (zero vertical extent, hence zero
+    volume). The caller is expected to flag it via
+    :func:`geometry.services.validation.validate_solid_non_degenerate` against
+    :data:`~geometry.utils.constants.EPS_VOLUME` and warn the user rather than
+    silently storing an invisible zero-extent Solid.
+
+    Parameters
+    ----------
+    points_3d : Mapping[str, Point]
+        Point lookup covering every ID in ``point_ids``.
+    point_ids : Sequence[str]
+        IDs of the input points (a subset of ``points_3d``). At least 4 are
+        required for a 3-D hull.
+    id_factory : IDFactory
+        Allocator for the new Solid and facet Polygon IDs.
+
+    Returns
+    -------
+    tuple[Solid, list[Polygon]]
+        The hull Solid and the list of its facet Polygons, for the command
+        layer to insert into the project store.
+
+    Raises
+    ------
+    ValueError
+        If fewer than 4 point IDs are supplied, or the coplanar fallback's
+        2-D hull is itself degenerate (all points collinear).
+    """
+    ids = list(point_ids)
+    if len(ids) < 4:
+        raise ValueError(f"convex_hull_3d requires at least 4 points; got {len(ids)}")
+    coords = np.array([_xyz(points_3d[pid]) for pid in ids], dtype=np.float64)
+
+    try:
+        hull = ConvexHull(coords)
+    except QhullError:
+        return _coplanar_fallback_solid(coords, ids, id_factory)
+
+    facets: list[Polygon] = []
+    for simplex, equation in zip(hull.simplices, hull.equations):
+        tri = list(simplex)
+        normal = equation[:3]
+        # Orient the triangle so its right-hand normal agrees with QHull's
+        # outward facet normal; QHull's simplex order is not itself consistent.
+        v0, v1, v2 = (coords[tri[0]], coords[tri[1]], coords[tri[2]])
+        if float(np.dot(np.cross(v1 - v0, v2 - v0), normal)) < 0.0:
+            tri = [tri[0], tri[2], tri[1]]
+        facets.append(
+            Polygon(
+                id=id_factory.next_id("pg"),
+                name="hull_facet",
+                alpha=1.0,
+                visibility=True,
+                point_ids=[ids[i] for i in tri],
+                is_convex=True,
+                line_color="#000000",
+                fill_color="#808080",
+            )
+        )
+
+    solid = Solid(
+        id=id_factory.next_id("so"),
+        name="Convex Hull 3D",
+        alpha=1.0,
+        visibility=True,
+        layers=tuple(f.id for f in facets),
+        line_color="#000000",
+        fill_color="#808080",
+    )
+    return solid, facets
+
+
+def _coplanar_fallback_solid(
+    coords: np.ndarray, ids: Sequence[str], id_factory: IDFactory
+) -> tuple[Solid, list[Polygon]]:
+    """Degenerate flat Solid for the coplanar :func:`convex_hull_3d` case.
+
+    Computes the 2-D hull on ``(easting, northing)`` and wraps it in a Solid
+    with two identical Polygon layers (zero extent → zero volume). Raises
+    ``ValueError`` if the 2-D hull is itself degenerate (collinear points).
+    """
+    try:
+        flat = ConvexHull(coords[:, :2])
+    except QhullError as exc:
+        raise ValueError("convex_hull_3d: input points are collinear; no hull exists") from exc
+    hull_ids = [ids[i] for i in flat.vertices]
+    polygon = Polygon(
+        id=id_factory.next_id("pg"),
+        name="hull_facet",
+        alpha=1.0,
+        visibility=True,
+        point_ids=hull_ids,
+        is_convex=True,
+        line_color="#000000",
+        fill_color="#808080",
+    )
+    solid = Solid(
+        id=id_factory.next_id("so"),
+        name="Convex Hull 3D (degenerate)",
+        alpha=1.0,
+        visibility=True,
+        layers=(polygon.id, polygon.id),
+        line_color="#000000",
+        fill_color="#808080",
+    )
+    return solid, [polygon]
+
+
+# ---------------------------------------------------------------------------
+# Ball geometry
+# ---------------------------------------------------------------------------
+
+
+def ball_volume(radius: float) -> np.float64:
+    """Volume of a ball of the given radius: ``(4/3)·π·r³``."""
+    return np.float64(4.0 / 3.0 * math.pi * radius**3)
+
+
+def ball_surface_area(radius: float) -> np.float64:
+    """Surface area of a ball of the given radius: ``4·π·r²``."""
+    return np.float64(4.0 * math.pi * radius**2)
+
+
+def ball_cross_section_radius(ball_radius: float, distance_to_plane: float) -> np.float64 | None:
+    """Radius of a ball's circular cross-section at a given plane distance.
+
+    The intersection of a ball (radius ``r``) with a plane at signed distance
+    ``d`` from its centre is a circle of radius ``√(r² − d²)`` when ``|d| ≤ r``.
+    Returns ``None`` when ``|d| > r`` (the plane misses the ball) so the Slice
+    renderer can skip the ball rather than feed a negative radicand to ``sqrt``
+    (design doc §13.3). A plane tangent to the ball (``|d| = r``) yields ``0.0``.
+
+    Parameters
+    ----------
+    ball_radius : float
+        Ball radius in metres (assumed non-negative).
+    distance_to_plane : float
+        Signed distance from the ball centre to the cutting plane.
+
+    Returns
+    -------
+    numpy.float64 or None
+        The cross-section radius, or ``None`` if the plane does not meet the
+        ball.
+    """
+    if abs(distance_to_plane) > ball_radius:
+        return None
+    return np.sqrt(np.float64(ball_radius) ** 2 - np.float64(distance_to_plane) ** 2)
+
+
+def ball_tangent_direction(center: Point, surface_point: Point) -> np.float64:
+    """Azimuth of the radius from a ball's centre to a point on its surface.
+
+    A ball tangent at ``surface_point`` must be perpendicular to this radius
+    direction; validation enforces ``|dot(tangent_unit, radius_unit)| <
+    EPS_ANGLE`` in 3-D. This returns the horizontal azimuth of the radius in
+    ``[0, 2π)`` (the radius bearing), delegating to :func:`azimuth`.
+
+    Returns
+    -------
+    numpy.float64
+        Radius azimuth in radians in ``[0, 2π)``.
+    """
+    return azimuth(center, surface_point)
+
+
+# ---------------------------------------------------------------------------
+# Cylinder geometry
+# ---------------------------------------------------------------------------
+
+
+def cylinder_volume(radius: float, height: float) -> np.float64:
+    """Volume of a right cylinder: ``π·r²·h``."""
+    return np.float64(math.pi * radius**2 * height)
+
+
+def cylinder_lateral_surface_area(radius: float, height: float) -> np.float64:
+    """Lateral (side) surface area of a cylinder: ``2·π·r·h``."""
+    return np.float64(2.0 * math.pi * radius * height)
+
+
+def cylinder_total_surface_area(radius: float, height: float) -> np.float64:
+    """Total surface area of a closed cylinder: ``2·π·r·h + 2·π·r²``."""
+    return np.float64(2.0 * math.pi * radius * height + 2.0 * math.pi * radius**2)
+
+
+def cylinder_axis_vector(cylinder: Cylinder) -> np.ndarray:
+    """Unit vector along a cylinder's axis in ``(easting, northing, altitude)``.
+
+    Vertical cylinders short-circuit to ``(0, 0, 1)`` without touching
+    ``axis_azimuth`` — which is meaningless in vertical mode and stored as
+    ``0.0`` (design doc §13.2). Inclined cylinders use the azimuth + elevation
+    convention ``(sin(az)·cos(el), cos(az)·cos(el), sin(el))``, matching
+    :func:`vector_endpoint`.
+
+    Returns
+    -------
+    numpy.ndarray
+        Unit axis vector, shape ``(3,)``.
+    """
+    if cylinder.axis_mode == "vertical":
+        return np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    az = cylinder.axis_azimuth
+    el = cylinder.axis_elevation
+    cos_el = math.cos(el)
+    return np.array(
+        [math.sin(az) * cos_el, math.cos(az) * cos_el, math.sin(el)],
+        dtype=np.float64,
+    )
+
+
+@dataclass(frozen=True)
+class CylinderCrossSection:
+    """Shape of a planar slice through a cylinder.
+
+    Fields
+    ------
+    kind : str
+        One of ``"circle"``, ``"ellipse"``, or ``"rectangle"``.
+    dimensions : tuple[float, ...]
+        Geometry of the cross-section, by ``kind``:
+
+        * ``"circle"`` — ``(radius,)``.
+        * ``"ellipse"`` — ``(semi_major, semi_minor)`` where ``semi_minor`` is
+          the cylinder radius and ``semi_major = radius / cos(θ)`` for cut
+          angle ``θ`` between the plane normal and the cylinder axis.
+        * ``"rectangle"`` — ``(width, height)`` = ``(2·radius, height)`` for a
+          plane parallel to the axis.
+    """
+
+    kind: str
+    dimensions: tuple[float, ...]
+
+
+def cylinder_cross_section(cylinder: Cylinder, plane_normal: np.ndarray) -> CylinderCrossSection:
+    """Classify and size the cross-section of a cylinder cut by a plane.
+
+    The shape is governed by the angle ``θ`` between the cutting plane's normal
+    and the cylinder axis:
+
+    * normal **parallel** to the axis (cut perpendicular to the axis) → a
+      **circle** of radius ``r``;
+    * normal **perpendicular** to the axis (cut parallel to the axis) → a
+      **rectangle** ``2r`` wide and ``h`` tall;
+    * otherwise → an **ellipse** with semi-minor axis ``r`` and semi-major axis
+      ``r / cos(θ)``.
+
+    The parallel/perpendicular thresholds use :data:`EPS_ANGLE`.
+
+    Parameters
+    ----------
+    cylinder : Cylinder
+        Source cylinder (provides ``radius``, ``height``, and axis).
+    plane_normal : numpy.ndarray
+        Normal vector of the cutting plane, shape ``(3,)``. Need not be unit
+        length; it is normalised internally.
+
+    Returns
+    -------
+    CylinderCrossSection
+        The classified cross-section and its dimensions.
+
+    Raises
+    ------
+    ValueError
+        If ``plane_normal`` has (near) zero length, so its direction — and the
+        cut angle — is undefined.
+    """
+    axis = cylinder_axis_vector(cylinder)
+    normal = np.asarray(plane_normal, dtype=np.float64)
+    norm = float(np.linalg.norm(normal))
+    if norm < EPS_DISTANCE:
+        raise ValueError("cylinder_cross_section: plane_normal has zero length")
+    cos_theta = abs(float(np.dot(axis, normal / norm)))
+    theta = math.acos(min(1.0, cos_theta))
+    r = float(cylinder.radius)
+    if theta < EPS_ANGLE:
+        return CylinderCrossSection("circle", (r,))
+    if abs(theta - _HALF_PI) < EPS_ANGLE:
+        return CylinderCrossSection("rectangle", (2.0 * r, float(cylinder.height)))
+    return CylinderCrossSection("ellipse", (r / math.cos(theta), r))
+
+
+# ---------------------------------------------------------------------------
+# Solid geometry (Mirtich 1996 polyhedral mass properties)
+# ---------------------------------------------------------------------------
+
+
+def _solid_layer_rings(
+    solid: Solid,
+    objects: Mapping[str, GeoObject],
+    points: Mapping[str, Point],
+) -> list[tuple[bool, list[np.ndarray]]]:
+    """Resolve a Solid's layer stack to ``(is_point, vertices)`` per layer.
+
+    Each polygon layer yields ``(False, [v0, v1, ...])`` of ``(3,)`` vertex
+    arrays in stored order; each point (apex/nadir) layer yields
+    ``(True, [vertex])``.
+    """
+    rings: list[tuple[bool, list[np.ndarray]]] = []
+    for layer_id in solid.layers:
+        if layer_id.startswith("pt_"):
+            rings.append((True, [_xyz(points[layer_id])]))
+        else:
+            polygon = objects[layer_id]
+            rings.append((False, [_xyz(points[pid]) for pid in polygon.point_ids]))
+    return rings
+
+
+def _lateral_faces(
+    lower: tuple[bool, list[np.ndarray]], upper: tuple[bool, list[np.ndarray]]
+) -> list[list[np.ndarray]]:
+    """Outward-wound lateral faces between two adjacent layers.
+
+    Handles equal-vertex-count polygon bands (quads) and the apex cases (a
+    point layer on either side → triangle fan). Bands between polygons of
+    *differing* vertex counts are rejected — the vertex correspondence is
+    ambiguous and outside this issue's scope.
+    """
+    lower_is_pt, low = lower
+    upper_is_pt, up = upper
+    faces: list[list[np.ndarray]] = []
+    if upper_is_pt:
+        apex = up[0]
+        n = len(low)
+        for i in range(n):
+            faces.append([low[i], low[(i + 1) % n], apex])
+    elif lower_is_pt:
+        apex = low[0]
+        n = len(up)
+        for i in range(n):
+            faces.append([apex, up[(i + 1) % n], up[i]])
+    else:
+        if len(low) != len(up):
+            raise ValueError(
+                "solid lateral band between polygons of differing vertex counts is not supported"
+            )
+        n = len(low)
+        for i in range(n):
+            faces.append([low[i], low[(i + 1) % n], up[(i + 1) % n], up[i]])
+    return faces
+
+
+def solid_faces(
+    solid: Solid,
+    objects: Mapping[str, GeoObject],
+    points: Mapping[str, Point],
+) -> list[list[np.ndarray]]:
+    """Closed B-rep of a Solid as a list of outward-wound polygon faces.
+
+    Builds the boundary representation from the layer stack (design doc §13.8):
+    a bottom cap (first layer, reversed so its normal faces down/outward), a
+    top cap (last layer, kept as stored so its normal faces up/outward), and
+    the lateral faces between every pair of adjacent layers. Point (apex/nadir)
+    end layers have no cap; their band is a triangle fan. All faces are wound
+    with consistent outward normals so the divergence-theorem volume in
+    :func:`solid_volume_centroid` is sign-consistent.
+
+    Parameters
+    ----------
+    solid : Solid
+        The solid whose layer stack is converted.
+    objects : Mapping[str, GeoObject]
+        Object lookup resolving each polygon layer ID to its Polygon.
+    points : Mapping[str, Point]
+        Point lookup resolving every vertex ID.
+
+    Returns
+    -------
+    list[list[numpy.ndarray]]
+        Faces, each a list of ``(3,)`` vertex arrays.
+
+    Raises
+    ------
+    ValueError
+        If a lateral band joins polygons of differing vertex counts.
+    """
+    caps, laterals = _solid_brep(solid, objects, points)
+    return caps + laterals
+
+
+def _solid_brep(
+    solid: Solid,
+    objects: Mapping[str, GeoObject],
+    points: Mapping[str, Point],
+) -> tuple[list[list[np.ndarray]], list[list[np.ndarray]]]:
+    """Return ``(cap_faces, lateral_faces)`` of a Solid's closed B-rep."""
+    rings = _solid_layer_rings(solid, objects, points)
+    caps: list[list[np.ndarray]] = []
+    first_is_pt, first = rings[0]
+    last_is_pt, last = rings[-1]
+    if not first_is_pt:
+        caps.append(list(reversed(first)))  # bottom cap: outward normal points down
+    if not last_is_pt:
+        caps.append(list(last))  # top cap: outward normal points up
+    laterals: list[list[np.ndarray]] = []
+    for lower, upper in zip(rings, rings[1:]):
+        laterals.extend(_lateral_faces(lower, upper))
+    return caps, laterals
+
+
+def _face_area_vector(face: Sequence[np.ndarray]) -> np.ndarray:
+    """Newell area vector of a planar polygon face (½·Σ vᵢ × vᵢ₊₁)."""
+    total = np.zeros(3, dtype=np.float64)
+    n = len(face)
+    for i in range(n):
+        total += np.cross(face[i], face[(i + 1) % n])
+    return 0.5 * total
+
+
+def _face_area(face: Sequence[np.ndarray]) -> np.float64:
+    """Area of a planar polygon face."""
+    return np.float64(np.linalg.norm(_face_area_vector(face)))
+
+
+def solid_volume_centroid(
+    solid: Solid,
+    objects: Mapping[str, GeoObject],
+    points: Mapping[str, Point],
+) -> tuple[np.float64, np.ndarray]:
+    """Volume and centroid of a Solid (Mirtich 1996 polyhedral mass properties).
+
+    Builds the closed B-rep via :func:`solid_faces`, fan-triangulates each
+    face, and accumulates the signed-tetrahedron decomposition from the origin
+    — the divergence-theorem surface integral underlying Mirtich's method. The
+    volume is ``Σ (p₀ · (p₁ × p₂)) / 6`` over the triangles; the centroid is the
+    volume-weighted mean of the tetra centroids ``(p₀+p₁+p₂)/4``.
+
+    Because every face is consistently wound (:func:`solid_faces`), the signed
+    volume's global sign is uniform: the reported volume is its magnitude, and
+    the centroid ``ΣC / ΣV`` is correct regardless of whether the shell is
+    globally inward- or outward-oriented (both numerator and denominator share
+    the sign).
+
+    A degenerate (coplanar, zero-extent) Solid returns volume ``0.0``; callers
+    gate on it via
+    :func:`geometry.services.validation.validate_solid_non_degenerate` against
+    :data:`~geometry.utils.constants.EPS_VOLUME`. The volume agrees with the
+    Wuttke (2021) Eq. 22 form-factor cross-check ``(1/3)·Σ Ar(face)·r_perp``.
+
+    Parameters
+    ----------
+    solid : Solid
+        The solid to measure.
+    objects : Mapping[str, GeoObject]
+        Object lookup resolving polygon layers.
+    points : Mapping[str, Point]
+        Point lookup resolving vertices.
+
+    Returns
+    -------
+    tuple[numpy.float64, numpy.ndarray]
+        ``(volume, centroid)`` — non-negative volume in cubic metres and the
+        ``(easting, northing, altitude)`` centroid, shape ``(3,)``. The
+        centroid of a zero-volume Solid is the origin ``(0, 0, 0)``.
+    """
+    signed_v = np.float64(0.0)
+    moment = np.zeros(3, dtype=np.float64)
+    for face in solid_faces(solid, objects, points):
+        v0 = face[0]
+        for i in range(1, len(face) - 1):
+            v1 = face[i]
+            v2 = face[i + 1]
+            tetra = float(np.dot(v0, np.cross(v1, v2))) / 6.0
+            signed_v += tetra
+            moment += tetra * (v0 + v1 + v2) / 4.0
+    if abs(signed_v) < EPS_VOLUME:
+        return np.float64(0.0), np.zeros(3, dtype=np.float64)
+    return np.float64(abs(signed_v)), moment / signed_v
+
+
+def solid_lateral_surface_area(
+    solid: Solid,
+    objects: Mapping[str, GeoObject],
+    points: Mapping[str, Point],
+) -> np.float64:
+    """Total area of a Solid's lateral faces (the bands between layers)."""
+    _, laterals = _solid_brep(solid, objects, points)
+    return np.float64(sum(_face_area(f) for f in laterals))
+
+
+def solid_total_surface_area(
+    solid: Solid,
+    objects: Mapping[str, GeoObject],
+    points: Mapping[str, Point],
+) -> np.float64:
+    """Total surface area of a Solid: lateral bands plus the cap faces."""
+    caps, laterals = _solid_brep(solid, objects, points)
+    return np.float64(sum(_face_area(f) for f in caps + laterals))
