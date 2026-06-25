@@ -1218,8 +1218,15 @@ def ball_cross_section_radius(ball_radius: float, distance_to_plane: float) -> n
         always true and the function would silently return ``None``, masking
         the corrupt input instead of rejecting it (consistent with
         :func:`ball_volume` and the other ball/cylinder measures).
+    ValueError
+        If ``distance_to_plane`` is non-finite. A ``nan`` distance makes the
+        miss-guard ``abs(distance_to_plane) > ball_radius`` evaluate ``False``,
+        so the function would return ``sqrt(r² − nan) = nan`` and corrupt the
+        ``None``-means-"plane misses ball" contract.
     """
     _require_non_negative_radius(ball_radius)
+    if not math.isfinite(distance_to_plane):
+        raise ValueError(f"distance_to_plane must be finite; got {distance_to_plane!r}")
     if abs(distance_to_plane) > ball_radius:
         return None
     return np.sqrt(np.float64(ball_radius) ** 2 - np.float64(distance_to_plane) ** 2)
@@ -1465,6 +1472,12 @@ def cylinder_cross_section(cylinder: Cylinder, plane_normal: np.ndarray) -> Cyli
     ValueError
         If ``plane_normal`` has (near) zero length, so its direction — and the
         cut angle — is undefined.
+    ValueError
+        If ``plane_normal`` contains a non-finite component (``nan`` or
+        ``±inf``). A ``nan`` component bypasses the zero-length guard (``norm``
+        is ``nan`` and ``nan < EPS_DISTANCE`` is ``False``), then ``cos_theta``
+        clamps to ``1.0`` and the function would fabricate an exact ``circle``
+        result from corrupt input.
 
     Notes
     -----
@@ -1482,6 +1495,10 @@ def cylinder_cross_section(cylinder: Cylinder, plane_normal: np.ndarray) -> Cyli
     """
     axis = cylinder_axis_vector(cylinder)
     normal = np.asarray(plane_normal, dtype=np.float64)
+    if not np.all(np.isfinite(normal)):
+        raise ValueError(
+            f"cylinder_cross_section: plane_normal contains nan or ±inf; got {plane_normal!r}"
+        )
     norm = float(np.linalg.norm(normal))
     if norm < EPS_DISTANCE:
         raise ValueError("cylinder_cross_section: plane_normal has zero length")
@@ -1809,7 +1826,18 @@ def solid_lateral_surface_area(
     objects: Mapping[str, GeoObject],
     points: Mapping[str, Point],
 ) -> np.float64:
-    """Total area of a Solid's lateral faces (the bands between layers)."""
+    """Total area of a Solid's lateral faces (the bands between layers).
+
+    Raises
+    ------
+    ValueError
+        If ``solid`` is a convex-hull facet shell rather than a cross-section
+        stack, or its layers yield bands with differing vertex counts
+        (propagated from :func:`_solid_brep`). The underlying B-rep also
+        asserts at least two layers, but :meth:`Solid.__post_init__` already
+        rejects a 0- or 1-layer Solid at construction, so a real Solid can
+        never trigger that path.
+    """
     _, laterals = _solid_brep(solid, objects, points)
     return np.float64(sum(_face_area(f) for f in laterals))
 
@@ -1819,6 +1847,17 @@ def solid_total_surface_area(
     objects: Mapping[str, GeoObject],
     points: Mapping[str, Point],
 ) -> np.float64:
-    """Total surface area of a Solid: lateral bands plus the cap faces."""
+    """Total surface area of a Solid: lateral bands plus the cap faces.
+
+    Raises
+    ------
+    ValueError
+        If ``solid`` is a convex-hull facet shell rather than a cross-section
+        stack, or its layers yield bands with differing vertex counts
+        (propagated from :func:`_solid_brep`). The underlying B-rep also
+        asserts at least two layers, but :meth:`Solid.__post_init__` already
+        rejects a 0- or 1-layer Solid at construction, so a real Solid can
+        never trigger that path.
+    """
     caps, laterals = _solid_brep(solid, objects, points)
     return np.float64(sum(_face_area(f) for f in caps + laterals))

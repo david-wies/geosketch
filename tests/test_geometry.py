@@ -1176,6 +1176,24 @@ def test_ball_cross_section_radius_zero_radius_only_meets_at_center():
     assert geo.ball_cross_section_radius(0.0, 1.0) is None
 
 
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf], ids=["nan", "inf", "-inf"])
+def test_ball_cross_section_radius_rejects_non_finite_distance(bad):
+    # A non-finite ``distance_to_plane`` must fail loud. ``nan`` makes the miss
+    # guard ``abs(distance) > ball_radius`` evaluate False, so the function would
+    # otherwise return ``sqrt(r² − nan) = nan`` and corrupt the
+    # ``None``-means-"plane misses ball" contract; ``±inf`` is non-physical for a
+    # signed plane distance. The guard rejects all three with a clear message.
+    with pytest.raises(ValueError, match="distance_to_plane must be finite"):
+        geo.ball_cross_section_radius(5.0, bad)
+
+
+def test_ball_cross_section_radius_finite_normal_and_miss():
+    # Confirms the guard left the normal contract intact: an in-range distance
+    # still returns √(r² − d²) and an out-of-range distance still returns None.
+    assert geo.ball_cross_section_radius(5.0, 3.0) == pytest.approx(4.0)  # √(25 − 9)
+    assert geo.ball_cross_section_radius(5.0, 7.0) is None  # |d| > r → plane misses
+
+
 def test_ball_tangent_direction_azimuth():
     center = _pt("c", 0, 0, 0.0)
     assert geo.ball_tangent_direction(center, _pt("n", 0, 1, 0.0)) == pytest.approx(0.0)
@@ -1258,6 +1276,18 @@ def test_cylinder_cross_section_zero_normal_raises():
         geo.cylinder_cross_section(_cyl("vertical"), np.array([0.0, 0.0, 0.0]))
 
 
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf], ids=["nan", "inf", "-inf"])
+def test_cylinder_cross_section_non_finite_normal_raises(bad):
+    # A non-finite component in ``plane_normal`` must fail loud. A ``nan``
+    # component bypasses the zero-length guard (``norm`` is ``nan`` and
+    # ``nan < EPS_DISTANCE`` is False), after which ``cos_theta`` clamps to 1.0
+    # and the function would fabricate an exact ``circle`` from corrupt input.
+    # The up-front ``np.isfinite`` screen rejects it instead.
+    normal = np.array([bad, 0.0, 1.0], dtype=np.float64)
+    with pytest.raises(ValueError, match=r"nan or ±inf"):
+        geo.cylinder_cross_section(_cyl("vertical"), normal)
+
+
 # ---------------------------------------------------------------------------
 # Solid volume / centroid / area (Mirtich 1996)
 # ---------------------------------------------------------------------------
@@ -1299,7 +1329,22 @@ def test_solid_lateral_surface_area_unit_cube():
     assert geo.solid_lateral_surface_area(solid, objects, pts) == pytest.approx(4.0)
 
 
-def test_solid_lateral_band_differing_vertex_counts_raises():
+@pytest.mark.parametrize(
+    "func",
+    [
+        geo.solid_volume_centroid,
+        geo.solid_lateral_surface_area,
+        geo.solid_total_surface_area,
+    ],
+    ids=["volume_centroid", "lateral_area", "total_area"],
+)
+def test_solid_lateral_band_differing_vertex_counts_raises(func):
+    # A 4-vertex bottom square stacked under a 3-vertex top triangle yields a
+    # lateral band whose vertex correspondence is ambiguous; ``_lateral_faces``
+    # rejects the differing-count band. All three measurement entry points reach
+    # that band via ``_solid_brep``, so each must surface the same ``ValueError``
+    # — parametrized rather than copied so a future divergence in one path is
+    # caught without duplicating the build.
     pts = {
         "pb0": _pt("pb0", 0, 0, 0.0),
         "pb1": _pt("pb1", 2, 0, 0.0),
@@ -1313,8 +1358,54 @@ def test_solid_lateral_band_differing_vertex_counts_raises():
         "pg_b": _poly("pg_b", ("pb0", "pb1", "pb2", "pb3")),
         "pg_t": _poly("pg_t", ("pt0", "pt1", "pt2")),
     }
-    with pytest.raises(ValueError):
-        geo.solid_volume_centroid(_solid(("pg_b", "pg_t")), objects, pts)
+    with pytest.raises(ValueError, match="differing vertex counts"):
+        func(_solid(("pg_b", "pg_t")), objects, pts)
+
+
+def _frustum():
+    """Return (solid, objects, points) for a truncated square pyramid (frustum).
+
+    Two *differently sized* squares are stacked with equal vertex counts and
+    positional correspondence (``low[i]`` over ``up[i]``): a 2×2 bottom centred
+    on the origin at ``z=0`` and a 1×1 top centred on the origin at ``z=1``. The
+    existing quad-band fixtures (``_unit_cube``) use two identical footprints, so
+    their slanted quads degenerate to vertical rectangles; a frustum forces the
+    genuinely *slanted* quad builder and the multi-band ``zip(rings, rings[1:])``
+    loop to run together over non-congruent rings.
+
+    Closed-form volume
+    ------------------
+    A frustum of height ``h`` between parallel areas ``A₁`` (bottom) and ``A₂``
+    (top) has volume ``h/3·(A₁ + A₂ + √(A₁·A₂))``. Here ``A₁ = 4``, ``A₂ = 1``,
+    ``h = 1`` → ``1/3·(4 + 1 + 2) = 7/3``.
+    """
+    pts = {
+        "pb0": _pt("pb0", -1, -1, 0.0),
+        "pb1": _pt("pb1", 1, -1, 0.0),
+        "pb2": _pt("pb2", 1, 1, 0.0),
+        "pb3": _pt("pb3", -1, 1, 0.0),
+        "pt0": _pt("pt0", -0.5, -0.5, 1.0),
+        "pt1": _pt("pt1", 0.5, -0.5, 1.0),
+        "pt2": _pt("pt2", 0.5, 0.5, 1.0),
+        "pt3": _pt("pt3", -0.5, 0.5, 1.0),
+    }
+    bottom = _poly("pg_b", ("pb0", "pb1", "pb2", "pb3"))
+    top = _poly("pg_t", ("pt0", "pt1", "pt2", "pt3"))
+    solid = _solid(("pg_b", "pg_t"))
+    objects = {"pg_b": bottom, "pg_t": top}
+    return solid, objects, pts
+
+
+def test_solid_volume_frustum_matches_closed_form():
+    # Truncated square pyramid: bottom area A1=4, top area A2=1, height h=1.
+    # Frustum volume = h/3·(A1 + A2 + √(A1·A2)) = 1/3·(4 + 1 + 2) = 7/3. This
+    # exercises the slanted-quad lateral builder over differently sized rings,
+    # which the identical-footprint cube fixtures cannot.
+    solid, objects, pts = _frustum()
+    a1, a2, h = 4.0, 1.0, 1.0
+    expected = h / 3.0 * (a1 + a2 + math.sqrt(a1 * a2))
+    volume, _ = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(expected)
 
 
 # ---------------------------------------------------------------------------
