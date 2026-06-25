@@ -1181,6 +1181,15 @@ def test_ball_tangent_direction_azimuth():
     assert geo.ball_tangent_direction(center, _pt("e", 1, 0, 0.0)) == pytest.approx(math.pi / 2)
 
 
+def test_ball_tangent_direction_ignores_surface_point_altitude():
+    # The returned bearing is the *horizontal* azimuth of the radius and must not
+    # depend on the surface point's altitude. A north-and-up surface point yields
+    # the same azimuth (0) as a flat one; an east-and-up point yields π/2.
+    center = _pt("c", 0, 0, 0.0)
+    assert geo.ball_tangent_direction(center, _pt("nu", 0, 1, 7.0)) == pytest.approx(0.0)
+    assert geo.ball_tangent_direction(center, _pt("eu", 1, 0, 7.0)) == pytest.approx(math.pi / 2)
+
+
 # ---------------------------------------------------------------------------
 # Cylinder geometry
 # ---------------------------------------------------------------------------
@@ -1209,22 +1218,38 @@ def test_cylinder_axis_vector_inclined():
     assert np.allclose(geo.cylinder_axis_vector(cyl), [inv_sqrt2, 0.0, inv_sqrt2])
 
 
+def test_cylinder_axis_vector_inclined_pins_sin_cos_swap():
+    # az=π/6 gives sin(az)=0.5 ≠ cos(az)=√3/2, both nonzero, so this pins which
+    # trig term maps to which axis (domain invariant #7's sin/cos swap): easting
+    # is the SIN term, northing the COS term — a case az=π/2 cannot distinguish.
+    cyl = _cyl("inclined", az=math.pi / 6, el=math.pi / 6)
+    cos_el = math.cos(math.pi / 6)
+    expected = [0.5 * cos_el, (math.sqrt(3.0) / 2.0) * cos_el, 0.5]
+    assert np.allclose(geo.cylinder_axis_vector(cyl), expected)
+
+
 def test_cylinder_cross_section_circle():
     cs = geo.cylinder_cross_section(_cyl("vertical"), np.array([0.0, 0.0, 1.0]))
     assert cs.kind == "circle"
     assert cs.dimensions == pytest.approx((2.0,))
+    # Perpendicular cut: radius r regardless of offset → exact.
+    assert cs.approximate is False
 
 
 def test_cylinder_cross_section_rectangle():
     cs = geo.cylinder_cross_section(_cyl("vertical"), np.array([1.0, 0.0, 0.0]))
     assert cs.kind == "rectangle"
     assert cs.dimensions == pytest.approx((4.0, 5.0))
+    # Full 2r width assumes a through-axis plane → simplified.
+    assert cs.approximate is True
 
 
 def test_cylinder_cross_section_ellipse():
     cs = geo.cylinder_cross_section(_cyl("vertical"), np.array([1.0, 0.0, 1.0]))
     assert cs.kind == "ellipse"
     assert cs.dimensions == pytest.approx((2.0 * math.sqrt(2.0), 2.0))
+    # Span depends on the perpendicular offset → simplified.
+    assert cs.approximate is True
 
 
 def test_cylinder_cross_section_zero_normal_raises():
@@ -1415,6 +1440,36 @@ def test_solid_volume_centroid_accepts_legitimate_stack():
     solid, objects, pts = _unit_cube()
     volume, _ = geo.solid_volume_centroid(solid, objects, pts)
     assert volume == pytest.approx(1.0)
+
+
+def test_solid_surface_areas_reject_hull_facet_shell():
+    # Both surface-area functions go through the same _solid_brep /
+    # _ensure_solid_is_stack guard as solid_volume_centroid, so a B-rep facet
+    # shell (cube vertices shared by 3+ facets) must be rejected there too, not
+    # silently summed into a meaningless area.
+    pts = {
+        f"p{i}": _pt(f"p{i}", x, y, z)
+        for i, (x, y, z) in enumerate(
+            [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
+        )
+    }
+    solid, facets = geo.convex_hull_3d(pts, list(pts), IDFactory())
+    objects = {f.id: f for f in facets}
+    with pytest.raises(ValueError, match="facet shell"):
+        geo.solid_lateral_surface_area(solid, objects, pts)
+    with pytest.raises(ValueError, match="facet shell"):
+        geo.solid_total_surface_area(solid, objects, pts)
+
+
+def test_solid_volume_centroid_tetrahedron_offcenter():
+    # A unit cube's centroid is symmetric, so abs(volume) masks a moment-sign
+    # bug. A tetrahedron is asymmetric: its centroid is the mean of its 4
+    # vertices — base (0,0,0),(1,0,0),(0,1,0) + apex (0,0,3) → (0.25, 0.25, 0.75)
+    # — which exposes any sign error in the centroid moment accumulation.
+    solid, objects, pts = _tetra(height=3.0)
+    volume, centroid = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(0.5)
+    assert centroid == pytest.approx([0.25, 0.25, 0.75])
 
 
 # ---------------------------------------------------------------------------
@@ -1671,6 +1726,52 @@ def test_cylinder_cross_section_rejects_unknown_kind():
 def test_cylinder_cross_section_rejects_non_positive_dimensions(kind, dimensions):
     with pytest.raises(ValueError, match="finite and > 0"):
         geo.CylinderCrossSection(kind, dimensions)
+
+
+def test_cylinder_cross_section_rejects_ellipse_semi_major_lt_minor():
+    with pytest.raises(ValueError, match="semi_major must be >= semi_minor"):
+        geo.CylinderCrossSection("ellipse", (1.0, 2.0))
+
+
+def test_cylinder_cross_section_allows_ellipse_equal_axes():
+    cs = geo.CylinderCrossSection("ellipse", (2.0, 2.0))
+    assert cs.semi_major == 2.0
+    assert cs.semi_minor == 2.0
+
+
+def test_cylinder_cross_section_default_approximate_is_false():
+    assert geo.CylinderCrossSection("circle", (1.0,)).approximate is False
+
+
+# ---------------------------------------------------------------------------
+# CylinderCrossSection read-only accessors
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("cs", "valid", "invalid"),
+    [
+        # ``radius`` of an ellipse is its semi-minor axis (the cylinder radius).
+        (geo.CylinderCrossSection("circle", (3.0,)), {"radius": 3.0}, ["semi_major", "width"]),
+        (
+            geo.CylinderCrossSection("ellipse", (5.0, 3.0)),
+            {"semi_major": 5.0, "semi_minor": 3.0, "radius": 3.0},
+            ["width", "height"],
+        ),
+        (
+            geo.CylinderCrossSection("rectangle", (4.0, 5.0)),
+            {"width": 4.0, "height": 5.0},
+            ["radius", "semi_major", "semi_minor"],
+        ),
+    ],
+    ids=["circle", "ellipse", "rectangle"],
+)
+def test_cross_section_accessors(cs, valid, invalid):
+    for attr, expected in valid.items():
+        assert getattr(cs, attr) == expected
+    for attr in invalid:
+        with pytest.raises(AttributeError):
+            getattr(cs, attr)
 
 
 # ---------------------------------------------------------------------------

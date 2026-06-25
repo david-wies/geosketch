@@ -66,6 +66,7 @@ that invariant, not a recoverable condition.
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -119,6 +120,8 @@ __all__ = [
     "solid_lateral_surface_area",
     "solid_total_surface_area",
 ]
+
+_logger = logging.getLogger(__name__)
 
 _HALF_PI = math.pi / 2.0
 
@@ -1015,9 +1018,14 @@ def convex_hull_3d(
 
     try:
         hull = ConvexHull(coords)
-    except QhullError:
+    except QhullError as exc:
         # Reached only for a genuinely degenerate/precision-borderline set that
         # passed the rank screen; fall back to the flat 2-D hull.
+        _logger.warning(
+            "convex_hull_3d: a rank-3 point set failed QHull on a "
+            "precision/degeneracy borderline; routing to the flat 2-D fallback.",
+            exc_info=exc,
+        )
         return _coplanar_fallback_solid(coords, ids, id_factory)
 
     facets: list[Polygon] = []
@@ -1050,16 +1058,18 @@ def convex_hull_3d(
     # shell; it is NOT a valid input to solid_volume_centroid / solid_faces /
     # solid_lateral_surface_area, which assume a monotonic bottom-to-top stack
     # and explicitly reject a facet shell (see _ensure_solid_is_stack).
-    solid = Solid(
-        id=id_factory.next_id("so"),
-        name="Convex Hull 3D",
-        alpha=1.0,
-        visibility=True,
-        layers=tuple(f.id for f in facets),
-        line_color="#000000",
-        fill_color="#808080",
+    return (
+        Solid(
+            id=id_factory.next_id("so"),
+            name="Convex Hull 3D",
+            alpha=1.0,
+            visibility=True,
+            layers=tuple(f.id for f in facets),
+            line_color="#000000",
+            fill_color="#808080",
+        ),
+        facets,
     )
-    return solid, facets
 
 
 def _coplanar_fallback_solid(
@@ -1327,21 +1337,30 @@ class CylinderCrossSection:
         * ``"circle"`` — ``(radius,)`` (arity 1).
         * ``"ellipse"`` — ``(semi_major, semi_minor)`` (arity 2) where
           ``semi_minor`` is the cylinder radius and
-          ``semi_major = radius / cos(θ)`` for cut angle ``θ`` between the plane
-          normal and the cylinder axis.
+          ``semi_major = radius / cos(θ) >= semi_minor`` for cut angle ``θ``
+          between the plane normal and the cylinder axis (``semi_major >=
+          semi_minor`` is enforced at construction).
         * ``"rectangle"`` — ``(width, height)`` = ``(2·radius, height)`` (arity
           2) for a plane parallel to the axis.
+    approximate : bool
+        ``True`` when the dimensions are a *through-axis* simplification that
+        ignores the cutting plane's offset and may overstate the true chord;
+        ``False`` when exact. :func:`cylinder_cross_section` sets it ``True`` for
+        the offset-dependent ``ellipse``/``rectangle`` cases and ``False`` for
+        the ``circle`` case (radius ``r`` regardless of offset). Defaults to
+        ``False`` so positional two-argument construction stays valid.
 
     Raises
     ------
     ValueError
         If ``kind`` is not one of the three valid tags, if ``dimensions`` has
-        the wrong arity for ``kind``, or if any dimension is non-finite or
-        ``<= 0``.
+        the wrong arity for ``kind``, if any dimension is non-finite or
+        ``<= 0``, or if an ``ellipse`` has ``semi_major < semi_minor``.
     """
 
     kind: Literal["circle", "ellipse", "rectangle"]
     dimensions: tuple[float, ...]
+    approximate: bool = False
 
     def __post_init__(self) -> None:
         expected = _CROSS_SECTION_ARITY.get(self.kind)
@@ -1361,6 +1380,48 @@ class CylinderCrossSection:
                     f"CylinderCrossSection {self.kind!r} dimensions must be "
                     f"finite and > 0; got {self.dimensions!r}"
                 )
+        if self.kind == "ellipse" and self.dimensions[0] < self.dimensions[1]:
+            raise ValueError(
+                f"CylinderCrossSection ellipse semi_major must be >= semi_minor; "
+                f"got {self.dimensions!r}"
+            )
+
+    @property
+    def radius(self) -> float:
+        """Cylinder radius — ``circle`` or ``ellipse`` semi-minor; raises for ``rectangle``."""
+        if self.kind == "circle":
+            return self.dimensions[0]
+        if self.kind == "ellipse":
+            return self.dimensions[1]
+        raise AttributeError(f"{self.kind!r} cross-section has no radius")
+
+    @property
+    def semi_major(self) -> float:
+        """Semi-major axis — ``ellipse`` only; raises ``AttributeError`` otherwise."""
+        if self.kind == "ellipse":
+            return self.dimensions[0]
+        raise AttributeError(f"{self.kind!r} cross-section has no semi_major axis")
+
+    @property
+    def semi_minor(self) -> float:
+        """Semi-minor axis (cylinder radius) — ``ellipse`` only; raises otherwise."""
+        if self.kind == "ellipse":
+            return self.dimensions[1]
+        raise AttributeError(f"{self.kind!r} cross-section has no semi_minor axis")
+
+    @property
+    def width(self) -> float:
+        """Width (``2·radius``) — ``rectangle`` only; raises ``AttributeError`` otherwise."""
+        if self.kind == "rectangle":
+            return self.dimensions[0]
+        raise AttributeError(f"{self.kind!r} cross-section has no width")
+
+    @property
+    def height(self) -> float:
+        """Height (cylinder height) — ``rectangle`` only; raises ``AttributeError`` otherwise."""
+        if self.kind == "rectangle":
+            return self.dimensions[1]
+        raise AttributeError(f"{self.kind!r} cross-section has no height")
 
 
 def cylinder_cross_section(cylinder: Cylinder, plane_normal: np.ndarray) -> CylinderCrossSection:
@@ -1415,6 +1476,10 @@ def cylinder_cross_section(cylinder: Cylinder, plane_normal: np.ndarray) -> Cyli
     actually yields a narrower chord — width ``2·√(r² − d²)`` rather than
     ``2r`` — which this function does not model. See
     ``docs/implementation-design.md`` §13.x for the slice-offset treatment.
+
+    The returned ``approximate`` flag reflects this: ``True`` for the
+    offset-dependent ``ellipse``/``rectangle`` cases and ``False`` for the exact
+    ``circle`` case, so callers can distinguish an exact slice from this one.
     """
     axis = cylinder_axis_vector(cylinder)
     normal = np.asarray(plane_normal, dtype=np.float64)
@@ -1428,11 +1493,15 @@ def cylinder_cross_section(cylinder: Cylinder, plane_normal: np.ndarray) -> Cyli
     # Classify in the well-conditioned cos-θ domain (see docstring), never on
     # acos(cos_theta): near the endpoints acos amplifies error past float64
     # resolution and misclassifies realistic inclined normals as ellipses.
+    # ``approximate``: circle radius is offset-independent (exact); the ellipse
+    # and rectangle spans assume a through-axis plane (simplified).
     if (1.0 - cos_theta) < EPS_ANGLE:  # normal ∥ axis → perpendicular cut
-        return CylinderCrossSection("circle", (r,))
+        return CylinderCrossSection("circle", (r,), approximate=False)
     if cos_theta < EPS_ANGLE:  # normal ⊥ axis → parallel cut
-        return CylinderCrossSection("rectangle", (2.0 * r, float(cylinder.height)))
-    return CylinderCrossSection("ellipse", (r / cos_theta, r))
+        return CylinderCrossSection(
+            "rectangle", (2.0 * r, float(cylinder.height)), approximate=True
+        )
+    return CylinderCrossSection("ellipse", (r / cos_theta, r), approximate=True)
 
 
 # ---------------------------------------------------------------------------
