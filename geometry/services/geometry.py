@@ -1026,7 +1026,12 @@ def convex_hull_3d(
             "precision/degeneracy borderline; routing to the flat 2-D fallback.",
             exc_info=exc,
         )
-        return _coplanar_fallback_solid(coords, ids, id_factory)
+        return _coplanar_fallback_solid(
+            coords,
+            ids,
+            id_factory,
+            name="Convex Hull 3D (QHull failure — degenerate)",
+        )
 
     facets: list[Polygon] = []
     for simplex, equation in zip(hull.simplices, hull.equations):
@@ -1073,13 +1078,40 @@ def convex_hull_3d(
 
 
 def _coplanar_fallback_solid(
-    coords: np.ndarray, ids: Sequence[str], id_factory: IDFactory
+    coords: np.ndarray,
+    ids: Sequence[str],
+    id_factory: IDFactory,
+    name: str = "Convex Hull 3D (degenerate)",
 ) -> tuple[Solid, list[Polygon]]:
     """Degenerate flat Solid for the coplanar :func:`convex_hull_3d` case.
 
     Computes the 2-D hull on ``(easting, northing)`` and wraps it in a Solid
     with two identical Polygon layers (zero extent → zero volume). Raises
     ``ValueError`` if the 2-D hull is itself degenerate (collinear points).
+
+    Two :func:`convex_hull_3d` call sites share this helper, and they pass
+    distinct ``name`` values so the command layer can tell the causes apart from
+    the resulting Solid's name alone (no schema-level flag exists):
+
+    * the **deliberately coplanar** branch (the expected flat-input feature)
+      keeps the default ``"Convex Hull 3D (degenerate)"``;
+    * the **QhullError** branch (an unexpected rank-3 cloud that trips QHull on a
+      precision/degeneracy borderline) passes
+      ``"Convex Hull 3D (QHull failure — degenerate)"``.
+
+    The zero-volume / ``EPS_VOLUME`` degeneracy semantics are identical for both
+    names; only the label differs.
+
+    Parameters
+    ----------
+    coords : numpy.ndarray
+        Point cloud, shape ``(n, 3)`` in ``(easting, northing, altitude)`` order.
+    ids : Sequence[str]
+        Object IDs aligned with ``coords`` rows.
+    id_factory : IDFactory
+        Source of the new Polygon and Solid IDs.
+    name : str, optional
+        Name for the resulting degenerate Solid; see the two callers above.
     """
     try:
         flat = ConvexHull(coords[:, :2])
@@ -1098,7 +1130,7 @@ def _coplanar_fallback_solid(
     )
     solid = Solid(
         id=id_factory.next_id("so"),
-        name="Convex Hull 3D (degenerate)",
+        name=name,
         alpha=1.0,
         visibility=True,
         # The SAME polygon ID is stored twice on purpose: the two layers are the
@@ -1337,9 +1369,11 @@ class CylinderCrossSection:
     ------
     kind : Literal["circle", "ellipse", "rectangle"]
         The classified slice shape.
-    dimensions : tuple[float, ...]
+    _dimensions : tuple[float, ...]
         Geometry of the cross-section, by ``kind`` (every entry must be finite
-        and ``> 0``):
+        and ``> 0``). **Private**: read it through the kind-aware typed
+        accessors (``radius`` / ``semi_major`` / ``semi_minor`` / ``width`` /
+        ``height``), which are the only public read path.
 
         * ``"circle"`` — ``(radius,)`` (arity 1).
         * ``"ellipse"`` — ``(semi_major, semi_minor)`` (arity 2) where
@@ -1366,7 +1400,7 @@ class CylinderCrossSection:
     """
 
     kind: Literal["circle", "ellipse", "rectangle"]
-    dimensions: tuple[float, ...]
+    _dimensions: tuple[float, ...]
     approximate: bool = False
 
     def __post_init__(self) -> None:
@@ -1376,58 +1410,66 @@ class CylinderCrossSection:
                 f"CylinderCrossSection.kind must be one of "
                 f"{sorted(_CROSS_SECTION_ARITY)}; got {self.kind!r}"
             )
-        if len(self.dimensions) != expected:
+        if len(self._dimensions) != expected:
             raise ValueError(
                 f"CylinderCrossSection {self.kind!r} requires {expected} "
-                f"dimension(s); got {self.dimensions!r}"
+                f"dimension(s); got {self._dimensions!r}"
             )
-        for value in self.dimensions:
+        for value in self._dimensions:
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(
                     f"CylinderCrossSection {self.kind!r} dimensions must be "
-                    f"finite and > 0; got {self.dimensions!r}"
+                    f"finite and > 0; got {self._dimensions!r}"
                 )
-        if self.kind == "ellipse" and self.dimensions[0] < self.dimensions[1]:
+        if self.kind == "ellipse" and self._dimensions[0] < self._dimensions[1]:
             raise ValueError(
                 f"CylinderCrossSection ellipse semi_major must be >= semi_minor; "
-                f"got {self.dimensions!r}"
+                f"got {self._dimensions!r}"
+            )
+        # A circular cross-section is the offset-independent perpendicular cut:
+        # its radius ``r`` is exact regardless of the cutting plane's offset, so
+        # ``approximate`` must never be True for a circle. Ellipse/rectangle may
+        # be either (their through-axis spans are a simplification).
+        if self.kind == "circle" and self.approximate:
+            raise ValueError(
+                "CylinderCrossSection circle is always exact; approximate must be False"
             )
 
     @property
     def radius(self) -> float:
         """Cylinder radius — ``circle`` or ``ellipse`` semi-minor; raises for ``rectangle``."""
         if self.kind == "circle":
-            return self.dimensions[0]
+            return self._dimensions[0]
         if self.kind == "ellipse":
-            return self.dimensions[1]
+            return self._dimensions[1]
         raise AttributeError(f"{self.kind!r} cross-section has no radius")
 
     @property
     def semi_major(self) -> float:
         """Semi-major axis — ``ellipse`` only; raises ``AttributeError`` otherwise."""
         if self.kind == "ellipse":
-            return self.dimensions[0]
+            return self._dimensions[0]
         raise AttributeError(f"{self.kind!r} cross-section has no semi_major axis")
 
     @property
     def semi_minor(self) -> float:
         """Semi-minor axis (cylinder radius) — ``ellipse`` only; raises otherwise."""
         if self.kind == "ellipse":
-            return self.dimensions[1]
+            return self._dimensions[1]
         raise AttributeError(f"{self.kind!r} cross-section has no semi_minor axis")
 
     @property
     def width(self) -> float:
         """Width (``2·radius``) — ``rectangle`` only; raises ``AttributeError`` otherwise."""
         if self.kind == "rectangle":
-            return self.dimensions[0]
+            return self._dimensions[0]
         raise AttributeError(f"{self.kind!r} cross-section has no width")
 
     @property
     def height(self) -> float:
         """Height (cylinder height) — ``rectangle`` only; raises ``AttributeError`` otherwise."""
         if self.kind == "rectangle":
-            return self.dimensions[1]
+            return self._dimensions[1]
         raise AttributeError(f"{self.kind!r} cross-section has no height")
 
 

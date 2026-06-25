@@ -1250,7 +1250,7 @@ def test_cylinder_axis_vector_inclined_pins_sin_cos_swap():
 def test_cylinder_cross_section_circle():
     cs = geo.cylinder_cross_section(_cyl("vertical"), np.array([0.0, 0.0, 1.0]))
     assert cs.kind == "circle"
-    assert cs.dimensions == pytest.approx((2.0,))
+    assert cs.radius == pytest.approx(2.0)
     # Perpendicular cut: radius r regardless of offset → exact.
     assert cs.approximate is False
 
@@ -1258,7 +1258,7 @@ def test_cylinder_cross_section_circle():
 def test_cylinder_cross_section_rectangle():
     cs = geo.cylinder_cross_section(_cyl("vertical"), np.array([1.0, 0.0, 0.0]))
     assert cs.kind == "rectangle"
-    assert cs.dimensions == pytest.approx((4.0, 5.0))
+    assert (cs.width, cs.height) == pytest.approx((4.0, 5.0))
     # Full 2r width assumes a through-axis plane → simplified.
     assert cs.approximate is True
 
@@ -1266,7 +1266,7 @@ def test_cylinder_cross_section_rectangle():
 def test_cylinder_cross_section_ellipse():
     cs = geo.cylinder_cross_section(_cyl("vertical"), np.array([1.0, 0.0, 1.0]))
     assert cs.kind == "ellipse"
-    assert cs.dimensions == pytest.approx((2.0 * math.sqrt(2.0), 2.0))
+    assert (cs.semi_major, cs.semi_minor) == pytest.approx((2.0 * math.sqrt(2.0), 2.0))
     # Span depends on the perpendicular offset → simplified.
     assert cs.approximate is True
 
@@ -1406,6 +1406,28 @@ def test_solid_volume_frustum_matches_closed_form():
     expected = h / 3.0 * (a1 + a2 + math.sqrt(a1 * a2))
     volume, _ = geo.solid_volume_centroid(solid, objects, pts)
     assert volume == pytest.approx(expected)
+
+
+def test_solid_volume_frustum_rotated_top_ring_twist_undetected():
+    # CHARACTERIZATION (PR #78 review): pins a KNOWN hazard in ``_lateral_faces``.
+    # It assumes positional vertex correspondence (``low[i]`` over ``up[i]``) and
+    # only rejects bands between polygons of *differing* vertex counts. Two rings
+    # with EQUAL vertex counts but a rotated start index produce a twisted,
+    # self-intersecting shell — and this is NOT detected: no exception is raised
+    # and the divergence-theorem volume comes out wrong.
+    #
+    # Reuse the frustum fixture (correct stacking → 7/3 ≈ 2.333) but rotate the
+    # top square's vertex order by one (pt1, pt2, pt3, pt0) so up[i] no longer
+    # sits above low[i]. The current code returns 1.0 instead of 7/3, silently.
+    # If a future change adds twist detection (e.g. an angle/winding screen), this
+    # test must be updated — either to expect a raise or the corrected 7/3.
+    _, objects, pts = _frustum()
+    twisted_top = _poly("pg_t", ("pt1", "pt2", "pt3", "pt0"))
+    twisted_objects = {"pg_b": objects["pg_b"], "pg_t": twisted_top}
+    correct = 1.0 / 3.0 * (4.0 + 1.0 + math.sqrt(4.0 * 1.0))  # 7/3, the aligned value
+    volume, _ = geo.solid_volume_centroid(_solid(("pg_b", "pg_t")), twisted_objects, pts)
+    assert volume == pytest.approx(1.0)  # the (wrong) value the twist yields
+    assert volume != pytest.approx(correct)  # twist went undetected, no raise
 
 
 # ---------------------------------------------------------------------------
@@ -1827,7 +1849,7 @@ def test_cylinder_measure_zero_height():
 
 
 def test_cylinder_cross_section_accepts_valid_kinds():
-    assert geo.CylinderCrossSection("circle", (1.0,)).dimensions == (1.0,)
+    assert geo.CylinderCrossSection("circle", (1.0,)).radius == 1.0
     assert geo.CylinderCrossSection("ellipse", (2.0, 1.0)).kind == "ellipse"
     assert geo.CylinderCrossSection("rectangle", (4.0, 5.0)).kind == "rectangle"
 
@@ -1927,7 +1949,7 @@ def test_cylinder_cross_section_near_circle_boundary_stays_circle():
     normal = np.array([math.sin(tilt), 0.0, math.cos(tilt)], dtype=np.float64)
     cs = geo.cylinder_cross_section(_cyl("vertical"), normal)
     assert cs.kind == "circle"
-    assert cs.dimensions == pytest.approx((2.0,))
+    assert cs.radius == pytest.approx(2.0)
 
 
 def test_cylinder_cross_section_just_off_circle_boundary_is_ellipse():
@@ -1938,9 +1960,9 @@ def test_cylinder_cross_section_just_off_circle_boundary_is_ellipse():
     normal = np.array([math.sin(tilt), 0.0, math.cos(tilt)], dtype=np.float64)
     cs = geo.cylinder_cross_section(_cyl("vertical"), normal)
     assert cs.kind == "ellipse"
-    assert cs.dimensions[0] == pytest.approx(2.0 / math.cos(tilt))
-    assert cs.dimensions[1] == pytest.approx(2.0)
-    assert math.isfinite(cs.dimensions[0])
+    assert cs.semi_major == pytest.approx(2.0 / math.cos(tilt))
+    assert cs.semi_minor == pytest.approx(2.0)
+    assert math.isfinite(cs.semi_major)
 
 
 def test_cylinder_cross_section_near_rectangle_boundary_stays_rectangle():
@@ -1950,7 +1972,7 @@ def test_cylinder_cross_section_near_rectangle_boundary_stays_rectangle():
     normal = np.array([math.cos(off), 0.0, math.sin(off)], dtype=np.float64)
     cs = geo.cylinder_cross_section(_cyl("vertical"), normal)
     assert cs.kind == "rectangle"
-    assert cs.dimensions == pytest.approx((4.0, 5.0))
+    assert (cs.width, cs.height) == pytest.approx((4.0, 5.0))
 
 
 def test_cylinder_cross_section_just_off_rectangle_boundary_is_ellipse():
@@ -1961,8 +1983,8 @@ def test_cylinder_cross_section_just_off_rectangle_boundary_is_ellipse():
     normal = np.array([math.cos(off), 0.0, math.sin(off)], dtype=np.float64)
     cs = geo.cylinder_cross_section(_cyl("vertical"), normal)
     assert cs.kind == "ellipse"
-    assert cs.dimensions[0] == pytest.approx(2.0 / math.sin(off))
-    assert math.isfinite(cs.dimensions[0])
+    assert cs.semi_major == pytest.approx(2.0 / math.sin(off))
+    assert math.isfinite(cs.semi_major)
 
 
 def test_cylinder_cross_section_clearly_inclined_normal_is_finite_ellipse():
@@ -1972,8 +1994,8 @@ def test_cylinder_cross_section_clearly_inclined_normal_is_finite_ellipse():
     normal = np.array([inv_sqrt2, 0.0, inv_sqrt2], dtype=np.float64)
     cs = geo.cylinder_cross_section(_cyl("vertical"), normal)
     assert cs.kind == "ellipse"
-    assert cs.dimensions[0] == pytest.approx(2.0 * math.sqrt(2.0))
-    assert cs.dimensions[1] == pytest.approx(2.0)
+    assert cs.semi_major == pytest.approx(2.0 * math.sqrt(2.0))
+    assert cs.semi_minor == pytest.approx(2.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1989,7 +2011,7 @@ def test_cylinder_cross_section_inclined_axis_circle_along_axis():
     axis = geo.cylinder_axis_vector(cyl)  # (1/√2, 0, 1/√2)
     cs = geo.cylinder_cross_section(cyl, axis)
     assert cs.kind == "circle"
-    assert cs.dimensions == pytest.approx((2.0,))
+    assert cs.radius == pytest.approx(2.0)
 
 
 def test_cylinder_cross_section_inclined_axis_horizontal_plane_is_ellipse():
@@ -2001,8 +2023,8 @@ def test_cylinder_cross_section_inclined_axis_horizontal_plane_is_ellipse():
     cyl = _cyl("inclined", az=math.pi / 2, el=math.pi / 4)
     cs = geo.cylinder_cross_section(cyl, np.array([0.0, 0.0, 1.0]))
     assert cs.kind == "ellipse"
-    assert cs.dimensions[0] == pytest.approx(2.0 * math.sqrt(2.0))
-    assert cs.dimensions[1] == pytest.approx(2.0)
+    assert cs.semi_major == pytest.approx(2.0 * math.sqrt(2.0))
+    assert cs.semi_minor == pytest.approx(2.0)
 
 
 def test_cylinder_cross_section_inclined_axis_perpendicular_plane_is_rectangle():
@@ -2014,7 +2036,7 @@ def test_cylinder_cross_section_inclined_axis_perpendicular_plane_is_rectangle()
     perp = np.array([1.0, 0.0, -1.0], dtype=np.float64)  # ⟂ to (1,0,1)
     cs = geo.cylinder_cross_section(cyl, perp)
     assert cs.kind == "rectangle"
-    assert cs.dimensions == pytest.approx((4.0, 5.0))
+    assert (cs.width, cs.height) == pytest.approx((4.0, 5.0))
 
 
 # ---------------------------------------------------------------------------
@@ -2037,3 +2059,18 @@ def test_ball_tangent_direction_non_cardinal_azimuth():
     center = _pt("c", 0, 0, 0.0)
     ne = _pt("ne", 1, 1, 0.0)
     assert geo.ball_tangent_direction(center, ne) == pytest.approx(math.pi / 4)
+
+
+def test_ball_tangent_direction_coincident_point_returns_zero():
+    # REGRESSION/CHARACTERIZATION (PR #78 review): pins the *current* degenerate
+    # behaviour when ``center == surface_point``. With Δe = Δn = 0 the function
+    # delegates to ``azimuth`` → ``arctan2(0, 0) == 0.0``, so it silently returns
+    # bearing 0.0 with no error. ``ball_tangent_direction`` itself is unguarded;
+    # rejecting a zero-radius ball is the validation layer's job upstream. This
+    # test locks what the geometry function alone does today — if a future change
+    # adds a coincident-point guard here, update this test to expect the raise.
+    center = _pt("c", 0, 0, 0.0)
+    coincident = _pt("same", 0, 0, 0.0)
+    result = geo.ball_tangent_direction(center, coincident)
+    assert result == pytest.approx(0.0)
+    assert result == np.float64(0.0)
