@@ -1474,8 +1474,7 @@ def cylinder_cross_section(cylinder: Cylinder, plane_normal: np.ndarray) -> Cyli
     the full ``2r`` and the ellipse spans the full radius. An off-axis plane
     parallel to one of these but offset by a perpendicular distance ``d``
     actually yields a narrower chord — width ``2·√(r² − d²)`` rather than
-    ``2r`` — which this function does not model. See
-    ``docs/implementation-design.md`` §13.x for the slice-offset treatment.
+    ``2r`` — which this function does not model.
 
     The returned ``approximate`` flag reflects this: ``True`` for the
     offset-dependent ``ellipse``/``rectangle`` cases and ``False`` for the exact

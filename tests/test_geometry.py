@@ -25,6 +25,7 @@ tolerance.
 
 from __future__ import annotations
 
+import logging
 import math
 from types import SimpleNamespace
 
@@ -1367,6 +1368,47 @@ def test_convex_hull_3d_coplanar_fallback_degenerate():
     assert volume == pytest.approx(0.0)  # zero extent → flagged via EPS_VOLUME
 
 
+def test_convex_hull_3d_qhull_error_routes_to_flat_fallback(monkeypatch, caplog):
+    # The coplanar test above reaches ``_coplanar_fallback_solid`` via the
+    # up-front rank screen. This drives the OTHER route: a rank-3 (non-coplanar)
+    # tetrahedron that passes the screen but trips ``ConvexHull`` itself — the
+    # ``except QhullError`` branch around geometry.py:1019-1029, which logs a
+    # WARNING and falls back to the flat 2-D hull. The branch is simulated by
+    # patching ``geo.ConvexHull`` to raise once on the first (3-D) call, then
+    # delegate to the real implementation so the fallback's 2-D hull still runs.
+    real_convex_hull = geo.ConvexHull
+    calls = {"n": 0}
+
+    def flaky_convex_hull(coords, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise QhullError("simulated precision/degeneracy borderline")
+        return real_convex_hull(coords, *args, **kwargs)
+
+    monkeypatch.setattr(geo, "ConvexHull", flaky_convex_hull)
+    pts = {
+        "p0": _pt("p0", 0, 0, 0.0),
+        "p1": _pt("p1", 1, 0, 0.0),
+        "p2": _pt("p2", 0, 1, 0.0),
+        "p3": _pt("p3", 0, 0, 1.0),  # apex lifts the set to full rank-3
+    }
+    with caplog.at_level(logging.WARNING, logger=geo._logger.name):  # pylint: disable=protected-access
+        solid, polygons = geo.convex_hull_3d(pts, list(pts), IDFactory())
+
+    # The fallback ran (real ConvexHull was reached on the 2-D retry) and
+    # produced the degenerate flat Solid: a single facet polygon stored twice.
+    assert calls["n"] == 2
+    assert len(polygons) == 1
+    assert len(solid.layers) == 2
+    assert solid.layers[0] == solid.layers[1]
+    objects = {polygons[0].id: polygons[0]}
+    volume, _ = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(0.0)  # zero extent → flagged via EPS_VOLUME
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("flat 2-D fallback" in r.getMessage() for r in warnings)
+
+
 def test_convex_hull_3d_collinear_raises():
     pts = {f"p{i}": _pt(f"p{i}", i, i, 0.0) for i in range(4)}  # collinear in 3D
     with pytest.raises(ValueError):
@@ -1508,10 +1550,16 @@ def _square_pyramid(height: float = 4.0):
 
 
 def test_solid_volume_square_pyramid():
+    # The centroid assertion exercises the apex-fan moment accumulation (the
+    # ``upper_is_pt`` triangle-fan from base edges to the apex), not just the
+    # scalar volume. For the symmetric base square ``(0,0)-(2,2)`` the centroid
+    # sits over the base centre ``(1, 1)`` and a pyramid's centroid lies at 1/4
+    # of the height from the base toward the apex, so z = ``height / 4``.
     height = 4.0
     solid, objects, pts = _square_pyramid(height)
-    volume, _ = geo.solid_volume_centroid(solid, objects, pts)
+    volume, centroid = geo.solid_volume_centroid(solid, objects, pts)
     assert volume == pytest.approx(4.0 * height / 3.0)
+    assert centroid == pytest.approx([1.0, 1.0, height / 4.0])
 
 
 def test_solid_lateral_surface_area_square_pyramid():
