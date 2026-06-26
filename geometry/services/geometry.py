@@ -15,13 +15,23 @@
 """Pure geometric calculations for GeoSketch.
 
 This module is the single home for every numeric geometry operation in the
-app: direction (azimuth), Euclidean distance, polygon signed area and
-convexity, convex hull, the direction unit vector, three intersection
+app, spanning both 2-D and 3-D/solid work.
+
+**2-D:** direction (azimuth), Euclidean distance, polygon signed area and
+convexity, the 2-D convex hull, the direction unit vector, three intersection
 functions (line–line, line–polygon, polygon–polygon), the ray-polygon
 distance, the point/polygon and polygon/polygon distances, the tangent
-direction, and the vector endpoint. It depends only on the model
-dataclasses (:mod:`geometry.models`) and the math utilities
-(:mod:`geometry.utils`); it imports neither ``tkinter`` nor ``matplotlib``.
+direction (including tangent-perpendicularity), and the vector endpoint.
+
+**3-D / solids:** the 3-D convex hull (:func:`convex_hull_3d`, with the
+coplanar/precision flat-Solid fallback), ball and cylinder and solid volumes,
+cylinder cross-section classification (:class:`CylinderCrossSection`), solid
+B-rep faces, and lateral/total surface area (Mirtich 1996 polyhedral mass
+properties for volume + centroid).
+
+It depends only on the model dataclasses (:mod:`geometry.models`) and the math
+utilities (:mod:`geometry.utils`); it imports neither ``tkinter`` nor
+``matplotlib``.
 
 Conventions
 -----------
@@ -69,7 +79,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import numpy as np
@@ -382,6 +392,11 @@ def convex_hull(polygon: Polygon, points: Mapping[str, Point], new_id: str) -> P
 
     Raises
     ------
+    ValueError
+        If any vertex coordinate is non-finite (``nan``/``±inf``). Mirrors the
+        up-front screen in :func:`convex_hull_3d`: without it a poisoned vertex
+        would surface as an opaque QHull message rather than an actionable
+        error pinned to the input.
     scipy.spatial.QhullError
         If the input is degenerate for hull construction (fewer than three
         vertices, or all vertices collinear). Unlike the intersection/distance
@@ -392,6 +407,8 @@ def convex_hull(polygon: Polygon, points: Mapping[str, Point], new_id: str) -> P
         triggers this.
     """
     coords = _polygon_coords(polygon, points)
+    if not np.all(np.isfinite(coords)):
+        raise ValueError("convex_hull: input coordinates contain nan or ±inf")
     hull = ConvexHull(coords)
     hull_point_ids = [polygon.point_ids[i] for i in hull.vertices]
     return Polygon(
@@ -1021,6 +1038,21 @@ def convex_hull_3d(
     except QhullError as exc:
         # Reached only for a genuinely degenerate/precision-borderline set that
         # passed the rank screen; fall back to the flat 2-D hull.
+        #
+        # NOTE (deferred — two-fallback ambiguity): this QHull-failure fallback
+        # and the deliberate-coplanar fallback above both return a degenerate
+        # flat Solid, distinguishable today only by the Solid's ``name``
+        # substring (a brittle, stringly-typed discriminator the command layer
+        # must parse). A structured discriminator (e.g. an enum returned
+        # alongside the Solid, or a transient non-persisted field on the result)
+        # was deferred: ``Solid`` is a persisted model with a strict
+        # ``__post_init__`` and the return type is the bare
+        # ``tuple[Solid, list[Polygon]]`` used by every caller, so a faithful
+        # structured fix means widening the return signature (or the schema) —
+        # a larger, breaking refactor outside this change's scope. Recommended
+        # fix: return ``tuple[Solid, list[Polygon], HullFallback]`` where
+        # ``HullFallback`` is an enum of ``{NONE, COPLANAR, QHULL_FAILURE}``,
+        # and migrate callers off the name-substring sniff.
         _logger.warning(
             "convex_hull_3d: a rank-3 point set failed QHull on a "
             "precision/degeneracy borderline; routing to the flat 2-D fallback.",
@@ -1358,22 +1390,27 @@ _CROSS_SECTION_ARITY: dict[str, int] = {"circle": 1, "ellipse": 2, "rectangle": 
 class CylinderCrossSection:
     """Shape of a planar slice through a cylinder.
 
-    The class makes illegal states unrepresentable. ``kind`` is constrained to
-    the three valid tags by :class:`typing.Literal`, and ``__post_init__``
-    enforces the per-kind arity and positivity of ``dimensions`` at
-    construction, so a value such as ``("circle", (1, 2, 3))`` or a non-positive
-    dimension can never be built. The dataclass is frozen, so once validated an
-    instance stays consistent.
+    The class makes illegal states unrepresentable. Instances are built **only**
+    through the kind-specific classmethod constructors :meth:`circle`,
+    :meth:`ellipse`, and :meth:`rectangle`; ``kind`` and ``_dimensions`` are
+    ``init=False`` fields set by those factories, so the per-kind arity
+    invariant (circle = 1 dimension, ellipse/rectangle = 2) is structurally
+    unviolatable — there is no positional path that could pair, say, ``"circle"``
+    with two dimensions. ``__post_init__`` still validates positivity and the
+    ellipse ordering as defence in depth. The dataclass is frozen, so once
+    validated an instance stays consistent.
 
     Fields
     ------
     kind : Literal["circle", "ellipse", "rectangle"]
-        The classified slice shape.
+        The classified slice shape. ``init=False`` — set by the classmethod
+        constructor, never passed in.
     _dimensions : tuple[float, ...]
         Geometry of the cross-section, by ``kind`` (every entry must be finite
-        and ``> 0``). **Private**: read it through the kind-aware typed
-        accessors (``radius`` / ``semi_major`` / ``semi_minor`` / ``width`` /
-        ``height``), which are the only public read path.
+        and ``> 0``). ``init=False`` and **private**: read it through the
+        kind-aware typed accessors (``radius`` / ``semi_major`` /
+        ``semi_minor`` / ``width`` / ``height``), which are the only public
+        read path.
 
         * ``"circle"`` — ``(radius,)`` (arity 1).
         * ``"ellipse"`` — ``(semi_major, semi_minor)`` (arity 2) where
@@ -1388,28 +1425,110 @@ class CylinderCrossSection:
         ignores the cutting plane's offset and may overstate the true chord;
         ``False`` when exact. :func:`cylinder_cross_section` sets it ``True`` for
         the offset-dependent ``ellipse``/``rectangle`` cases and ``False`` for
-        the ``circle`` case (radius ``r`` regardless of offset). Defaults to
-        ``False`` so positional two-argument construction stays valid.
+        the ``circle`` case (radius ``r`` regardless of offset). A ``circle``
+        forbids ``approximate=True`` (it is always exact).
 
     Raises
     ------
     ValueError
-        If ``kind`` is not one of the three valid tags, if ``dimensions`` has
-        the wrong arity for ``kind``, if any dimension is non-finite or
-        ``<= 0``, or if an ``ellipse`` has ``semi_major < semi_minor``.
+        If any dimension is non-finite or ``<= 0``, if an ``ellipse`` has
+        ``semi_major < semi_minor``, or if a ``circle`` is built with
+        ``approximate=True``.
     """
 
-    kind: Literal["circle", "ellipse", "rectangle"]
-    _dimensions: tuple[float, ...]
+    kind: Literal["circle", "ellipse", "rectangle"] = field(init=False)
+    _dimensions: tuple[float, ...] = field(init=False)
     approximate: bool = False
 
-    def __post_init__(self) -> None:
-        expected = _CROSS_SECTION_ARITY.get(self.kind)
-        if expected is None:
-            raise ValueError(
-                f"CylinderCrossSection.kind must be one of "
-                f"{sorted(_CROSS_SECTION_ARITY)}; got {self.kind!r}"
-            )
+    @classmethod
+    def circle(cls, radius: float) -> "CylinderCrossSection":
+        """Build a circular cross-section (offset-independent perpendicular cut).
+
+        Parameters
+        ----------
+        radius : float
+            Cylinder radius; must be finite and ``> 0``.
+
+        Returns
+        -------
+        CylinderCrossSection
+            A ``kind="circle"`` instance with ``approximate=False`` (a circle is
+            always exact).
+        """
+        return cls._build("circle", (radius,), approximate=False)
+
+    @classmethod
+    def ellipse(
+        cls, semi_major: float, semi_minor: float, *, approximate: bool = True
+    ) -> "CylinderCrossSection":
+        """Build an elliptical cross-section (oblique cut).
+
+        Parameters
+        ----------
+        semi_major : float
+            Semi-major axis ``r / cos(θ)``; must be ``>= semi_minor``.
+        semi_minor : float
+            Semi-minor axis (the cylinder radius ``r``).
+        approximate : bool, keyword-only, optional
+            ``True`` (default) when the span assumes a through-axis plane.
+
+        Returns
+        -------
+        CylinderCrossSection
+            A ``kind="ellipse"`` instance.
+        """
+        return cls._build("ellipse", (semi_major, semi_minor), approximate=approximate)
+
+    @classmethod
+    def rectangle(
+        cls, width: float, height: float, *, approximate: bool = True
+    ) -> "CylinderCrossSection":
+        """Build a rectangular cross-section (cut parallel to the axis).
+
+        Parameters
+        ----------
+        width : float
+            Rectangle width ``2·radius``.
+        height : float
+            Rectangle height (the cylinder height).
+        approximate : bool, keyword-only, optional
+            ``True`` (default) when the span assumes a through-axis plane.
+
+        Returns
+        -------
+        CylinderCrossSection
+            A ``kind="rectangle"`` instance.
+        """
+        return cls._build("rectangle", (width, height), approximate=approximate)
+
+    @classmethod
+    def _build(
+        cls,
+        kind: Literal["circle", "ellipse", "rectangle"],
+        dimensions: tuple[float, ...],
+        *,
+        approximate: bool,
+    ) -> "CylinderCrossSection":
+        """Set the ``init=False`` fields on a fresh frozen instance.
+
+        Routing every classmethod through this single factory keeps the
+        ``kind``↔arity pairing in one place, so the constructors cannot mint an
+        inconsistent instance.
+        """
+        instance = cls(approximate=approximate)
+        object.__setattr__(instance, "kind", kind)
+        object.__setattr__(instance, "_dimensions", dimensions)
+        instance.__validate__()
+        return instance
+
+    def __validate__(self) -> None:
+        """Validate the ``init=False`` fields after the factory sets them.
+
+        Not ``__post_init__``: the auto-generated ``__init__`` runs before
+        ``kind``/``_dimensions`` are assigned, so validation is invoked by
+        :meth:`_build` once the instance is fully populated.
+        """
+        expected = _CROSS_SECTION_ARITY[self.kind]
         if len(self._dimensions) != expected:
             raise ValueError(
                 f"CylinderCrossSection {self.kind!r} requires {expected} "
@@ -1554,12 +1673,10 @@ def cylinder_cross_section(cylinder: Cylinder, plane_normal: np.ndarray) -> Cyli
     # ``approximate``: circle radius is offset-independent (exact); the ellipse
     # and rectangle spans assume a through-axis plane (simplified).
     if (1.0 - cos_theta) < EPS_ANGLE:  # normal ∥ axis → perpendicular cut
-        return CylinderCrossSection("circle", (r,), approximate=False)
+        return CylinderCrossSection.circle(r)
     if cos_theta < EPS_ANGLE:  # normal ⊥ axis → parallel cut
-        return CylinderCrossSection(
-            "rectangle", (2.0 * r, float(cylinder.height)), approximate=True
-        )
-    return CylinderCrossSection("ellipse", (r / cos_theta, r), approximate=True)
+        return CylinderCrossSection.rectangle(2.0 * r, float(cylinder.height))
+    return CylinderCrossSection.ellipse(r / cos_theta, r)
 
 
 # ---------------------------------------------------------------------------
@@ -1640,6 +1757,17 @@ def _solid_layer_rings(
     Each polygon layer yields ``(False, [v0, v1, ...])`` of ``(3,)`` vertex
     arrays in stored order; each point (apex/nadir) layer yields
     ``(True, [vertex])``.
+
+    Raises
+    ------
+    ValueError
+        If any resolved vertex is non-finite (``nan``/``±inf``). This is the
+        single up-front screen shared by every Solid metric routing through
+        here — :func:`solid_faces`, :func:`solid_volume_centroid`, and both
+        surface-area paths — so an area computation fails loud rather than
+        returning a silent ``nan``. (The volume path keeps its own late
+        non-finite gate for defence in depth, but a poisoned vertex is now
+        caught here first.)
     """
     rings: list[tuple[bool, list[np.ndarray]]] = []
     for layer_id in solid.layers:
@@ -1648,6 +1776,8 @@ def _solid_layer_rings(
         else:
             polygon = objects[layer_id]
             rings.append((False, [_xyz(points[pid]) for pid in polygon.point_ids]))
+    if not all(np.all(np.isfinite(v)) for _, ring in rings for v in ring):
+        raise ValueError("solid layer vertices contain nan or ±inf")
     return rings
 
 
@@ -1796,10 +1926,19 @@ def solid_volume_centroid(
     """Volume and centroid of a Solid (Mirtich 1996 polyhedral mass properties).
 
     Builds the closed B-rep via :func:`solid_faces`, fan-triangulates each
-    face, and accumulates the signed-tetrahedron decomposition from the origin
-    — the divergence-theorem surface integral underlying Mirtich's method. The
+    face, and accumulates the signed-tetrahedron decomposition — the
+    divergence-theorem surface integral underlying Mirtich's method. The
     volume is ``Σ (p₀ · (p₁ × p₂)) / 6`` over the triangles; the centroid is the
     volume-weighted mean of the tetra centroids ``(p₀+p₁+p₂)/4``.
+
+    The tetra/centroid sum is accumulated in a frame shifted by a reference
+    vertex (the first vertex of the first face), not the absolute UTM origin.
+    Mirtich's decomposition is translation-invariant in the volume and the
+    centroid simply translates by the same offset, so this is exact — but it
+    avoids the catastrophic cancellation that would otherwise lose ~5 significant
+    digits: at UTM magnitudes (E~5e5, N~4e6) the unshifted tetra products are
+    ~1e17 and the volume emerges as their tiny difference. The reference offset
+    is added back to the returned centroid; the volume needs no correction.
 
     Because every face is consistently wound (:func:`solid_faces`), the signed
     volume's global sign is uniform: the reported volume is its magnitude, and
@@ -1844,13 +1983,17 @@ def solid_volume_centroid(
         rejects a 0- or 1-layer Solid at construction, so a real Solid can
         never trigger that path.
     """
+    faces = solid_faces(solid, objects, points)
+    # Anchor the accumulation at the first vertex to keep the tetra products in a
+    # small local frame; see the docstring for the UTM-cancellation rationale.
+    ref = faces[0][0] if faces else np.zeros(3, dtype=np.float64)
     signed_v = np.float64(0.0)
     moment = np.zeros(3, dtype=np.float64)
-    for face in solid_faces(solid, objects, points):
-        v0 = face[0]
+    for face in faces:
+        v0 = face[0] - ref
         for i in range(1, len(face) - 1):
-            v1 = face[i]
-            v2 = face[i + 1]
+            v1 = face[i] - ref
+            v2 = face[i + 1] - ref
             tetra = float(np.dot(v0, np.cross(v1, v2))) / 6.0
             signed_v += tetra
             moment += tetra * (v0 + v1 + v2) / 4.0
@@ -1860,7 +2003,8 @@ def solid_volume_centroid(
     # alongside the genuine zero-extent case.
     if not math.isfinite(float(signed_v)) or abs(signed_v) < EPS_VOLUME:
         return np.float64(0.0), np.full(3, np.nan, dtype=np.float64)
-    return np.float64(abs(signed_v)), moment / signed_v
+    # Centroid was computed in the shifted frame; translate it back by ``ref``.
+    return np.float64(abs(signed_v)), moment / signed_v + ref
 
 
 def solid_lateral_surface_area(

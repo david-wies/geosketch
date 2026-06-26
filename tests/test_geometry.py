@@ -12,15 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for ``geometry.services.geometry`` (issue #13).
+"""Tests for ``geometry.services.geometry`` (issues #13, #60, #78).
 
-Every formula in the acceptance criteria gets a known-input/known-output
-test: direction (azimuth), Euclidean distance, convexity, convex hull,
-signed area, the four intersection types, the two polygon distances, the
-tangent direction, and the vector endpoint. Inputs are chosen so the
-expected results are exact (axis-aligned squares, 3-4-5 triangles) and can
-be asserted without depending on floating-point noise beyond a tight
-tolerance.
+Covers both the 2-D plane geometry and the 3-D solid geometry the module
+now provides. Each formula in the acceptance criteria gets a
+known-input/known-output test:
+
+* 2-D — direction (azimuth), 3-D Euclidean distance, elevation and the
+  three-point azimuth/elevation, convexity, 2-D convex hull, signed area,
+  the three intersection helpers (line-line, line-polygon, polygon-polygon)
+  plus the ray-polygon distance, the two polygon distances, the tangent
+  direction, and the vector endpoint.
+* 3-D solids — the 3-D convex hull (B-rep facet shell), ball volume /
+  surface area / cross-section radius / tangent, cylinder volume / surface
+  area / axis vector / planar cross-section classification
+  (:class:`CylinderCrossSection`), and Solid volume + centroid, lateral and
+  total surface area, and the B-rep face builder (Mirtich 1996 mass
+  properties, Wuttke 2021 cross-check).
+
+Inputs are chosen so the expected results are exact (axis-aligned squares,
+3-4-5 triangles, unit cubes/tetrahedra) and can be asserted without
+depending on floating-point noise beyond a tight tolerance. A
+far-from-origin UTM case additionally locks the centroid-precision fix.
 """
 
 from __future__ import annotations
@@ -335,6 +348,25 @@ def test_convex_hull_raises_on_collinear():
     }
     poly = _poly("pg_k", ["k0", "k1", "k2"])
     with pytest.raises(QhullError):
+        geo.convex_hull(poly, pts, "pg_999")
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf], ids=["nan", "inf", "-inf"])
+def test_convex_hull_non_finite_coord_raises(bad):
+    # PR #78: the 2-D ``convex_hull`` gained the same up-front ``np.isfinite``
+    # screen as ``convex_hull_3d`` so a poisoned vertex fails loud here with an
+    # actionable message rather than surfacing as an opaque QHull error.
+    # ``Point.__post_init__`` forbids non-finite coordinates, so the corrupt
+    # vertex is supplied via a minimal stand-in exposing only the two attributes
+    # ``_polygon_coords`` reads — the exact seam the guard exists to catch.
+    pts = {
+        "g0": _pt("g0", 0, 0),
+        "g1": _pt("g1", 1, 0),
+        "g2": _pt("g2", 1, 1),
+        "g3": SimpleNamespace(easting=bad, northing=0.0),
+    }
+    poly = _poly("pg_g", ["g0", "g1", "g2", "g3"])
+    with pytest.raises(ValueError, match=r"nan or ±inf"):
         geo.convex_hull(poly, pts, "pg_999")
 
 
@@ -1430,6 +1462,56 @@ def test_solid_volume_frustum_rotated_top_ring_twist_undetected():
     assert volume != pytest.approx(correct)  # twist went undetected, no raise
 
 
+def test_lateral_faces_reversed_upper_ring_makes_bowtie_quads_undetected():
+    # CHARACTERIZATION (PR #78 review): the SECOND, independently-regressing
+    # failure mode named in the ``_lateral_faces`` docstring — a *reversed*
+    # (CW vs CCW) upper ring of EQUAL vertex count. The rotated-start twist above
+    # is pinned through the volume; this pins the reversed case at the face level,
+    # directly on ``_lateral_faces``, since the two modes wind into different
+    # broken connectivity and a future fix could address one but not the other.
+    #
+    # With ``up`` reversed relative to ``low``, positional correspondence
+    # (``low[i]``↔``up[i]``) pairs each lower edge with a flipped upper edge, so
+    # the builder emits self-intersecting "bowtie" quads. Pin the exact
+    # connectivity the current code produces: alternating quads collapse to
+    # ZERO area (a degenerate normal) while the others warp into non-planar
+    # bowties — and crucially NO exception is raised (only the differing-count
+    # band is rejected). If twist/winding detection is added, update this test.
+    low = [
+        np.array([0.0, 0.0, 0.0]),
+        np.array([1.0, 0.0, 0.0]),
+        np.array([1.0, 1.0, 0.0]),
+        np.array([0.0, 1.0, 0.0]),
+    ]
+    up_aligned = [
+        np.array([0.0, 0.0, 1.0]),
+        np.array([1.0, 0.0, 1.0]),
+        np.array([1.0, 1.0, 1.0]),
+        np.array([0.0, 1.0, 1.0]),
+    ]
+    up_reversed = list(reversed(up_aligned))
+
+    faces = geo._lateral_faces((False, low), (False, up_reversed))  # pylint: disable=protected-access
+
+    # Four quads, one per lower edge — the band is built, not rejected.
+    assert len(faces) == 4
+    assert all(len(face) == 4 for face in faces)
+    # The reversed pairing degenerates the band: two quads collapse to zero area
+    # (their flipped edge folds them flat) and two warp into finite-area bowties.
+    areas = [float(geo._face_area(face)) for face in faces]  # pylint: disable=protected-access
+    zero_area = [a for a in areas if a == pytest.approx(0.0)]
+    bowtie_area = [a for a in areas if a == pytest.approx(math.sqrt(2.0))]
+    assert len(zero_area) == 2
+    assert len(bowtie_area) == 2
+    # Pin the exact stored vertex connectivity of the first (degenerate) quad:
+    # low[0], low[1], up_reversed[1], up_reversed[0].
+    first = faces[0]
+    assert np.allclose(first[0], low[0])
+    assert np.allclose(first[1], low[1])
+    assert np.allclose(first[2], up_reversed[1])
+    assert np.allclose(first[3], up_reversed[0])
+
+
 # ---------------------------------------------------------------------------
 # 3-D convex hull
 # ---------------------------------------------------------------------------
@@ -1627,6 +1709,51 @@ def test_solid_volume_centroid_tetrahedron_offcenter():
     assert centroid == pytest.approx([0.25, 0.25, 0.75])
 
 
+def _offset_unit_cube(origin: tuple[float, float, float]):
+    """Return (solid, objects, points) for a unit cube translated to ``origin``.
+
+    Same two-square-layer construction as :func:`_unit_cube` but with every
+    vertex shifted by ``origin`` (an ``(easting, northing, altitude)`` corner).
+    Used to exercise :func:`solid_volume_centroid` at realistic UTM magnitudes,
+    where the un-shifted Mirtich tetra products are ~1e17 and the unit volume
+    must emerge from their difference without catastrophic cancellation.
+    """
+    oe, on, oz = origin
+    pts = {
+        "qb0": _pt("qb0", oe + 0, on + 0, oz + 0.0),
+        "qb1": _pt("qb1", oe + 1, on + 0, oz + 0.0),
+        "qb2": _pt("qb2", oe + 1, on + 1, oz + 0.0),
+        "qb3": _pt("qb3", oe + 0, on + 1, oz + 0.0),
+        "qt0": _pt("qt0", oe + 0, on + 0, oz + 1.0),
+        "qt1": _pt("qt1", oe + 1, on + 0, oz + 1.0),
+        "qt2": _pt("qt2", oe + 1, on + 1, oz + 1.0),
+        "qt3": _pt("qt3", oe + 0, on + 1, oz + 1.0),
+    }
+    bottom = _poly("pg_b", ("qb0", "qb1", "qb2", "qb3"))
+    top = _poly("pg_t", ("qt0", "qt1", "qt2", "qt3"))
+    objects = {"pg_b": bottom, "pg_t": top}
+    return _solid(("pg_b", "pg_t")), objects, pts
+
+
+def test_solid_volume_centroid_far_from_origin_utm_is_precise():
+    # PRECISION REGRESSION (PR #78): a unit cube placed at a realistic UTM corner
+    # (E~5e5, N~4e6, Z~10.5). Without the reference-vertex shift in
+    # ``solid_volume_centroid`` the signed-tetra products are ~1e17 and the unit
+    # volume emerges as their difference, bleeding ~5 significant digits. The
+    # shifted accumulation keeps it exact (~1e-16), so the volume must hold to a
+    # TIGHT absolute tolerance and the centroid (cube centre = corner +
+    # (0.5,0.5,0.5)) must land on the offset centre even after the offset is
+    # added back. The 1e-12 volume tolerance is deliberately tighter than the
+    # ~9e-11 error the *unshifted* accumulation incurs at this UTM magnitude, so
+    # this test fails loud if the reference-vertex shift is ever removed.
+    origin = (500000.0, 4000000.0, 10.5)
+    solid, objects, pts = _offset_unit_cube(origin)
+    volume, centroid = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(1.0, abs=1e-12)
+    expected_centroid = [origin[0] + 0.5, origin[1] + 0.5, origin[2] + 0.5]
+    assert centroid == pytest.approx(expected_centroid, abs=1e-9)
+
+
 # ---------------------------------------------------------------------------
 # Solid pyramid (apex / point-layer) surface area & volume
 # ---------------------------------------------------------------------------
@@ -1759,6 +1886,39 @@ def test_solid_volume_centroid_non_finite_volume_returns_nan_centroid():
     assert np.isnan(centroid).all()
 
 
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf], ids=["nan", "inf", "-inf"])
+@pytest.mark.parametrize(
+    "func",
+    [geo.solid_lateral_surface_area, geo.solid_total_surface_area, geo.solid_faces],
+    ids=["lateral_area", "total_area", "faces"],
+)
+def test_solid_layer_rings_non_finite_vertex_makes_area_raise(func, bad):
+    # PR #78: ``_solid_layer_rings`` — the shared resolver behind
+    # ``solid_faces``/``solid_lateral_surface_area``/``solid_total_surface_area``
+    # — now screens every resolved vertex for finiteness up front. Before the
+    # guard a nan/inf vertex flowed through the Newell area sum and the call
+    # returned a silent ``nan`` area instead of failing; now it raises. The
+    # volume path keeps its own late gate (returns nan-centroid), but the
+    # surface-area paths have no such fallback and must fail loud. ``Point``
+    # forbids non-finite coordinates, so a corrupt vertex is injected via a
+    # minimal ``_xyz`` stand-in exposing only easting/northing/altitude.
+    pts = {
+        "rb0": _pt("rb0", 0, 0, 0.0),
+        "rb1": _pt("rb1", 1, 0, 0.0),
+        "rb2": _pt("rb2", 1, 1, 0.0),
+        "rb3": _pt("rb3", 0, 1, 0.0),
+        "rt0": _pt("rt0", 0, 0, 1.0),
+        "rt1": _pt("rt1", 1, 0, 1.0),
+        "rt2": _pt("rt2", 1, 1, 1.0),
+        "rt3": SimpleNamespace(easting=0.0, northing=1.0, altitude=bad),
+    }
+    bottom = _poly("pg_b", ("rb0", "rb1", "rb2", "rb3"))
+    top = _poly("pg_t", ("rt0", "rt1", "rt2", "rt3"))
+    objects = {"pg_b": bottom, "pg_t": top}
+    with pytest.raises(ValueError, match=r"nan or ±inf"):
+        func(_solid(("pg_b", "pg_t")), objects, pts)
+
+
 # ---------------------------------------------------------------------------
 # Ball / cylinder measurement guards (non-finite, negative, exact-zero)
 # ---------------------------------------------------------------------------
@@ -1849,9 +2009,9 @@ def test_cylinder_measure_zero_height():
 
 
 def test_cylinder_cross_section_accepts_valid_kinds():
-    assert geo.CylinderCrossSection("circle", (1.0,)).radius == 1.0
-    assert geo.CylinderCrossSection("ellipse", (2.0, 1.0)).kind == "ellipse"
-    assert geo.CylinderCrossSection("rectangle", (4.0, 5.0)).kind == "rectangle"
+    assert geo.CylinderCrossSection.circle(1.0).radius == 1.0
+    assert geo.CylinderCrossSection.ellipse(2.0, 1.0).kind == "ellipse"
+    assert geo.CylinderCrossSection.rectangle(4.0, 5.0).kind == "rectangle"
 
 
 @pytest.mark.parametrize(
@@ -1864,44 +2024,65 @@ def test_cylinder_cross_section_accepts_valid_kinds():
     ids=["circle-too-many", "ellipse-too-few", "rectangle-too-many"],
 )
 def test_cylinder_cross_section_rejects_wrong_arity(kind, dimensions):
+    # The public classmethods make a wrong (kind, arity) pairing structurally
+    # impossible, but ``__validate__`` still enforces arity for defence in depth.
+    # Drive it through the private ``_build`` factory — the only path that can
+    # reach the arity guard now — so the guard stays covered.
     with pytest.raises(ValueError, match="dimension"):
-        geo.CylinderCrossSection(kind, dimensions)
+        geo.CylinderCrossSection._build(kind, dimensions, approximate=False)  # pylint: disable=protected-access
 
 
 def test_cylinder_cross_section_rejects_unknown_kind():
-    with pytest.raises(ValueError, match="kind"):
-        geo.CylinderCrossSection("triangle", (1.0, 2.0))  # type: ignore[arg-type]
+    # ``_build`` looks ``kind`` up in ``_CROSS_SECTION_ARITY``; an unknown kind
+    # raises ``KeyError`` there before ``__validate__`` runs, so this no longer
+    # reaches a ValueError. The public API cannot express an unknown kind at all.
+    with pytest.raises(KeyError):
+        geo.CylinderCrossSection._build("triangle", (1.0, 2.0), approximate=False)  # type: ignore[arg-type]  # pylint: disable=protected-access
 
 
 @pytest.mark.parametrize(
-    ("kind", "dimensions"),
+    ("ctor", "dimensions"),
     [
-        ("circle", (0.0,)),
-        ("circle", (-1.0,)),
-        ("ellipse", (2.0, 0.0)),
-        ("rectangle", (-4.0, 5.0)),
-        ("rectangle", (4.0, math.inf)),
+        (geo.CylinderCrossSection.circle, (0.0,)),
+        (geo.CylinderCrossSection.circle, (-1.0,)),
+        (geo.CylinderCrossSection.ellipse, (2.0, 0.0)),
+        (geo.CylinderCrossSection.rectangle, (-4.0, 5.0)),
+        (geo.CylinderCrossSection.rectangle, (4.0, math.inf)),
     ],
     ids=["circle-zero", "circle-neg", "ellipse-zero", "rect-neg", "rect-inf"],
 )
-def test_cylinder_cross_section_rejects_non_positive_dimensions(kind, dimensions):
+def test_cylinder_cross_section_rejects_non_positive_dimensions(ctor, dimensions):
     with pytest.raises(ValueError, match="finite and > 0"):
-        geo.CylinderCrossSection(kind, dimensions)
+        ctor(*dimensions)
 
 
 def test_cylinder_cross_section_rejects_ellipse_semi_major_lt_minor():
     with pytest.raises(ValueError, match="semi_major must be >= semi_minor"):
-        geo.CylinderCrossSection("ellipse", (1.0, 2.0))
+        geo.CylinderCrossSection.ellipse(1.0, 2.0)
 
 
 def test_cylinder_cross_section_allows_ellipse_equal_axes():
-    cs = geo.CylinderCrossSection("ellipse", (2.0, 2.0))
+    cs = geo.CylinderCrossSection.ellipse(2.0, 2.0)
     assert cs.semi_major == 2.0
     assert cs.semi_minor == 2.0
 
 
 def test_cylinder_cross_section_default_approximate_is_false():
-    assert geo.CylinderCrossSection("circle", (1.0,)).approximate is False
+    assert geo.CylinderCrossSection.circle(1.0).approximate is False
+
+
+def test_cylinder_cross_section_circle_classmethod_forbids_approximate_true():
+    # TASK 2 (PR #78 review): the circle-is-always-exact guard in
+    # ``__validate__`` (geometry.py ~1552) rejects ``kind="circle"`` paired with
+    # ``approximate=True``. The public ``circle`` classmethod hard-codes
+    # ``approximate=False``, so the invalid combo is unconstructable through the
+    # supported API — confirmed by reading the source. The only path that can
+    # still feed ``approximate=True`` for a circle is the private ``_build``
+    # factory, so drive the guard there to keep it covered.
+    with pytest.raises(ValueError, match="circle is always exact"):
+        geo.CylinderCrossSection._build("circle", (2.0,), approximate=True)  # pylint: disable=protected-access
+    # And the supported constructor can never reach that bad state:
+    assert geo.CylinderCrossSection.circle(2.0).approximate is False
 
 
 # ---------------------------------------------------------------------------
@@ -1913,14 +2094,14 @@ def test_cylinder_cross_section_default_approximate_is_false():
     ("cs", "valid", "invalid"),
     [
         # ``radius`` of an ellipse is its semi-minor axis (the cylinder radius).
-        (geo.CylinderCrossSection("circle", (3.0,)), {"radius": 3.0}, ["semi_major", "width"]),
+        (geo.CylinderCrossSection.circle(3.0), {"radius": 3.0}, ["semi_major", "width"]),
         (
-            geo.CylinderCrossSection("ellipse", (5.0, 3.0)),
+            geo.CylinderCrossSection.ellipse(5.0, 3.0),
             {"semi_major": 5.0, "semi_minor": 3.0, "radius": 3.0},
             ["width", "height"],
         ),
         (
-            geo.CylinderCrossSection("rectangle", (4.0, 5.0)),
+            geo.CylinderCrossSection.rectangle(4.0, 5.0),
             {"width": 4.0, "height": 5.0},
             ["radius", "semi_major", "semi_minor"],
         ),

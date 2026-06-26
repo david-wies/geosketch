@@ -43,26 +43,14 @@ max-returns = 12
 
 [tool.pylint.format]
 max-line-length = 100
-# tests/test_geometry.py and tests/test_dep_graph.py are each single cohesive
-# suites (known-input/known-output for the geometry service; one-test-per-path
-# edge-table + invariant coverage for the dependency graph) that naturally run
-# long; splitting either would only duplicate fixtures. geometry/services/
-# geometry.py is likewise one cohesive module (every numeric geometry op lives
-# there by design) carrying multi-paragraph NumPy docstrings on each public
-# function; the 3D-solid additions (ball/cylinder/solid volume + cross-section,
-# convex_hull_3d, the facet-shell/stack guards and their rationale comments)
-# pushed it past 1700. The cross-section PR-review polish (CylinderCrossSection
-# read-only accessors, the ellipse semi_major>=semi_minor invariant, and the
-# through-axis ``approximate`` flag) plus matching tests then pushed both files
-# past 1800. 1900 keeps headroom without inviting an arbitrary split that would
-# only scatter tightly-related geometry across files. The 3D-solid PR-review test
-# gaps (sin/cos-swap axis case, non-zero-altitude tangent, facet-shell surface-area
-# rejection, off-center tetra centroid) then reached exactly 1900, so 2000. The
-# PR #78 review-finding tests (non-finite distance_to_plane / plane_normal guards,
-# the differing-vertex-count band parametrized across all three solid entry points,
-# and a truncated-pyramid frustum exercising the slanted-quad multi-band builder)
-# pushed test_geometry.py past 2000, so 2100.
-max-module-lines = 2100
+# Raised above the 1000-line default because three modules are each a single
+# cohesive unit that would only fragment if split: tests/test_geometry.py and
+# tests/test_dep_graph.py (known-input/known-output and one-test-per-path edge
+# tables — splitting duplicates fixtures), and geometry/services/geometry.py
+# (every numeric 2-D and 3-D/solid geometry op lives here by design, each public
+# function carrying a multi-paragraph NumPy docstring). The limit is set to
+# accommodate that intentional cohesion rather than to invite an arbitrary split.
+max-module-lines = 2300
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
