@@ -50,7 +50,10 @@ max-line-length = 100
 # (every numeric 2-D and 3-D/solid geometry op lives here by design, each public
 # function carrying a multi-paragraph NumPy docstring). The limit is set to
 # accommodate that intentional cohesion rather than to invite an arbitrary split.
-max-module-lines = 2300
+# Bumped 2300→2400 as tests/test_geometry.py grew with the issue #60/#78 3-D
+# solid coverage (HullFallback discriminator, bipyramid double-point B-rep branch,
+# KeyError→ValueError and TypeError guards).
+max-module-lines = 2400
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

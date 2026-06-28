@@ -76,6 +76,7 @@ that invariant, not a recoverable condition.
 
 from __future__ import annotations
 
+import enum
 import logging
 import math
 from collections.abc import Mapping, Sequence
@@ -842,7 +843,7 @@ def vector_endpoint(origin: Point, length: float, az: float, el: float = 0.0) ->
     intentionally carries no ``math.isfinite`` guard — unlike
     :func:`horizontal_unit_vector`, which validates because it resolves a stored
     ``direction`` that may have been corrupted on deserialisation.
-    ``vector_endpoint`` takes plain scalar arguments that the command layer
+    ``vector_endpoint`` takes plain scalar arguments that any future caller
     computes locally, so the validation responsibility sits with the caller. A
     non-finite argument propagates silently into a ``nan``/``inf`` endpoint
     array; callers passing values from an untrusted source must check them
@@ -931,6 +932,40 @@ def three_point_azimuth_elevation(
 # ---------------------------------------------------------------------------
 
 
+class HullFallback(enum.Enum):
+    """Which path :func:`convex_hull_3d` took to produce its Solid.
+
+    Returned as the third element of the :func:`convex_hull_3d` tuple, this is a
+    **transient, non-persisted** discriminator that lets a caller tell a genuine
+    3-D hull apart from the two degenerate flat-Solid fallbacks *without* parsing
+    the Solid's human-readable ``name``. It replaces the earlier brittle,
+    stringly-typed name-substring sniff; the enum is the contract, the names are
+    now display labels only.
+
+    It is deliberately **not** a field on the persisted
+    :class:`~geometry.models.solid.Solid` model. A schema-level
+    ``Solid.layers_kind`` discriminator (facet-shell vs cross-section stack, so
+    the Solid itself records which structure its ``layers`` hold) remains a
+    separate DEFERRED fast-follow — see ``docs/implementation-design.md`` §13.7
+    — and is intentionally *not* implemented here.
+
+    Members
+    -------
+    NONE
+        A genuine rank-3 convex hull was built: the Solid is a B-rep facet shell.
+    COPLANAR
+        The deliberate rank ``< 3`` coplanar fallback — a flat, zero-extent Solid
+        built from the 2-D hull (the expected flat-input feature).
+    QHULL_FAILURE
+        A rank-3 point set that QHull nonetheless rejected on a
+        precision/degeneracy borderline, routed to the same flat 2-D fallback.
+    """
+
+    NONE = "none"
+    COPLANAR = "coplanar"
+    QHULL_FAILURE = "qhull_failure"
+
+
 def _is_coplanar(coords: np.ndarray) -> bool:
     """Whether all rows of ``coords`` lie on a common plane in 3-D.
 
@@ -944,11 +979,66 @@ def _is_coplanar(coords: np.ndarray) -> bool:
     return bool(np.linalg.matrix_rank(centered, tol=EPS_DISTANCE) < 3)
 
 
+def _hull_facets(
+    hull: ConvexHull,
+    coords: np.ndarray,
+    ids: Sequence[str],
+    id_factory: IDFactory,
+) -> list[Polygon]:
+    """Triangle :class:`Polygon` facets of a 3-D :class:`scipy.spatial.ConvexHull`.
+
+    Each QHull simplex becomes one triangle Polygon referencing the original
+    vertex Point IDs (``ids`` indexes into the input set, so no new points are
+    minted). The triangle is wound so its right-hand normal agrees with QHull's
+    outward facet normal (``hull.equations``); QHull's own simplex vertex order
+    is not consistently oriented.
+
+    Split out of :func:`convex_hull_3d` so that function stays within the
+    local-variable budget — the per-facet winding locals live here.
+
+    Parameters
+    ----------
+    hull : scipy.spatial.ConvexHull
+        The computed 3-D hull.
+    coords : numpy.ndarray
+        Point cloud, shape ``(n, 3)``, aligned with ``ids``.
+    ids : Sequence[str]
+        Point IDs aligned with ``coords`` rows.
+    id_factory : IDFactory
+        Source of the new facet Polygon IDs.
+    """
+    facets: list[Polygon] = []
+    for simplex, equation in zip(hull.simplices, hull.equations):
+        tri = list(simplex)
+        normal = equation[:3]
+        # Orient the triangle so its right-hand normal agrees with QHull's
+        # outward facet normal; QHull's simplex order is not itself consistent.
+        # NOTE: hull facets are wound by 3-D OUTWARD NORMAL, deliberately NOT by
+        # 2-D CCW (invariant #3). Do not "fix" this by running facets through
+        # 2-D CCW normalization — that would corrupt the shell's orientation.
+        v0, v1, v2 = (coords[tri[0]], coords[tri[1]], coords[tri[2]])
+        if float(np.dot(np.cross(v1 - v0, v2 - v0), normal)) < 0.0:
+            tri = [tri[0], tri[2], tri[1]]
+        facets.append(
+            Polygon(
+                id=id_factory.next_id("pg"),
+                name="hull_facet",
+                alpha=1.0,
+                visibility=True,
+                point_ids=[ids[i] for i in tri],
+                is_convex=True,
+                line_color="#000000",
+                fill_color="#808080",
+            )
+        )
+    return facets
+
+
 def convex_hull_3d(
     points_3d: Mapping[str, Point],
     point_ids: Sequence[str],
     id_factory: IDFactory,
-) -> tuple[Solid, list[Polygon]]:
+) -> tuple[Solid, list[Polygon], HullFallback]:
     """Convex hull of a 3-D point set as a :class:`Solid` of triangular facets.
 
     Runs :class:`scipy.spatial.ConvexHull` on the ``(easting, northing,
@@ -972,7 +1062,7 @@ def convex_hull_3d(
     ``docs/implementation-design.md`` §13.12):
     the number of facets is unknown until QHull runs, so the function takes an
     :class:`~geometry.utils.id_factory.IDFactory` and calls ``next_id`` for the
-    Solid (``so``) and each facet Polygon (``pg``). The command layer passes
+    Solid (``so``) and each facet Polygon (``pg``). Any future caller passes its
     ``project.id_factory``.
 
     Facet triangles are wound so their right-hand normal matches the outward
@@ -1006,9 +1096,15 @@ def convex_hull_3d(
 
     Returns
     -------
-    tuple[Solid, list[Polygon]]
-        The hull Solid and the list of its facet Polygons, for the command
-        layer to insert into the project store.
+    tuple[Solid, list[Polygon], HullFallback]
+        The hull Solid, the list of its facet Polygons (for the caller to insert
+        into the project store), and a :class:`HullFallback` discriminator naming
+        which path produced the Solid. ``HullFallback.NONE`` for a real rank-3
+        hull (facet shell); ``HullFallback.COPLANAR`` for the deliberate flat
+        fallback; ``HullFallback.QHULL_FAILURE`` for the rank-3-but-QHull-rejected
+        flat fallback. The enum is the structured replacement for the former
+        name-substring discriminator — branch on it rather than parsing the
+        Solid's ``name``.
 
     Raises
     ------
@@ -1020,7 +1116,12 @@ def convex_hull_3d(
     ids = list(point_ids)
     if len(ids) < 4:
         raise ValueError(f"convex_hull_3d requires at least 4 points; got {len(ids)}")
-    coords = np.array([_xyz(points_3d[pid]) for pid in ids], dtype=np.float64)
+    try:
+        coords = np.array([_xyz(points_3d[pid]) for pid in ids], dtype=np.float64)
+    except KeyError as exc:
+        raise ValueError(
+            f"convex_hull_3d: point ID {exc.args[0]!r} is not present in points_3d"
+        ) from exc
 
     # Guard non-finite coordinates up front so a nan/inf does not get funnelled
     # into the coplanar fallback and silently masquerade as flat geometry. Only
@@ -1031,7 +1132,8 @@ def convex_hull_3d(
     # Detect coplanarity deliberately (see _is_coplanar) rather than inferring
     # it from a QhullError, which also fires for precision/duplicate failures.
     if _is_coplanar(coords):
-        return _coplanar_fallback_solid(coords, ids, id_factory)
+        solid, facets = _coplanar_fallback_solid(coords, ids, id_factory)
+        return solid, facets, HullFallback.COPLANAR
 
     try:
         hull = ConvexHull(coords)
@@ -1039,56 +1141,28 @@ def convex_hull_3d(
         # Reached only for a genuinely degenerate/precision-borderline set that
         # passed the rank screen; fall back to the flat 2-D hull.
         #
-        # NOTE (deferred — two-fallback ambiguity): this QHull-failure fallback
-        # and the deliberate-coplanar fallback above both return a degenerate
-        # flat Solid, distinguishable today only by the Solid's ``name``
-        # substring (a brittle, stringly-typed discriminator the command layer
-        # must parse). A structured discriminator (e.g. an enum returned
-        # alongside the Solid, or a transient non-persisted field on the result)
-        # was deferred: ``Solid`` is a persisted model with a strict
-        # ``__post_init__`` and the return type is the bare
-        # ``tuple[Solid, list[Polygon]]`` used by every caller, so a faithful
-        # structured fix means widening the return signature (or the schema) —
-        # a larger, breaking refactor outside this change's scope. Recommended
-        # fix: return ``tuple[Solid, list[Polygon], HullFallback]`` where
-        # ``HullFallback`` is an enum of ``{NONE, COPLANAR, QHULL_FAILURE}``,
-        # and migrate callers off the name-substring sniff.
+        # This QHull-failure fallback and the deliberate-coplanar fallback above
+        # both return a degenerate flat Solid. They are told apart by the
+        # ``HullFallback`` enum attached to each return value (here,
+        # ``HullFallback.QHULL_FAILURE``; coplanar above, ``HullFallback.COPLANAR``),
+        # *not* by parsing the Solid's ``name`` — the human-readable name labels
+        # are display-only. (A schema-level ``Solid.layers_kind`` discriminator on
+        # the persisted model remains a separate DEFERRED fast-follow; see
+        # ``docs/implementation-design.md`` §13.7 and :class:`HullFallback`.)
         _logger.warning(
             "convex_hull_3d: a rank-3 point set failed QHull on a "
             "precision/degeneracy borderline; routing to the flat 2-D fallback.",
             exc_info=exc,
         )
-        return _coplanar_fallback_solid(
+        solid, facets = _coplanar_fallback_solid(
             coords,
             ids,
             id_factory,
             name="Convex Hull 3D (QHull failure — degenerate)",
         )
+        return solid, facets, HullFallback.QHULL_FAILURE
 
-    facets: list[Polygon] = []
-    for simplex, equation in zip(hull.simplices, hull.equations):
-        tri = list(simplex)
-        normal = equation[:3]
-        # Orient the triangle so its right-hand normal agrees with QHull's
-        # outward facet normal; QHull's simplex order is not itself consistent.
-        # NOTE: hull facets are wound by 3-D OUTWARD NORMAL, deliberately NOT by
-        # 2-D CCW (invariant #3). Do not "fix" this by running facets through
-        # 2-D CCW normalization — that would corrupt the shell's orientation.
-        v0, v1, v2 = (coords[tri[0]], coords[tri[1]], coords[tri[2]])
-        if float(np.dot(np.cross(v1 - v0, v2 - v0), normal)) < 0.0:
-            tri = [tri[0], tri[2], tri[1]]
-        facets.append(
-            Polygon(
-                id=id_factory.next_id("pg"),
-                name="hull_facet",
-                alpha=1.0,
-                visibility=True,
-                point_ids=[ids[i] for i in tri],
-                is_convex=True,
-                line_color="#000000",
-                fill_color="#808080",
-            )
-        )
+    facets = _hull_facets(hull, coords, ids, id_factory)
 
     # NOTE: this Solid is a B-rep *facet shell*, not a cross-section *stack*.
     # Its ``layers`` are triangular hull facets that share vertices across the
@@ -1106,6 +1180,7 @@ def convex_hull_3d(
             fill_color="#808080",
         ),
         facets,
+        HullFallback.NONE,
     )
 
 
@@ -1121,9 +1196,8 @@ def _coplanar_fallback_solid(
     with two identical Polygon layers (zero extent → zero volume). Raises
     ``ValueError`` if the 2-D hull is itself degenerate (collinear points).
 
-    Two :func:`convex_hull_3d` call sites share this helper, and they pass
-    distinct ``name`` values so the command layer can tell the causes apart from
-    the resulting Solid's name alone (no schema-level flag exists):
+    Two :func:`convex_hull_3d` call sites share this helper and pass distinct
+    ``name`` values purely as **display labels**:
 
     * the **deliberately coplanar** branch (the expected flat-input feature)
       keeps the default ``"Convex Hull 3D (degenerate)"``;
@@ -1132,7 +1206,11 @@ def _coplanar_fallback_solid(
       ``"Convex Hull 3D (QHull failure — degenerate)"``.
 
     The zero-volume / ``EPS_VOLUME`` degeneracy semantics are identical for both
-    names; only the label differs.
+    names; only the label differs. Control flow no longer parses these names: the
+    caller (:func:`convex_hull_3d`) attaches the structured
+    :class:`HullFallback` discriminator (``COPLANAR`` vs ``QHULL_FAILURE``) to its
+    return value, and that enum — not the name — is the contract callers branch
+    on.
 
     Parameters
     ----------
@@ -1390,15 +1468,18 @@ _CROSS_SECTION_ARITY: dict[str, int] = {"circle": 1, "ellipse": 2, "rectangle": 
 class CylinderCrossSection:
     """Shape of a planar slice through a cylinder.
 
-    The class makes illegal states unrepresentable. Instances are built **only**
-    through the kind-specific classmethod constructors :meth:`circle`,
-    :meth:`ellipse`, and :meth:`rectangle`; ``kind`` and ``_dimensions`` are
-    ``init=False`` fields set by those factories, so the per-kind arity
-    invariant (circle = 1 dimension, ellipse/rectangle = 2) is structurally
-    unviolatable — there is no positional path that could pair, say, ``"circle"``
-    with two dimensions. ``__post_init__`` still validates positivity and the
-    ellipse ordering as defence in depth. The dataclass is frozen, so once
-    validated an instance stays consistent.
+    Instances are built **only** through the kind-specific classmethod
+    constructors :meth:`circle`, :meth:`ellipse`, and :meth:`rectangle`; ``kind``
+    and ``_dimensions`` are ``init=False`` fields set by those factories, so the
+    per-kind arity invariant (circle = 1 dimension, ellipse/rectangle = 2) is
+    structurally unviolatable — there is no positional path that could pair, say,
+    ``"circle"`` with two dimensions. Because those fields have no default, a
+    direct ``CylinderCrossSection()`` would otherwise construct a zombie with
+    ``kind``/``_dimensions`` unset (raising only later, on access);
+    :meth:`__post_init__` closes that path by rejecting any non-factory
+    construction with a ``TypeError``. :meth:`_validate` (run by the factories)
+    additionally checks positivity and the ellipse ordering as defence in depth.
+    The dataclass is frozen, so once validated an instance stays consistent.
 
     Fields
     ------
@@ -1514,19 +1595,46 @@ class CylinderCrossSection:
         Routing every classmethod through this single factory keeps the
         ``kind``↔arity pairing in one place, so the constructors cannot mint an
         inconsistent instance.
+
+        The instance is allocated with ``object.__new__`` to bypass the generated
+        ``__init__`` (and hence :meth:`__post_init__`): the bare-construction
+        guard in ``__post_init__`` keys off ``kind`` being unset, which is exactly
+        the transient state ``__init__`` would leave the instance in *before*
+        this factory assigns the ``init=False`` fields. Bypassing ``__init__``
+        lets the factory populate the fields and run the full :meth:`_validate`
+        without tripping its own guard.
         """
-        instance = cls(approximate=approximate)
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "approximate", approximate)
         object.__setattr__(instance, "kind", kind)
         object.__setattr__(instance, "_dimensions", dimensions)
-        instance.__validate__()
+        instance._validate()
         return instance
 
-    def __validate__(self) -> None:
+    def __post_init__(self) -> None:
+        """Reject direct (non-factory) construction of a bare instance.
+
+        Because ``kind`` and ``_dimensions`` are ``init=False`` with no default,
+        a direct ``CylinderCrossSection()`` / ``CylinderCrossSection(approximate=…)``
+        call constructs an instance with those fields **unset** — a zombie that
+        only raises ``AttributeError`` on later access. This guard closes that
+        path: it fires whenever ``kind`` is absent (the un-built state) and
+        directs callers to the kind-specific factories. The legitimate factory
+        path goes through :meth:`_build`, which allocates via ``object.__new__``
+        and so never runs this hook.
+        """
+        if "kind" not in self.__dict__:
+            raise TypeError(
+                "CylinderCrossSection cannot be constructed directly; use the "
+                "CylinderCrossSection.circle / .ellipse / .rectangle factories"
+            )
+
+    def _validate(self) -> None:
         """Validate the ``init=False`` fields after the factory sets them.
 
-        Not ``__post_init__``: the auto-generated ``__init__`` runs before
-        ``kind``/``_dimensions`` are assigned, so validation is invoked by
-        :meth:`_build` once the instance is fully populated.
+        Invoked by :meth:`_build` once the instance is fully populated (the
+        generated ``__init__`` is bypassed for the factory path, so this is not
+        ``__post_init__``).
         """
         expected = _CROSS_SECTION_ARITY[self.kind]
         if len(self._dimensions) != expected:
@@ -1726,7 +1834,13 @@ def _ensure_solid_is_stack(solid: Solid, objects: Mapping[str, GeoObject]) -> No
     for layer_id in solid.layers:
         if layer_id.startswith("pt_"):
             continue
-        polygon = objects[layer_id]
+        try:
+            polygon = objects[layer_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"_ensure_solid_is_stack: Solid {solid.id!r} references layer "
+                f"{layer_id!r}, which is absent from the object store"
+            ) from exc
         for pid in set(polygon.point_ids):  # one count per layer per vertex
             layer_counts[pid] = layer_counts.get(pid, 0) + 1
     offenders = sorted(pid for pid, count in layer_counts.items() if count > 2)
@@ -1774,7 +1888,13 @@ def _solid_layer_rings(
         if layer_id.startswith("pt_"):
             rings.append((True, [_xyz(points[layer_id])]))
         else:
-            polygon = objects[layer_id]
+            try:
+                polygon = objects[layer_id]
+            except KeyError as exc:
+                raise ValueError(
+                    f"_solid_layer_rings: Solid {solid.id!r} references layer "
+                    f"{layer_id!r}, which is absent from the object store"
+                ) from exc
             rings.append((False, [_xyz(points[pid]) for pid in polygon.point_ids]))
     if not all(np.all(np.isfinite(v)) for _, ring in rings for v in ring):
         raise ValueError("solid layer vertices contain nan or ±inf")
@@ -1935,10 +2055,11 @@ def solid_volume_centroid(
     vertex (the first vertex of the first face), not the absolute UTM origin.
     Mirtich's decomposition is translation-invariant in the volume and the
     centroid simply translates by the same offset, so this is exact — but it
-    avoids the catastrophic cancellation that would otherwise lose ~5 significant
-    digits: at UTM magnitudes (E~5e5, N~4e6) the unshifted tetra products are
-    ~1e17 and the volume emerges as their tiny difference. The reference offset
-    is added back to the returned centroid; the volume needs no correction.
+    avoids the catastrophic cancellation that, depending on the solid's scale,
+    can lose several significant digits at UTM magnitudes: with E~5e5, N~4e6 the
+    unshifted tetra products run to ~1e17 and the volume emerges as their tiny
+    difference. The reference offset is added back to the returned centroid; the
+    volume needs no correction.
 
     Because every face is consistently wound (:func:`solid_faces`), the signed
     volume's global sign is uniform: the reported volume is its magnitude, and
@@ -1970,9 +2091,10 @@ def solid_volume_centroid(
     -------
     tuple[numpy.float64, numpy.ndarray]
         ``(volume, centroid)`` — non-negative volume in cubic metres and the
-        ``(easting, northing, altitude)`` centroid, shape ``(3,)``. A
-        zero-volume (or non-finite) Solid returns ``(0.0, np.full(3, nan))``:
-        the centroid is undefined, not the UTM origin.
+        ``(easting, northing, altitude)`` centroid, shape ``(3,)``. A genuine
+        zero-extent (coplanar, ``|volume| < EPS_VOLUME``) Solid returns
+        ``(0.0, np.full(3, nan))``: the centroid is undefined, not the UTM
+        origin. A *non-finite* accumulation does **not** return here — see Raises.
 
     Raises
     ------
@@ -1981,7 +2103,10 @@ def solid_volume_centroid(
         stack (propagated from :func:`solid_faces`). The underlying B-rep also
         asserts at least two layers, but :meth:`Solid.__post_init__` already
         rejects a 0- or 1-layer Solid at construction, so a real Solid can
-        never trigger that path.
+        never trigger that path. Also raised if the signed-volume accumulation
+        is non-finite (``nan``/``±inf``) — a corrupt computation from arithmetic
+        overflow at UTM magnitudes or nan/inf vertices — which is reported as an
+        error rather than folded into the clean zero-extent return.
     """
     faces = solid_faces(solid, objects, points)
     # Anchor the accumulation at the first vertex to keep the tetra products in a
@@ -1997,11 +2122,22 @@ def solid_volume_centroid(
             tetra = float(np.dot(v0, np.cross(v1, v2))) / 6.0
             signed_v += tetra
             moment += tetra * (v0 + v1 + v2) / 4.0
-    # A non-finite signed volume (from a nan/inf vertex) must not slip past the
-    # degeneracy gate: ``nan < EPS_VOLUME`` is False, so without this branch the
-    # function would return ``(nan, moment/nan)``. Treat non-finite as degenerate
-    # alongside the genuine zero-extent case.
-    if not math.isfinite(float(signed_v)) or abs(signed_v) < EPS_VOLUME:
+    # A non-finite signed volume is a *corrupt* accumulation, not a degenerate
+    # solid: it means the tetra products overflowed (real at UTM magnitudes,
+    # where unshifted coordinates push intermediates toward float64's range) or a
+    # nan/inf vertex slipped through. It is distinct from the genuine zero-extent
+    # case below and must fail loud rather than masquerade as a clean zero —
+    # ``nan < EPS_VOLUME`` is False, so it would otherwise fall through to the
+    # final return as ``(nan, moment/nan)``.
+    if not math.isfinite(float(signed_v)):
+        raise ValueError(
+            "solid_volume_centroid: non-finite signed volume "
+            f"({float(signed_v)!r}) — overflow or nan/inf vertices corrupted the "
+            "accumulation"
+        )
+    # Genuine zero-extent (coplanar / degenerate) solid: report zero volume with
+    # an undefined (nan) centroid rather than a fabricated UTM origin.
+    if abs(signed_v) < EPS_VOLUME:
         return np.float64(0.0), np.full(3, np.nan, dtype=np.float64)
     # Centroid was computed in the shifted frame; translate it back by ``ref``.
     return np.float64(abs(signed_v)), moment / signed_v + ref

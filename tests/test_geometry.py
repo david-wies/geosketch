@@ -1533,7 +1533,8 @@ def test_convex_hull_3d_unit_cube():
             [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
         )
     }
-    solid, facets = geo.convex_hull_3d(pts, list(pts), IDFactory())
+    solid, facets, fallback = geo.convex_hull_3d(pts, list(pts), IDFactory())
+    assert fallback is geo.HullFallback.NONE  # genuine rank-3 hull, not a fallback
     assert solid.id.startswith("so_")
     assert all(f.id.startswith("pg_") for f in facets)
     assert len(solid.layers) == len(facets)
@@ -1554,8 +1555,12 @@ def test_convex_hull_3d_coplanar_fallback_degenerate():
         "p2": _pt("p2", 1, 1, 0.0),
         "p3": _pt("p3", 0, 1, 0.0),
     }
-    solid, polygons = geo.convex_hull_3d(pts, list(pts), IDFactory())
+    solid, polygons, fallback = geo.convex_hull_3d(pts, list(pts), IDFactory())
+    # The deliberate rank<3 fallback: branch on the structured discriminator, not
+    # the Solid's display name.
+    assert fallback is geo.HullFallback.COPLANAR
     assert len(polygons) == 1
+    # The Solid is the degenerate flat one: two identical zero-extent layers.
     assert len(solid.layers) == 2
     assert solid.layers[0] == solid.layers[1]  # two identical flat layers
     objects = {polygons[0].id: polygons[0]}
@@ -1588,10 +1593,13 @@ def test_convex_hull_3d_qhull_error_routes_to_flat_fallback(monkeypatch, caplog)
         "p3": _pt("p3", 0, 0, 1.0),  # apex lifts the set to full rank-3
     }
     with caplog.at_level(logging.WARNING, logger=geo._logger.name):  # pylint: disable=protected-access
-        solid, polygons = geo.convex_hull_3d(pts, list(pts), IDFactory())
+        solid, polygons, fallback = geo.convex_hull_3d(pts, list(pts), IDFactory())
 
     # The fallback ran (real ConvexHull was reached on the 2-D retry) and
     # produced the degenerate flat Solid: a single facet polygon stored twice.
+    # The QHull-failure route is distinguished from the deliberate-coplanar route
+    # by the enum, not by parsing the Solid's name.
+    assert fallback is geo.HullFallback.QHULL_FAILURE
     assert calls["n"] == 2
     assert len(polygons) == 1
     assert len(solid.layers) == 2
@@ -1628,6 +1636,23 @@ def test_convex_hull_3d_non_finite_coord_raises(bad):
         geo.convex_hull_3d(points, list(points), IDFactory())
 
 
+def test_convex_hull_3d_missing_point_id_raises_value_error():
+    # A ``point_ids`` entry absent from ``points_3d`` previously surfaced as a
+    # bare ``KeyError`` from the ``_xyz`` coordinate lookup; it now raises a
+    # descriptive ``ValueError`` naming the offending ID, so upstream
+    # referential-integrity bugs report against the input rather than an opaque
+    # mapping miss.
+    pts = {
+        "p0": _pt("p0", 0, 0, 0.0),
+        "p1": _pt("p1", 1, 0, 0.0),
+        "p2": _pt("p2", 0, 1, 0.0),
+        "p3": _pt("p3", 0, 0, 1.0),
+    }
+    ids = ["p0", "p1", "p2", "p3", "p_missing"]  # 5 ids clears the >=4 guard
+    with pytest.raises(ValueError, match="p_missing"):
+        geo.convex_hull_3d(pts, ids, IDFactory())
+
+
 def test_convex_hull_3d_facets_wound_outward():
     # Every facet normal (right-hand rule over its stored vertex order) must
     # point away from the hull interior. The unit-cube test above uses abs() on
@@ -1640,7 +1665,8 @@ def test_convex_hull_3d_facets_wound_outward():
             [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
         )
     }
-    _solid, facets = geo.convex_hull_3d(pts, list(pts), IDFactory())
+    _solid, facets, fallback = geo.convex_hull_3d(pts, list(pts), IDFactory())
+    assert fallback is geo.HullFallback.NONE  # genuine rank-3 hull
     all_coords = np.array(
         [geo._xyz(p) for p in pts.values()],  # pylint: disable=protected-access
         dtype=np.float64,
@@ -1664,7 +1690,7 @@ def test_solid_volume_centroid_rejects_hull_facet_shell():
             [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
         )
     }
-    solid, facets = geo.convex_hull_3d(pts, list(pts), IDFactory())
+    solid, facets, _fallback = geo.convex_hull_3d(pts, list(pts), IDFactory())
     objects = {f.id: f for f in facets}
     with pytest.raises(ValueError, match="facet shell"):
         geo.solid_volume_centroid(solid, objects, pts)
@@ -1679,6 +1705,18 @@ def test_solid_volume_centroid_accepts_legitimate_stack():
     assert volume == pytest.approx(1.0)
 
 
+def test_solid_volume_centroid_missing_layer_id_raises_value_error():
+    # A Solid layer ID absent from the object store previously surfaced as a bare
+    # ``KeyError`` from ``_ensure_solid_is_stack``'s lookup; it now raises a
+    # descriptive ``ValueError`` naming the missing layer. ``_ensure_solid_is_stack``
+    # runs first in ``_solid_brep``, so the public ``solid_volume_centroid`` entry
+    # point reaches the converted error.
+    _, objects, pts = _unit_cube()  # objects has pg_b and pg_t
+    solid = _solid(("pg_b", "pg_missing"))  # pg_missing is not in the object store
+    with pytest.raises(ValueError, match="pg_missing"):
+        geo.solid_volume_centroid(solid, objects, pts)
+
+
 def test_solid_surface_areas_reject_hull_facet_shell():
     # Both surface-area functions go through the same _solid_brep /
     # _ensure_solid_is_stack guard as solid_volume_centroid, so a B-rep facet
@@ -1690,7 +1728,7 @@ def test_solid_surface_areas_reject_hull_facet_shell():
             [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
         )
     }
-    solid, facets = geo.convex_hull_3d(pts, list(pts), IDFactory())
+    solid, facets, _fallback = geo.convex_hull_3d(pts, list(pts), IDFactory())
     objects = {f.id: f for f in facets}
     with pytest.raises(ValueError, match="facet shell"):
         geo.solid_lateral_surface_area(solid, objects, pts)
@@ -1839,6 +1877,69 @@ def test_solid_volume_pyramid_apex_first_layer_matches():
     assert geo.solid_total_surface_area(flipped, objects, pts) == pytest.approx(expected_total)
 
 
+def _bipyramid(half_height: float = 3.0):
+    """Return (solid, objects, points) for a square bipyramid (apex-base-apex).
+
+    Two square pyramids joined base-to-base: a shared square base
+    ``(0,0)-(2,2)`` at ``z=0`` (area 4) with a bottom apex (nadir) at
+    ``(1, 1, -half_height)`` and a top apex at ``(1, 1, +half_height)``. The
+    layer stack is ``(pt_ nadir, pg_ base, pt_ apex)`` — a ``[pt_, pg_, pt_]``
+    pattern with point layers on **both** ends, which makes it the no-cap fan
+    B-rep: :func:`_solid_brep` emits no cap faces (both end layers are points)
+    and both lateral bands are triangle fans — the ``lower_is_pt`` reverse-wound
+    fan for the nadir→base band and the ``upper_is_pt`` fan for the base→apex
+    band. The single-apex :func:`_square_pyramid` only ever drives one fan branch
+    per Solid; this stack drives both, the branch the prior review flagged as
+    uncovered.
+
+    Stand-in Solid (model conflict)
+    -------------------------------
+    The real :class:`~geometry.models.solid.Solid` rejects a stack with **more
+    than one** Point-ID layer (``Solid.__post_init__``, spec §10: at most one
+    apex/nadir), so a genuine ``[pt_, pg_, pt_]`` bipyramid Solid cannot be
+    constructed through the model and the no-cap/both-fan B-rep path is
+    unreachable via a real Solid. To exercise that path the Solid is supplied as
+    a minimal :class:`~types.SimpleNamespace` stand-in exposing only the two
+    attributes the B-rep machinery reads — ``id`` and ``layers`` — mirroring the
+    ``SimpleNamespace`` seam this module already uses to reach code the data
+    models otherwise block.
+
+    Closed-form volume
+    ------------------
+    Two pyramids of base area ``A = 4`` and height ``half_height`` give
+    ``2 · (1/3 · A · half_height)``. For ``half_height = 3`` that is
+    ``2 · (1/3 · 4 · 3) = 8``. By the up/down symmetry of the two equal apexes
+    the centroid is the base centre ``(1, 1, 0)``.
+    """
+    pts = {
+        "pb0": _pt("pb0", 0, 0, 0.0),
+        "pb1": _pt("pb1", 2, 0, 0.0),
+        "pb2": _pt("pb2", 2, 2, 0.0),
+        "pb3": _pt("pb3", 0, 2, 0.0),
+        "pt_nadir": _pt("pt_nadir", 1, 1, -half_height),
+        "pt_apex": _pt("pt_apex", 1, 1, half_height),
+    }
+    base = _poly("pg_base", ("pb0", "pb1", "pb2", "pb3"))
+    solid = SimpleNamespace(id="so_bipyramid", layers=("pt_nadir", "pg_base", "pt_apex"))
+    objects = {"pg_base": base}
+    return solid, objects, pts
+
+
+def test_solid_volume_bipyramid_double_point_layers():
+    # The [pt_, pg_, pt_] stack drives the no-cap, both-fan B-rep branch the
+    # single-apex pyramid leaves half-covered (see _bipyramid for why a stand-in
+    # Solid is required — the model forbids two Point layers). Two pyramids
+    # base-to-base over a 2x2 base (area 4) with half-height 3 give volume
+    # 2·(1/3·4·3) = 8, and by symmetry the centroid is the base centre (1, 1, 0).
+    # The Wuttke (2021) cross-check guards the triangle-fan winding of both
+    # apex branches independently of the divergence-theorem accumulation.
+    solid, objects, pts = _bipyramid(half_height=3.0)
+    volume, centroid = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(8.0)
+    assert centroid == pytest.approx([1.0, 1.0, 0.0])
+    assert volume == pytest.approx(_wuttke_volume(solid, objects, pts))
+
+
 def test_solid_volume_centroid_degenerate_returns_nan_not_origin():
     # A coplanar, zero-extent Solid (two identical flat layers) returns volume
     # 0.0 paired with a nan-filled centroid — NOT a fabricated (0,0,0), which in
@@ -1856,16 +1957,19 @@ def test_solid_volume_centroid_degenerate_returns_nan_not_origin():
     assert np.isnan(centroid).all()
 
 
-def test_solid_volume_centroid_non_finite_volume_returns_nan_centroid():
+def test_solid_volume_centroid_non_finite_volume_raises():
     # The degeneracy gate has two halves: ``abs(signed_v) < EPS_VOLUME`` (the
-    # zero-extent case exercised above) and ``not isfinite(signed_v)``. This
-    # drives the second half. Point construction forbids non-finite coordinates,
-    # so a nan/inf cannot be injected as a vertex directly; instead huge-but-
-    # finite coordinates (cube ~1e480) overflow the signed-tetrahedron product
-    # ``dot(v0, cross(v1, v2))`` to ``inf``, making ``signed_v`` non-finite. The
-    # contract then returns volume 0.0 paired with a nan-filled centroid rather
-    # than ``(nan, moment / nan)``. ``np.errstate`` silences the expected
-    # overflow warning without depending on the global warning filter.
+    # genuine zero-extent case exercised above, which returns a nan centroid) and
+    # ``not isfinite(signed_v)``. This drives the second half — which is NOT a
+    # degenerate solid but a *corrupt* accumulation (overflow at huge magnitudes
+    # or a nan/inf vertex). The contract now RAISES ``ValueError`` here rather
+    # than folding the corruption into the clean ``(0.0, nan)`` zero-extent
+    # return, so the two failure modes stay distinguishable. Point construction
+    # forbids non-finite coordinates, so a nan/inf cannot be injected as a vertex
+    # directly; instead huge-but-finite coordinates overflow the signed-
+    # tetrahedron product ``dot(v0, cross(v1, v2))`` to ``inf``, making
+    # ``signed_v`` non-finite. ``np.errstate`` silences the expected overflow
+    # warning without depending on the global warning filter.
     big = 1e160
     pts = {
         "hb0": _pt("hb0", 0, 0, 0.0),
@@ -1881,9 +1985,8 @@ def test_solid_volume_centroid_non_finite_volume_returns_nan_centroid():
     top = _poly("pg_t", ("ht0", "ht1", "ht2", "ht3"))
     objects = {"pg_b": bottom, "pg_t": top}
     with np.errstate(over="ignore", invalid="ignore"):
-        volume, centroid = geo.solid_volume_centroid(_solid(("pg_b", "pg_t")), objects, pts)
-    assert volume == pytest.approx(0.0)
-    assert np.isnan(centroid).all()
+        with pytest.raises(ValueError, match="non-finite signed volume"):
+            geo.solid_volume_centroid(_solid(("pg_b", "pg_t")), objects, pts)
 
 
 @pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf], ids=["nan", "inf", "-inf"])
@@ -2012,6 +2115,18 @@ def test_cylinder_cross_section_accepts_valid_kinds():
     assert geo.CylinderCrossSection.circle(1.0).radius == 1.0
     assert geo.CylinderCrossSection.ellipse(2.0, 1.0).kind == "ellipse"
     assert geo.CylinderCrossSection.rectangle(4.0, 5.0).kind == "rectangle"
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"approximate": True}], ids=["bare", "approximate-true"])
+def test_cylinder_cross_section_direct_construction_raises_type_error(kwargs):
+    # Direct construction bypasses the kind-specific factories and would leave
+    # ``kind``/``_dimensions`` unset — a zombie instance that only raises
+    # ``AttributeError`` on later access. ``__post_init__`` now closes that path
+    # immediately with a ``TypeError`` pointing at the ``.circle`` / ``.ellipse``
+    # / ``.rectangle`` factories. Both the bare call and the one that passes the
+    # sole real init field (``approximate``) must be rejected.
+    with pytest.raises(TypeError, match="cannot be constructed directly"):
+        geo.CylinderCrossSection(**kwargs)
 
 
 @pytest.mark.parametrize(
