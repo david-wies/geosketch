@@ -15,13 +15,23 @@
 """Pure geometric calculations for GeoSketch.
 
 This module is the single home for every numeric geometry operation in the
-app: direction (azimuth), Euclidean distance, polygon signed area and
-convexity, convex hull, the direction unit vector, three intersection
+app, spanning both 2-D and 3-D/solid work.
+
+**2-D:** direction (azimuth), Euclidean distance, polygon signed area and
+convexity, the 2-D convex hull, the direction unit vector, three intersection
 functions (line–line, line–polygon, polygon–polygon), the ray-polygon
 distance, the point/polygon and polygon/polygon distances, the tangent
-direction, and the vector endpoint. It depends only on the model
-dataclasses (:mod:`geometry.models`) and the math utilities
-(:mod:`geometry.utils`); it imports neither ``tkinter`` nor ``matplotlib``.
+direction (including tangent-perpendicularity), and the vector endpoint.
+
+**3-D / solids:** the 3-D convex hull (:func:`convex_hull_3d`, with the
+coplanar/precision flat-Solid fallback), ball and cylinder and solid volumes,
+cylinder cross-section classification (:class:`CylinderCrossSection`), solid
+B-rep faces, and lateral/total surface area (Mirtich 1996 polyhedral mass
+properties for volume + centroid).
+
+It depends only on the model dataclasses (:mod:`geometry.models`) and the math
+utilities (:mod:`geometry.utils`); it imports neither ``tkinter`` nor
+``matplotlib``.
 
 Conventions
 -----------
@@ -66,20 +76,27 @@ that invariant, not a recoverable condition.
 
 from __future__ import annotations
 
+import enum
+import logging
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Literal
 
 import numpy as np
 import shapely
-from scipy.spatial import ConvexHull  # pylint: disable=no-name-in-module
+from scipy.spatial import ConvexHull, QhullError  # pylint: disable=no-name-in-module
 
-from geometry.models.common import ElevatedObject, DirectionMode
+from geometry.models.common import ElevatedObject, DirectionMode, GeoObject
+from geometry.models.cylinder import Cylinder
 from geometry.models.line import Line
 from geometry.models.point import Point
 from geometry.models.polygon import Polygon
 from geometry.models.ray import Ray
+from geometry.models.solid import Solid
 from geometry.utils.angles import azimuth_to_angle, normalize_to_2pi
-from geometry.utils.constants import EPS_ANGLE, EPS_DISTANCE, EPS_PARAM
+from geometry.utils.constants import EPS_ANGLE, EPS_DISTANCE, EPS_PARAM, EPS_VOLUME
+from geometry.utils.id_factory import IDFactory
 
 __all__ = [
     "azimuth",
@@ -98,7 +115,24 @@ __all__ = [
     "polygon_polygon_distance",
     "tangent_direction",
     "vector_endpoint",
+    "convex_hull_3d",
+    "ball_volume",
+    "ball_surface_area",
+    "ball_cross_section_radius",
+    "ball_tangent_direction",
+    "cylinder_volume",
+    "cylinder_lateral_surface_area",
+    "cylinder_total_surface_area",
+    "cylinder_axis_vector",
+    "cylinder_cross_section",
+    "CylinderCrossSection",
+    "solid_faces",
+    "solid_volume_centroid",
+    "solid_lateral_surface_area",
+    "solid_total_surface_area",
 ]
+
+_logger = logging.getLogger(__name__)
 
 _HALF_PI = math.pi / 2.0
 
@@ -359,6 +393,11 @@ def convex_hull(polygon: Polygon, points: Mapping[str, Point], new_id: str) -> P
 
     Raises
     ------
+    ValueError
+        If any vertex coordinate is non-finite (``nan``/``±inf``). Mirrors the
+        up-front screen in :func:`convex_hull_3d`: without it a poisoned vertex
+        would surface as an opaque QHull message rather than an actionable
+        error pinned to the input.
     scipy.spatial.QhullError
         If the input is degenerate for hull construction (fewer than three
         vertices, or all vertices collinear). Unlike the intersection/distance
@@ -369,6 +408,8 @@ def convex_hull(polygon: Polygon, points: Mapping[str, Point], new_id: str) -> P
         triggers this.
     """
     coords = _polygon_coords(polygon, points)
+    if not np.all(np.isfinite(coords)):
+        raise ValueError("convex_hull: input coordinates contain nan or ±inf")
     hull = ConvexHull(coords)
     hull_point_ids = [polygon.point_ids[i] for i in hull.vertices]
     return Polygon(
@@ -802,7 +843,7 @@ def vector_endpoint(origin: Point, length: float, az: float, el: float = 0.0) ->
     intentionally carries no ``math.isfinite`` guard — unlike
     :func:`horizontal_unit_vector`, which validates because it resolves a stored
     ``direction`` that may have been corrupted on deserialisation.
-    ``vector_endpoint`` takes plain scalar arguments that the command layer
+    ``vector_endpoint`` takes plain scalar arguments that any future caller
     computes locally, so the validation responsibility sits with the caller. A
     non-finite argument propagates silently into a ``nan``/``inf`` endpoint
     array; callers passing values from an untrusted source must check them
@@ -884,3 +925,1261 @@ def three_point_azimuth_elevation(
         azimuth_turn = normalize_to_2pi(np.arctan2(bc_e, bc_n) - np.arctan2(ba_e, ba_n))
 
     return azimuth_turn, elevation(b, c) - elevation(b, a)
+
+
+# ---------------------------------------------------------------------------
+# 3-D convex hull → Solid
+# ---------------------------------------------------------------------------
+
+
+class HullFallback(enum.Enum):
+    """Which path :func:`convex_hull_3d` took to produce its Solid.
+
+    Returned as the third element of the :func:`convex_hull_3d` tuple, this is a
+    **transient, non-persisted** discriminator that lets a caller tell a genuine
+    3-D hull apart from the two degenerate flat-Solid fallbacks *without* parsing
+    the Solid's human-readable ``name``. It replaces the earlier brittle,
+    stringly-typed name-substring sniff; the enum is the contract, the names are
+    now display labels only.
+
+    It is deliberately **not** a field on the persisted
+    :class:`~geometry.models.solid.Solid` model. A schema-level
+    ``Solid.layers_kind`` discriminator (facet-shell vs cross-section stack, so
+    the Solid itself records which structure its ``layers`` hold) remains a
+    separate DEFERRED fast-follow — see ``docs/implementation-design.md`` §13.7
+    — and is intentionally *not* implemented here.
+
+    Members
+    -------
+    NONE
+        A genuine rank-3 convex hull was built: the Solid is a B-rep facet shell.
+    COPLANAR
+        The deliberate rank ``< 3`` coplanar fallback — a flat, zero-extent Solid
+        built from the 2-D hull (the expected flat-input feature).
+    QHULL_FAILURE
+        A rank-3 point set that QHull nonetheless rejected on a
+        precision/degeneracy borderline, routed to the same flat 2-D fallback.
+    """
+
+    NONE = "none"
+    COPLANAR = "coplanar"
+    QHULL_FAILURE = "qhull_failure"
+
+
+def _is_coplanar(coords: np.ndarray) -> bool:
+    """Whether all rows of ``coords`` lie on a common plane in 3-D.
+
+    The mean-centred coordinates span a subspace of rank ``< 3`` iff every point
+    lies on a single plane (or line, or coincide). Used by :func:`convex_hull_3d`
+    to classify coplanarity *deliberately*, instead of inferring it from a
+    :class:`~scipy.spatial.QhullError` (which also fires for precision/duplicate
+    failures unrelated to coplanarity).
+    """
+    centered = coords - coords.mean(axis=0)
+    return bool(np.linalg.matrix_rank(centered, tol=EPS_DISTANCE) < 3)
+
+
+def _hull_facets(
+    hull: ConvexHull,
+    coords: np.ndarray,
+    ids: Sequence[str],
+    id_factory: IDFactory,
+) -> list[Polygon]:
+    """Triangle :class:`Polygon` facets of a 3-D :class:`scipy.spatial.ConvexHull`.
+
+    Each QHull simplex becomes one triangle Polygon referencing the original
+    vertex Point IDs (``ids`` indexes into the input set, so no new points are
+    minted). The triangle is wound so its right-hand normal agrees with QHull's
+    outward facet normal (``hull.equations``); QHull's own simplex vertex order
+    is not consistently oriented.
+
+    Split out of :func:`convex_hull_3d` so that function stays within the
+    local-variable budget — the per-facet winding locals live here.
+
+    Parameters
+    ----------
+    hull : scipy.spatial.ConvexHull
+        The computed 3-D hull.
+    coords : numpy.ndarray
+        Point cloud, shape ``(n, 3)``, aligned with ``ids``.
+    ids : Sequence[str]
+        Point IDs aligned with ``coords`` rows.
+    id_factory : IDFactory
+        Source of the new facet Polygon IDs.
+    """
+    facets: list[Polygon] = []
+    for simplex, equation in zip(hull.simplices, hull.equations):
+        tri = list(simplex)
+        normal = equation[:3]
+        # Orient the triangle so its right-hand normal agrees with QHull's
+        # outward facet normal; QHull's simplex order is not itself consistent.
+        # NOTE: hull facets are wound by 3-D OUTWARD NORMAL, deliberately NOT by
+        # 2-D CCW (invariant #3). Do not "fix" this by running facets through
+        # 2-D CCW normalization — that would corrupt the shell's orientation.
+        v0, v1, v2 = (coords[tri[0]], coords[tri[1]], coords[tri[2]])
+        if float(np.dot(np.cross(v1 - v0, v2 - v0), normal)) < 0.0:
+            tri = [tri[0], tri[2], tri[1]]
+        facets.append(
+            Polygon(
+                id=id_factory.next_id("pg"),
+                name="hull_facet",
+                alpha=1.0,
+                visibility=True,
+                point_ids=[ids[i] for i in tri],
+                is_convex=True,
+                line_color="#000000",
+                fill_color="#808080",
+            )
+        )
+    return facets
+
+
+def convex_hull_3d(
+    points_3d: Mapping[str, Point],
+    point_ids: Sequence[str],
+    id_factory: IDFactory,
+) -> tuple[Solid, list[Polygon], HullFallback]:
+    """Convex hull of a 3-D point set as a :class:`Solid` of triangular facets.
+
+    Runs :class:`scipy.spatial.ConvexHull` on the ``(easting, northing,
+    altitude)`` coordinates of the named points (QHull is the Quickhull
+    implementation, Barber et al. 1996). Each hull facet becomes a new triangle
+    :class:`Polygon` referencing the original vertex Point IDs (QHull's
+    ``simplices`` index into the input set, so no new points are minted); the
+    returned :class:`Solid` lists those facet polygons as its ``layers``.
+
+    .. warning::
+       The returned Solid is a **boundary-representation (B-rep) shell** of
+       triangular facets, *not* the ordered bottom-to-top cross-section *stack*
+       that :func:`solid_volume_centroid`, :func:`solid_faces`, and
+       :func:`solid_lateral_surface_area` consume. Its ``layers`` are facets,
+       not stacked cross-sections, so feeding this Solid to those functions is a
+       category error — they detect the facet shell and raise ``ValueError``
+       rather than return a wrong number. Use the per-facet geometry directly
+       (or a dedicated B-rep volume routine) to measure a hull.
+
+    This is the one service function permitted to mint IDs (design doc
+    ``docs/implementation-design.md`` §13.12):
+    the number of facets is unknown until QHull runs, so the function takes an
+    :class:`~geometry.utils.id_factory.IDFactory` and calls ``next_id`` for the
+    Solid (``so``) and each facet Polygon (``pg``). Any future caller passes its
+    ``project.id_factory``.
+
+    Facet triangles are wound so their right-hand normal matches the outward
+    normal QHull reports in ``hull.equations`` — consistent outward orientation
+    across the shell. Orientation relies on QHull's convention that the
+    ``hull.equations`` plane normals point **outward** from the hull interior;
+    the facet winding is derived from those normals.
+
+    Coplanar fallback (design doc ``docs/implementation-design.md`` §13.7):
+    coplanarity is detected **deliberately** up front — the mean-centred
+    coordinates' matrix rank is ``< 3`` iff every point lies on a common plane —
+    rather than inferred from a QHull exception, so a genuine coplanar set is
+    distinguished from non-finite coordinates or other precision failures (which
+    raise a clear error instead of silently taking the flat-Solid path). On the
+    coplanar branch the function builds the 2-D hull on ``(easting, northing)``
+    and returns a *degenerate* Solid with two identical Polygon layers (zero
+    vertical extent, hence zero volume). The caller is expected to flag it via
+    :func:`geometry.services.validation.validate_solid_non_degenerate` against
+    :data:`~geometry.utils.constants.EPS_VOLUME` and warn the user rather than
+    silently storing an invisible zero-extent Solid.
+
+    Parameters
+    ----------
+    points_3d : Mapping[str, Point]
+        Point lookup covering every ID in ``point_ids``.
+    point_ids : Sequence[str]
+        IDs of the input points (a subset of ``points_3d``). At least 4 are
+        required for a 3-D hull.
+    id_factory : IDFactory
+        Allocator for the new Solid and facet Polygon IDs.
+
+    Returns
+    -------
+    tuple[Solid, list[Polygon], HullFallback]
+        The hull Solid, the list of its facet Polygons (for the caller to insert
+        into the project store), and a :class:`HullFallback` discriminator naming
+        which path produced the Solid. ``HullFallback.NONE`` for a real rank-3
+        hull (facet shell); ``HullFallback.COPLANAR`` for the deliberate flat
+        fallback; ``HullFallback.QHULL_FAILURE`` for the rank-3-but-QHull-rejected
+        flat fallback. The enum is the structured replacement for the former
+        name-substring discriminator — branch on it rather than parsing the
+        Solid's ``name``.
+
+    Raises
+    ------
+    ValueError
+        If fewer than 4 point IDs are supplied, if any input coordinate is
+        non-finite (``nan`` or ``±inf``), or if the coplanar fallback's 2-D hull
+        is itself degenerate (all points collinear).
+    """
+    ids = list(point_ids)
+    if len(ids) < 4:
+        raise ValueError(f"convex_hull_3d requires at least 4 points; got {len(ids)}")
+    try:
+        coords = np.array([_xyz(points_3d[pid]) for pid in ids], dtype=np.float64)
+    except KeyError as exc:
+        raise ValueError(
+            f"convex_hull_3d: point ID {exc.args[0]!r} is not present in points_3d"
+        ) from exc
+
+    # Guard non-finite coordinates up front so a nan/inf does not get funnelled
+    # into the coplanar fallback and silently masquerade as flat geometry. Only
+    # a *deliberately*-detected coplanar set should take that branch.
+    if not np.all(np.isfinite(coords)):
+        raise ValueError("convex_hull_3d: input coordinates contain nan or ±inf")
+
+    # Detect coplanarity deliberately (see _is_coplanar) rather than inferring
+    # it from a QhullError, which also fires for precision/duplicate failures.
+    if _is_coplanar(coords):
+        solid, facets = _coplanar_fallback_solid(coords, ids, id_factory)
+        return solid, facets, HullFallback.COPLANAR
+
+    try:
+        hull = ConvexHull(coords)
+    except QhullError as exc:
+        # Reached only for a genuinely degenerate/precision-borderline set that
+        # passed the rank screen; fall back to the flat 2-D hull.
+        #
+        # This QHull-failure fallback and the deliberate-coplanar fallback above
+        # both return a degenerate flat Solid. They are told apart by the
+        # ``HullFallback`` enum attached to each return value (here,
+        # ``HullFallback.QHULL_FAILURE``; coplanar above, ``HullFallback.COPLANAR``),
+        # *not* by parsing the Solid's ``name`` — the human-readable name labels
+        # are display-only. (A schema-level ``Solid.layers_kind`` discriminator on
+        # the persisted model remains a separate DEFERRED fast-follow; see
+        # ``docs/implementation-design.md`` §13.7 and :class:`HullFallback`.)
+        _logger.warning(
+            "convex_hull_3d: a rank-3 point set failed QHull on a "
+            "precision/degeneracy borderline; routing to the flat 2-D fallback.",
+            exc_info=exc,
+        )
+        solid, facets = _coplanar_fallback_solid(
+            coords,
+            ids,
+            id_factory,
+            name="Convex Hull 3D (QHull failure — degenerate)",
+        )
+        return solid, facets, HullFallback.QHULL_FAILURE
+
+    facets = _hull_facets(hull, coords, ids, id_factory)
+
+    # NOTE: this Solid is a B-rep *facet shell*, not a cross-section *stack*.
+    # Its ``layers`` are triangular hull facets that share vertices across the
+    # shell; it is NOT a valid input to solid_volume_centroid / solid_faces /
+    # solid_lateral_surface_area, which assume a monotonic bottom-to-top stack
+    # and explicitly reject a facet shell (see _ensure_solid_is_stack).
+    return (
+        Solid(
+            id=id_factory.next_id("so"),
+            name="Convex Hull 3D",
+            alpha=1.0,
+            visibility=True,
+            layers=tuple(f.id for f in facets),
+            line_color="#000000",
+            fill_color="#808080",
+        ),
+        facets,
+        HullFallback.NONE,
+    )
+
+
+def _coplanar_fallback_solid(
+    coords: np.ndarray,
+    ids: Sequence[str],
+    id_factory: IDFactory,
+    name: str = "Convex Hull 3D (degenerate)",
+) -> tuple[Solid, list[Polygon]]:
+    """Degenerate flat Solid for the coplanar :func:`convex_hull_3d` case.
+
+    Computes the 2-D hull on ``(easting, northing)`` and wraps it in a Solid
+    with two identical Polygon layers (zero extent → zero volume). Raises
+    ``ValueError`` if the 2-D hull is itself degenerate (collinear points).
+
+    Two :func:`convex_hull_3d` call sites share this helper and pass distinct
+    ``name`` values purely as **display labels**:
+
+    * the **deliberately coplanar** branch (the expected flat-input feature)
+      keeps the default ``"Convex Hull 3D (degenerate)"``;
+    * the **QhullError** branch (an unexpected rank-3 cloud that trips QHull on a
+      precision/degeneracy borderline) passes
+      ``"Convex Hull 3D (QHull failure — degenerate)"``.
+
+    The zero-volume / ``EPS_VOLUME`` degeneracy semantics are identical for both
+    names; only the label differs. Control flow no longer parses these names: the
+    caller (:func:`convex_hull_3d`) attaches the structured
+    :class:`HullFallback` discriminator (``COPLANAR`` vs ``QHULL_FAILURE``) to its
+    return value, and that enum — not the name — is the contract callers branch
+    on.
+
+    Parameters
+    ----------
+    coords : numpy.ndarray
+        Point cloud, shape ``(n, 3)`` in ``(easting, northing, altitude)`` order.
+    ids : Sequence[str]
+        Object IDs aligned with ``coords`` rows.
+    id_factory : IDFactory
+        Source of the new Polygon and Solid IDs.
+    name : str, optional
+        Name for the resulting degenerate Solid; see the two callers above.
+    """
+    try:
+        flat = ConvexHull(coords[:, :2])
+    except QhullError as exc:
+        raise ValueError("convex_hull_3d: input points are collinear; no hull exists") from exc
+    hull_ids = [ids[i] for i in flat.vertices]
+    polygon = Polygon(
+        id=id_factory.next_id("pg"),
+        name="hull_facet",
+        alpha=1.0,
+        visibility=True,
+        point_ids=hull_ids,
+        is_convex=True,
+        line_color="#000000",
+        fill_color="#808080",
+    )
+    solid = Solid(
+        id=id_factory.next_id("so"),
+        name=name,
+        alpha=1.0,
+        visibility=True,
+        # The SAME polygon ID is stored twice on purpose: the two layers are the
+        # identical flat ring, giving a zero-extent (zero-volume) degenerate
+        # Solid that solid_volume_centroid reports as 0.0. CAVEAT: this duplicate
+        # layer ID means the object store / cascading-delete logic must tolerate
+        # a layer ID appearing more than once within a single Solid (deleting the
+        # polygon must clean up both references, not just the first).
+        layers=(polygon.id, polygon.id),
+        line_color="#000000",
+        fill_color="#808080",
+    )
+    return solid, [polygon]
+
+
+# ---------------------------------------------------------------------------
+# Ball geometry
+# ---------------------------------------------------------------------------
+
+
+def _require_non_negative_radius(radius: float) -> None:
+    """Reject a non-finite or negative radius before a volume/area formula.
+
+    Defense-in-depth for the measurement functions, which would otherwise turn
+    a corrupt ``radius`` into a wrong-signed or ``nan`` result and propagate it
+    silently. This local copy exists because
+    :mod:`geometry.services.validation` imports this module, so importing
+    :func:`~geometry.services.validation.validate_positive_radius` back here
+    would be circular.
+
+    The two helpers are deliberately **not** in lockstep, despite the similar
+    naming. Only the *finite* check matches word-for-word; the bound and its
+    message diverge on purpose:
+
+    * This helper rejects ``radius < 0.0`` with ``"Radius must be >= 0"`` — a
+      radius of exactly ``0`` is **permitted** (it yields a well-defined zero
+      volume/area).
+    * :func:`~geometry.services.validation.validate_positive_radius` rejects
+      ``radius <= EPS_DISTANCE`` with ``"Radius must be > 1e-06"`` — it
+      **forbids** zero (a degenerate object the user is constructing).
+
+    A maintainer should not assume these stay in sync.
+    """
+    if not math.isfinite(radius):
+        raise ValueError(f"Radius must be finite; got {radius!r}")
+    if radius < 0.0:
+        raise ValueError(f"Radius must be >= 0; got {radius!r}")
+
+
+def _require_non_negative_height(height: float) -> None:
+    """Reject a non-finite or negative height before a volume/area formula.
+
+    The height counterpart of :func:`_require_non_negative_radius`; a non-finite
+    or negative ``height`` would otherwise yield a ``nan`` or negative cylinder
+    volume/area with no error. A height of exactly ``0`` is permitted (a
+    well-defined zero-extent degenerate cylinder).
+    """
+    if not math.isfinite(height):
+        raise ValueError(f"Height must be finite; got {height!r}")
+    if height < 0.0:
+        raise ValueError(f"Height must be >= 0; got {height!r}")
+
+
+def ball_volume(radius: float) -> np.float64:
+    """Volume of a ball of the given radius: ``(4/3)·π·r³``.
+
+    Raises
+    ------
+    ValueError
+        If ``radius`` is non-finite or negative (defense-in-depth: a corrupt
+        radius would otherwise yield a ``nan`` or negative volume silently).
+    """
+    _require_non_negative_radius(radius)
+    return np.float64(4.0 / 3.0 * math.pi * radius**3)
+
+
+def ball_surface_area(radius: float) -> np.float64:
+    """Surface area of a ball of the given radius: ``4·π·r²``.
+
+    Raises
+    ------
+    ValueError
+        If ``radius`` is non-finite or negative.
+    """
+    _require_non_negative_radius(radius)
+    return np.float64(4.0 * math.pi * radius**2)
+
+
+def ball_cross_section_radius(ball_radius: float, distance_to_plane: float) -> np.float64 | None:
+    """Radius of a ball's circular cross-section at a given plane distance.
+
+    The intersection of a ball (radius ``r``) with a plane at signed distance
+    ``d`` from its centre is a circle of radius ``√(r² − d²)`` when ``|d| ≤ r``.
+    Returns ``None`` when ``|d| > r`` (the plane misses the ball) so the Slice
+    renderer can skip the ball rather than feed a negative radicand to ``sqrt``
+    (``docs/implementation-design.md`` §13.3). A plane tangent to the ball
+    (``|d| = r``) yields ``0.0``.
+
+    Parameters
+    ----------
+    ball_radius : float
+        Ball radius in metres.
+    distance_to_plane : float
+        Signed distance from the ball centre to the cutting plane.
+
+    Returns
+    -------
+    numpy.float64 or None
+        The cross-section radius, or ``None`` if the plane does not meet the
+        ball.
+
+    Raises
+    ------
+    ValueError
+        If ``ball_radius`` is non-finite or negative. Without this guard a
+        negative radius would make ``abs(distance_to_plane) > ball_radius``
+        always true and the function would silently return ``None``, masking
+        the corrupt input instead of rejecting it (consistent with
+        :func:`ball_volume` and the other ball/cylinder measures).
+    ValueError
+        If ``distance_to_plane`` is non-finite. A ``nan`` distance makes the
+        miss-guard ``abs(distance_to_plane) > ball_radius`` evaluate ``False``,
+        so the function would return ``sqrt(r² − nan) = nan`` and corrupt the
+        ``None``-means-"plane misses ball" contract.
+    """
+    _require_non_negative_radius(ball_radius)
+    if not math.isfinite(distance_to_plane):
+        raise ValueError(f"distance_to_plane must be finite; got {distance_to_plane!r}")
+    if abs(distance_to_plane) > ball_radius:
+        return None
+    return np.sqrt(np.float64(ball_radius) ** 2 - np.float64(distance_to_plane) ** 2)
+
+
+def ball_tangent_direction(center: Point, surface_point: Point) -> np.float64:
+    """Azimuth of the radius from a ball's centre to a point on its surface.
+
+    A ball tangent at ``surface_point`` must be perpendicular to this radius
+    direction; validation enforces ``|dot(tangent_unit, radius_unit)| <
+    EPS_ANGLE`` in 3-D. This returns the horizontal azimuth of the radius in
+    ``[0, 2π)`` (the radius bearing), delegating to :func:`azimuth`.
+
+    Returns
+    -------
+    numpy.float64
+        Radius azimuth in radians in ``[0, 2π)``.
+    """
+    return azimuth(center, surface_point)
+
+
+# ---------------------------------------------------------------------------
+# Cylinder geometry
+# ---------------------------------------------------------------------------
+
+
+def cylinder_volume(radius: float, height: float) -> np.float64:
+    """Volume of a right cylinder: ``π·r²·h``.
+
+    Raises
+    ------
+    ValueError
+        If ``radius`` or ``height`` is non-finite or negative (defense-in-depth:
+        a corrupt input would otherwise yield a ``nan`` or negative volume).
+    """
+    _require_non_negative_radius(radius)
+    _require_non_negative_height(height)
+    return np.float64(math.pi * radius**2 * height)
+
+
+def cylinder_lateral_surface_area(radius: float, height: float) -> np.float64:
+    """Lateral (side) surface area of a cylinder: ``2·π·r·h``.
+
+    Raises
+    ------
+    ValueError
+        If ``radius`` or ``height`` is non-finite or negative.
+    """
+    _require_non_negative_radius(radius)
+    _require_non_negative_height(height)
+    return np.float64(2.0 * math.pi * radius * height)
+
+
+def cylinder_total_surface_area(radius: float, height: float) -> np.float64:
+    """Total surface area of a closed cylinder: ``2·π·r·h + 2·π·r²``.
+
+    Raises
+    ------
+    ValueError
+        If ``radius`` or ``height`` is non-finite or negative.
+    """
+    _require_non_negative_radius(radius)
+    _require_non_negative_height(height)
+    return np.float64(2.0 * math.pi * radius * height + 2.0 * math.pi * radius**2)
+
+
+def cylinder_axis_vector(cylinder: Cylinder) -> np.ndarray:
+    """Unit vector along a cylinder's axis in ``(easting, northing, altitude)``.
+
+    Vertical cylinders short-circuit to ``(0, 0, 1)`` without touching
+    ``axis_azimuth`` — which is meaningless in vertical mode and stored as
+    ``0.0`` (``docs/implementation-design.md`` §13.2). Inclined cylinders use
+    the azimuth + elevation
+    convention ``(sin(az)·cos(el), cos(az)·cos(el), sin(el))``, matching
+    :func:`vector_endpoint`.
+
+    Returns
+    -------
+    numpy.ndarray
+        Unit axis vector, shape ``(3,)``.
+    """
+    if cylinder.axis_mode == "vertical":
+        return np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    az = cylinder.axis_azimuth
+    el = cylinder.axis_elevation
+    cos_el = math.cos(el)
+    return np.array(
+        [math.sin(az) * cos_el, math.cos(az) * cos_el, math.sin(el)],
+        dtype=np.float64,
+    )
+
+
+_CROSS_SECTION_ARITY: dict[str, int] = {"circle": 1, "ellipse": 2, "rectangle": 2}
+
+
+@dataclass(frozen=True)
+class CylinderCrossSection:
+    """Shape of a planar slice through a cylinder.
+
+    Instances are built **only** through the kind-specific classmethod
+    constructors :meth:`circle`, :meth:`ellipse`, and :meth:`rectangle`; ``kind``
+    and ``_dimensions`` are ``init=False`` fields set by those factories, so the
+    per-kind arity invariant (circle = 1 dimension, ellipse/rectangle = 2) is
+    structurally unviolatable — there is no positional path that could pair, say,
+    ``"circle"`` with two dimensions. Because those fields have no default, a
+    direct ``CylinderCrossSection()`` would otherwise construct a zombie with
+    ``kind``/``_dimensions`` unset (raising only later, on access);
+    :meth:`__post_init__` closes that path by rejecting any non-factory
+    construction with a ``TypeError``. :meth:`_validate` (run by the factories)
+    additionally checks positivity and the ellipse ordering as defence in depth.
+    The dataclass is frozen, so once validated an instance stays consistent.
+
+    Fields
+    ------
+    kind : Literal["circle", "ellipse", "rectangle"]
+        The classified slice shape. ``init=False`` — set by the classmethod
+        constructor, never passed in.
+    _dimensions : tuple[float, ...]
+        Geometry of the cross-section, by ``kind`` (every entry must be finite
+        and ``> 0``). ``init=False`` and **private**: read it through the
+        kind-aware typed accessors (``radius`` / ``semi_major`` /
+        ``semi_minor`` / ``width`` / ``height``), which are the only public
+        read path.
+
+        * ``"circle"`` — ``(radius,)`` (arity 1).
+        * ``"ellipse"`` — ``(semi_major, semi_minor)`` (arity 2) where
+          ``semi_minor`` is the cylinder radius and
+          ``semi_major = radius / cos(θ) >= semi_minor`` for cut angle ``θ``
+          between the plane normal and the cylinder axis (``semi_major >=
+          semi_minor`` is enforced at construction).
+        * ``"rectangle"`` — ``(width, height)`` = ``(2·radius, height)`` (arity
+          2) for a plane parallel to the axis.
+    approximate : bool
+        ``True`` when the dimensions are a *through-axis* simplification that
+        ignores the cutting plane's offset and may overstate the true chord;
+        ``False`` when exact. :func:`cylinder_cross_section` sets it ``True`` for
+        the offset-dependent ``ellipse``/``rectangle`` cases and ``False`` for
+        the ``circle`` case (radius ``r`` regardless of offset). A ``circle``
+        forbids ``approximate=True`` (it is always exact).
+
+    Raises
+    ------
+    ValueError
+        If any dimension is non-finite or ``<= 0``, if an ``ellipse`` has
+        ``semi_major < semi_minor``, or if a ``circle`` is built with
+        ``approximate=True``.
+    """
+
+    kind: Literal["circle", "ellipse", "rectangle"] = field(init=False)
+    _dimensions: tuple[float, ...] = field(init=False)
+    approximate: bool = False
+
+    @classmethod
+    def circle(cls, radius: float) -> "CylinderCrossSection":
+        """Build a circular cross-section (offset-independent perpendicular cut).
+
+        Parameters
+        ----------
+        radius : float
+            Cylinder radius; must be finite and ``> 0``.
+
+        Returns
+        -------
+        CylinderCrossSection
+            A ``kind="circle"`` instance with ``approximate=False`` (a circle is
+            always exact).
+        """
+        return cls._build("circle", (radius,), approximate=False)
+
+    @classmethod
+    def ellipse(
+        cls, semi_major: float, semi_minor: float, *, approximate: bool = True
+    ) -> "CylinderCrossSection":
+        """Build an elliptical cross-section (oblique cut).
+
+        Parameters
+        ----------
+        semi_major : float
+            Semi-major axis ``r / cos(θ)``; must be ``>= semi_minor``.
+        semi_minor : float
+            Semi-minor axis (the cylinder radius ``r``).
+        approximate : bool, keyword-only, optional
+            ``True`` (default) when the span assumes a through-axis plane.
+
+        Returns
+        -------
+        CylinderCrossSection
+            A ``kind="ellipse"`` instance.
+        """
+        return cls._build("ellipse", (semi_major, semi_minor), approximate=approximate)
+
+    @classmethod
+    def rectangle(
+        cls, width: float, height: float, *, approximate: bool = True
+    ) -> "CylinderCrossSection":
+        """Build a rectangular cross-section (cut parallel to the axis).
+
+        Parameters
+        ----------
+        width : float
+            Rectangle width ``2·radius``.
+        height : float
+            Rectangle height (the cylinder height).
+        approximate : bool, keyword-only, optional
+            ``True`` (default) when the span assumes a through-axis plane.
+
+        Returns
+        -------
+        CylinderCrossSection
+            A ``kind="rectangle"`` instance.
+        """
+        return cls._build("rectangle", (width, height), approximate=approximate)
+
+    @classmethod
+    def _build(
+        cls,
+        kind: Literal["circle", "ellipse", "rectangle"],
+        dimensions: tuple[float, ...],
+        *,
+        approximate: bool,
+    ) -> "CylinderCrossSection":
+        """Set the ``init=False`` fields on a fresh frozen instance.
+
+        Routing every classmethod through this single factory keeps the
+        ``kind``↔arity pairing in one place, so the constructors cannot mint an
+        inconsistent instance.
+
+        The instance is allocated with ``object.__new__`` to bypass the generated
+        ``__init__`` (and hence :meth:`__post_init__`): the bare-construction
+        guard in ``__post_init__`` keys off ``kind`` being unset, which is exactly
+        the transient state ``__init__`` would leave the instance in *before*
+        this factory assigns the ``init=False`` fields. Bypassing ``__init__``
+        lets the factory populate the fields and run the full :meth:`_validate`
+        without tripping its own guard.
+        """
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "approximate", approximate)
+        object.__setattr__(instance, "kind", kind)
+        object.__setattr__(instance, "_dimensions", dimensions)
+        instance._validate()
+        return instance
+
+    def __post_init__(self) -> None:
+        """Reject direct (non-factory) construction of a bare instance.
+
+        Because ``kind`` and ``_dimensions`` are ``init=False`` with no default,
+        a direct ``CylinderCrossSection()`` / ``CylinderCrossSection(approximate=…)``
+        call constructs an instance with those fields **unset** — a zombie that
+        only raises ``AttributeError`` on later access. This guard closes that
+        path: it fires whenever ``kind`` is absent (the un-built state) and
+        directs callers to the kind-specific factories. The legitimate factory
+        path goes through :meth:`_build`, which allocates via ``object.__new__``
+        and so never runs this hook.
+        """
+        if "kind" not in self.__dict__:
+            raise TypeError(
+                "CylinderCrossSection cannot be constructed directly; use the "
+                "CylinderCrossSection.circle / .ellipse / .rectangle factories"
+            )
+
+    def _validate(self) -> None:
+        """Validate the ``init=False`` fields after the factory sets them.
+
+        Invoked by :meth:`_build` once the instance is fully populated (the
+        generated ``__init__`` is bypassed for the factory path, so this is not
+        ``__post_init__``).
+        """
+        expected = _CROSS_SECTION_ARITY[self.kind]
+        if len(self._dimensions) != expected:
+            raise ValueError(
+                f"CylinderCrossSection {self.kind!r} requires {expected} "
+                f"dimension(s); got {self._dimensions!r}"
+            )
+        for value in self._dimensions:
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(
+                    f"CylinderCrossSection {self.kind!r} dimensions must be "
+                    f"finite and > 0; got {self._dimensions!r}"
+                )
+        if self.kind == "ellipse" and self._dimensions[0] < self._dimensions[1]:
+            raise ValueError(
+                f"CylinderCrossSection ellipse semi_major must be >= semi_minor; "
+                f"got {self._dimensions!r}"
+            )
+        # A circular cross-section is the offset-independent perpendicular cut:
+        # its radius ``r`` is exact regardless of the cutting plane's offset, so
+        # ``approximate`` must never be True for a circle. Ellipse/rectangle may
+        # be either (their through-axis spans are a simplification).
+        if self.kind == "circle" and self.approximate:
+            raise ValueError(
+                "CylinderCrossSection circle is always exact; approximate must be False"
+            )
+
+    @property
+    def radius(self) -> float:
+        """Cylinder radius — ``circle`` or ``ellipse`` semi-minor; raises for ``rectangle``."""
+        if self.kind == "circle":
+            return self._dimensions[0]
+        if self.kind == "ellipse":
+            return self._dimensions[1]
+        raise AttributeError(f"{self.kind!r} cross-section has no radius")
+
+    @property
+    def semi_major(self) -> float:
+        """Semi-major axis — ``ellipse`` only; raises ``AttributeError`` otherwise."""
+        if self.kind == "ellipse":
+            return self._dimensions[0]
+        raise AttributeError(f"{self.kind!r} cross-section has no semi_major axis")
+
+    @property
+    def semi_minor(self) -> float:
+        """Semi-minor axis (cylinder radius) — ``ellipse`` only; raises otherwise."""
+        if self.kind == "ellipse":
+            return self._dimensions[1]
+        raise AttributeError(f"{self.kind!r} cross-section has no semi_minor axis")
+
+    @property
+    def width(self) -> float:
+        """Width (``2·radius``) — ``rectangle`` only; raises ``AttributeError`` otherwise."""
+        if self.kind == "rectangle":
+            return self._dimensions[0]
+        raise AttributeError(f"{self.kind!r} cross-section has no width")
+
+    @property
+    def height(self) -> float:
+        """Height (cylinder height) — ``rectangle`` only; raises ``AttributeError`` otherwise."""
+        if self.kind == "rectangle":
+            return self._dimensions[1]
+        raise AttributeError(f"{self.kind!r} cross-section has no height")
+
+
+def cylinder_cross_section(cylinder: Cylinder, plane_normal: np.ndarray) -> CylinderCrossSection:
+    """Classify and size the cross-section of a cylinder cut by a plane.
+
+    The shape is governed by the angle ``θ`` between the cutting plane's normal
+    and the cylinder axis:
+
+    * normal **parallel** to the axis (cut perpendicular to the axis) → a
+      **circle** of radius ``r``;
+    * normal **perpendicular** to the axis (cut parallel to the axis) → a
+      **rectangle** ``2r`` wide and ``h`` tall;
+    * otherwise → an **ellipse** with semi-minor axis ``r`` and semi-major axis
+      ``r / cos(θ)``.
+
+    Classification is performed on ``cos θ`` directly — where ``θ`` is the angle
+    between the plane normal and the cylinder axis — **not** on the ``acos``
+    output. ``acos`` is ill-conditioned near its endpoints (its derivative
+    diverges as ``cos θ → ±1``), so a tolerance applied to ``θ`` would demand
+    ``cos θ`` lie within ~5e-19 of 1.0 — finer than float64 resolution — and a
+    realistic inclined or trig-derived normal would misclassify as an ellipse,
+    blowing up ``semi_major = r / cos θ``. Testing in the well-conditioned
+    ``cos θ`` domain — **circle** when ``(1 − cos θ) < EPS_ANGLE``, **rectangle**
+    when ``cos θ < EPS_ANGLE`` — keeps the thresholds numerically reachable.
+
+    Parameters
+    ----------
+    cylinder : Cylinder
+        Source cylinder (provides ``radius``, ``height``, and axis).
+    plane_normal : numpy.ndarray
+        Normal vector of the cutting plane, shape ``(3,)``. Need not be unit
+        length; it is normalised internally.
+
+    Returns
+    -------
+    CylinderCrossSection
+        The classified cross-section and its dimensions.
+
+    Raises
+    ------
+    ValueError
+        If ``plane_normal`` has (near) zero length, so its direction — and the
+        cut angle — is undefined.
+    ValueError
+        If ``plane_normal`` contains a non-finite component (``nan`` or
+        ``±inf``). A ``nan`` component bypasses the zero-length guard (``norm``
+        is ``nan`` and ``nan < EPS_DISTANCE`` is ``False``), then ``cos_theta``
+        clamps to ``1.0`` and the function would fabricate an exact ``circle``
+        result from corrupt input.
+
+    Notes
+    -----
+    This is a **through-axis** simplification: only the plane *normal* is
+    consumed, not its offset along that normal. The reported sizes assume the
+    cutting plane passes through the cylinder axis, so the rectangle width is
+    the full ``2r`` and the ellipse spans the full radius. An off-axis plane
+    parallel to one of these but offset by a perpendicular distance ``d``
+    actually yields a narrower chord — width ``2·√(r² − d²)`` rather than
+    ``2r`` — which this function does not model.
+
+    The returned ``approximate`` flag reflects this: ``True`` for the
+    offset-dependent ``ellipse``/``rectangle`` cases and ``False`` for the exact
+    ``circle`` case, so callers can distinguish an exact slice from this one.
+    """
+    axis = cylinder_axis_vector(cylinder)
+    normal = np.asarray(plane_normal, dtype=np.float64)
+    if not np.all(np.isfinite(normal)):
+        raise ValueError(
+            f"cylinder_cross_section: plane_normal contains nan or ±inf; got {plane_normal!r}"
+        )
+    norm = float(np.linalg.norm(normal))
+    if norm < EPS_DISTANCE:
+        raise ValueError("cylinder_cross_section: plane_normal has zero length")
+    cos_theta = abs(float(np.dot(axis, normal / norm)))
+    # Clamp to guard against a dot product nudged just past 1.0 by rounding.
+    cos_theta = min(1.0, cos_theta)
+    r = float(cylinder.radius)
+    # Classify in the well-conditioned cos-θ domain (see docstring), never on
+    # acos(cos_theta): near the endpoints acos amplifies error past float64
+    # resolution and misclassifies realistic inclined normals as ellipses.
+    # ``approximate``: circle radius is offset-independent (exact); the ellipse
+    # and rectangle spans assume a through-axis plane (simplified).
+    if (1.0 - cos_theta) < EPS_ANGLE:  # normal ∥ axis → perpendicular cut
+        return CylinderCrossSection.circle(r)
+    if cos_theta < EPS_ANGLE:  # normal ⊥ axis → parallel cut
+        return CylinderCrossSection.rectangle(2.0 * r, float(cylinder.height))
+    return CylinderCrossSection.ellipse(r / cos_theta, r)
+
+
+# ---------------------------------------------------------------------------
+# Solid geometry (Mirtich 1996 polyhedral mass properties)
+# ---------------------------------------------------------------------------
+
+
+def _ensure_solid_is_stack(solid: Solid, objects: Mapping[str, GeoObject]) -> None:
+    """Reject a Solid whose ``layers`` are a facet shell, not a cross-section stack.
+
+    The whole Solid B-rep / volume machinery interprets ``Solid.layers`` as an
+    **ordered bottom-to-top stack of cross-sections**: the first and last layers
+    are the caps and each adjacent pair forms one lateral band. A 3-D convex
+    hull (:func:`convex_hull_3d`), by contrast, stores triangular *facets* of a
+    closed shell in ``layers`` — a structurally different object. Fed a facet
+    shell, the band builder would silently pair facet *i* with facet *i+1* and
+    return a meaningless volume with no error, because every facet is a triangle
+    so the equal-vertex-count band path accepts it.
+
+    A facet shell is detected structurally: in a valid cross-section stack each
+    vertex Point ID belongs to exactly one layer's polygon (distinct
+    cross-sections share no vertices), whereas in a hull shell every vertex is
+    shared by three or more facets. So a vertex appearing in **more than two**
+    polygon layers cannot be a stack and is rejected. (The coplanar-hull
+    fallback's two *identical* layers — each vertex in exactly two layers — is a
+    legitimate zero-extent stack and is intentionally *not* rejected.)
+
+    This is the proportionate guard for a geometry-services PR: it refuses a
+    facet-shell Solid with a clear error rather than expanding the persistence
+    schema to carry an explicit ``layers``-kind discriminator.
+
+    Parameters
+    ----------
+    solid : Solid
+        The candidate solid.
+    objects : Mapping[str, GeoObject]
+        Object lookup resolving each polygon layer to its Polygon (for its
+        ``point_ids``).
+
+    Raises
+    ------
+    ValueError
+        If a vertex Point ID appears in more than two polygon layers, i.e. the
+        Solid is a facet shell rather than a cross-section stack.
+    """
+    layer_counts: dict[str, int] = {}
+    for layer_id in solid.layers:
+        if layer_id.startswith("pt_"):
+            continue
+        try:
+            polygon = objects[layer_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"_ensure_solid_is_stack: Solid {solid.id!r} references layer "
+                f"{layer_id!r}, which is absent from the object store"
+            ) from exc
+        for pid in set(polygon.point_ids):  # one count per layer per vertex
+            layer_counts[pid] = layer_counts.get(pid, 0) + 1
+    offenders = sorted(pid for pid, count in layer_counts.items() if count > 2)
+    if offenders:
+        raise ValueError(
+            "Solid.layers look like a convex-hull facet shell, not a "
+            f"bottom-to-top cross-section stack: vertices {offenders!r} appear "
+            "in more than two polygon layers. solid_volume_centroid / "
+            "solid_faces require a stack; pass a stacked Solid, or measure the "
+            "hull's facets directly."
+        )
+
+
+def _solid_layer_rings(
+    solid: Solid,
+    objects: Mapping[str, GeoObject],
+    points: Mapping[str, Point],
+) -> list[tuple[bool, list[np.ndarray]]]:
+    """Resolve a Solid's layer stack to ``(is_point, vertices)`` per layer.
+
+    ``Solid.layers`` is contractually an **ordered bottom-to-top stack of
+    cross-sections** — the first and last entries are the caps and each adjacent
+    pair defines one lateral band — **not** a list of B-rep faces/facets. A
+    convex-hull Solid (:func:`convex_hull_3d`) violates that contract by storing
+    triangular facets here; :func:`_ensure_solid_is_stack` rejects such input
+    before this resolver runs.
+
+    Each polygon layer yields ``(False, [v0, v1, ...])`` of ``(3,)`` vertex
+    arrays in stored order; each point (apex/nadir) layer yields
+    ``(True, [vertex])``.
+
+    Raises
+    ------
+    ValueError
+        If any resolved vertex is non-finite (``nan``/``±inf``). This is the
+        single up-front screen shared by every Solid metric routing through
+        here — :func:`solid_faces`, :func:`solid_volume_centroid`, and both
+        surface-area paths — so an area computation fails loud rather than
+        returning a silent ``nan``. (The volume path keeps its own late
+        non-finite gate for defence in depth, but a poisoned vertex is now
+        caught here first.)
+    """
+    rings: list[tuple[bool, list[np.ndarray]]] = []
+    for layer_id in solid.layers:
+        if layer_id.startswith("pt_"):
+            rings.append((True, [_xyz(points[layer_id])]))
+        else:
+            try:
+                polygon = objects[layer_id]
+            except KeyError as exc:
+                raise ValueError(
+                    f"_solid_layer_rings: Solid {solid.id!r} references layer "
+                    f"{layer_id!r}, which is absent from the object store"
+                ) from exc
+            rings.append((False, [_xyz(points[pid]) for pid in polygon.point_ids]))
+    if not all(np.all(np.isfinite(v)) for _, ring in rings for v in ring):
+        raise ValueError("solid layer vertices contain nan or ±inf")
+    return rings
+
+
+def _lateral_faces(
+    lower: tuple[bool, list[np.ndarray]], upper: tuple[bool, list[np.ndarray]]
+) -> list[list[np.ndarray]]:
+    """Outward-wound lateral faces between two adjacent layers.
+
+    Handles equal-vertex-count polygon bands (quads) and the apex cases (a
+    point layer on either side → triangle fan). Bands between polygons of
+    *differing* vertex counts are rejected — the vertex correspondence is
+    ambiguous and outside this issue's scope.
+
+    .. note::
+       For an equal-count polygon band this assumes **positional vertex
+       correspondence**: ``low[i]`` connects to ``up[i]`` (and ``low[i+1]`` to
+       ``up[i+1]``). If the upper polygon is rotated relative to the lower —
+       same vertex count but offset start index, or reversed winding — the quads
+       wind into a twisted, self-intersecting shell whose volume is wrong, and
+       the only thing rejected today is the *differing*-count case. A twist is
+       **not** caught here: a cheap zero-area-quad screen was considered and
+       rejected because the legitimate coplanar-hull fallback (two identical
+       flat layers, :func:`_coplanar_fallback_solid`) produces zero-area bands
+       by design, so such a screen would false-positive on valid degenerate
+       input. Callers must therefore supply layers in corresponding vertex
+       order.
+    """
+    lower_is_pt, low = lower
+    upper_is_pt, up = upper
+    faces: list[list[np.ndarray]] = []
+    if upper_is_pt:
+        apex = up[0]
+        n = len(low)
+        for i in range(n):
+            faces.append([low[i], low[(i + 1) % n], apex])
+    elif lower_is_pt:
+        apex = low[0]
+        n = len(up)
+        for i in range(n):
+            faces.append([apex, up[(i + 1) % n], up[i]])
+    else:
+        if len(low) != len(up):
+            raise ValueError(
+                "solid lateral band between polygons of differing vertex counts is not supported"
+            )
+        n = len(low)
+        for i in range(n):
+            faces.append([low[i], low[(i + 1) % n], up[(i + 1) % n], up[i]])
+    return faces
+
+
+def solid_faces(
+    solid: Solid,
+    objects: Mapping[str, GeoObject],
+    points: Mapping[str, Point],
+) -> list[list[np.ndarray]]:
+    """Closed B-rep of a Solid as a list of outward-wound polygon faces.
+
+    Builds the boundary representation from the layer stack
+    (``docs/implementation-design.md`` §13.8):
+    a bottom cap (first layer, reversed so its normal faces down/outward), a
+    top cap (last layer, kept as stored so its normal faces up/outward), and
+    the lateral faces between every pair of adjacent layers. Point (apex/nadir)
+    end layers have no cap; their band is a triangle fan. All faces are wound
+    with consistent outward normals so the divergence-theorem volume in
+    :func:`solid_volume_centroid` is sign-consistent.
+
+    Parameters
+    ----------
+    solid : Solid
+        The solid whose layer stack is converted.
+    objects : Mapping[str, GeoObject]
+        Object lookup resolving each polygon layer ID to its Polygon.
+    points : Mapping[str, Point]
+        Point lookup resolving every vertex ID.
+
+    Returns
+    -------
+    list[list[numpy.ndarray]]
+        Faces, each a list of ``(3,)`` vertex arrays.
+
+    Raises
+    ------
+    ValueError
+        If a lateral band joins polygons of differing vertex counts.
+    """
+    caps, laterals = _solid_brep(solid, objects, points)
+    return caps + laterals
+
+
+def _solid_brep(
+    solid: Solid,
+    objects: Mapping[str, GeoObject],
+    points: Mapping[str, Point],
+) -> tuple[list[list[np.ndarray]], list[list[np.ndarray]]]:
+    """Return ``(cap_faces, lateral_faces)`` of a Solid's closed B-rep.
+
+    Raises
+    ------
+    ValueError
+        If ``solid`` is a convex-hull facet shell rather than a cross-section
+        stack (see :func:`_ensure_solid_is_stack`). The function also asserts
+        at least two layers, but this is belt-and-suspenders:
+        :meth:`Solid.__post_init__` already rejects a 0- or 1-layer Solid at
+        construction, so a real Solid can never reach that guard.
+    """
+    _ensure_solid_is_stack(solid, objects)
+    rings = _solid_layer_rings(solid, objects, points)
+    if len(rings) < 2:
+        raise ValueError(
+            f"Solid B-rep requires at least 2 layers; got {len(rings)} "
+            f"(a 0- or 1-layer Solid has no cap/lateral structure)"
+        )
+    caps: list[list[np.ndarray]] = []
+    first_is_pt, first = rings[0]
+    last_is_pt, last = rings[-1]
+    if not first_is_pt:
+        caps.append(list(reversed(first)))  # bottom cap: outward normal points down
+    if not last_is_pt:
+        caps.append(list(last))  # top cap: outward normal points up
+    laterals: list[list[np.ndarray]] = []
+    for lower, upper in zip(rings, rings[1:]):
+        laterals.extend(_lateral_faces(lower, upper))
+    return caps, laterals
+
+
+def _face_area_vector(face: Sequence[np.ndarray]) -> np.ndarray:
+    """Newell area vector of a planar polygon face (½·Σ vᵢ × vᵢ₊₁)."""
+    total = np.zeros(3, dtype=np.float64)
+    n = len(face)
+    for i in range(n):
+        total += np.cross(face[i], face[(i + 1) % n])
+    return 0.5 * total
+
+
+def _face_area(face: Sequence[np.ndarray]) -> np.float64:
+    """Area of a planar polygon face."""
+    return np.float64(np.linalg.norm(_face_area_vector(face)))
+
+
+def solid_volume_centroid(
+    solid: Solid,
+    objects: Mapping[str, GeoObject],
+    points: Mapping[str, Point],
+) -> tuple[np.float64, np.ndarray]:
+    """Volume and centroid of a Solid (Mirtich 1996 polyhedral mass properties).
+
+    Builds the closed B-rep via :func:`solid_faces`, fan-triangulates each
+    face, and accumulates the signed-tetrahedron decomposition — the
+    divergence-theorem surface integral underlying Mirtich's method. The
+    volume is ``Σ (p₀ · (p₁ × p₂)) / 6`` over the triangles; the centroid is the
+    volume-weighted mean of the tetra centroids ``(p₀+p₁+p₂)/4``.
+
+    The tetra/centroid sum is accumulated in a frame shifted by a reference
+    vertex (the first vertex of the first face), not the absolute UTM origin.
+    Mirtich's decomposition is translation-invariant in the volume and the
+    centroid simply translates by the same offset, so this is exact — but it
+    avoids the catastrophic cancellation that, depending on the solid's scale,
+    can lose several significant digits at UTM magnitudes: with E~5e5, N~4e6 the
+    unshifted tetra products run to ~1e17 and the volume emerges as their tiny
+    difference. The reference offset is added back to the returned centroid; the
+    volume needs no correction.
+
+    Because every face is consistently wound (:func:`solid_faces`), the signed
+    volume's global sign is uniform: the reported volume is its magnitude, and
+    the centroid ``ΣC / ΣV`` is correct regardless of whether the shell is
+    globally inward- or outward-oriented (both numerator and denominator share
+    the sign).
+
+    A degenerate (coplanar, zero-extent) Solid returns volume ``0.0`` paired
+    with a **nan-filled centroid** (``np.full(3, nan)``), not a fabricated
+    ``(0, 0, 0)``: in UTM metres the origin is hundreds of kilometres from any
+    real geometry, so returning it would silently plant the centroid in the
+    ocean and could not be told apart from a flat solid whose
+    inconsistently-wound faces happen to cancel to ~0. A ``nan`` centroid is the
+    honest "undefined" signal; callers gate on volume via
+    :func:`geometry.services.validation.validate_solid_non_degenerate` against
+    :data:`~geometry.utils.constants.EPS_VOLUME`. The volume agrees with the
+    Wuttke (2021) Eq. 22 form-factor cross-check ``(1/3)·Σ Ar(face)·r_perp``.
+
+    Parameters
+    ----------
+    solid : Solid
+        The solid to measure.
+    objects : Mapping[str, GeoObject]
+        Object lookup resolving polygon layers.
+    points : Mapping[str, Point]
+        Point lookup resolving vertices.
+
+    Returns
+    -------
+    tuple[numpy.float64, numpy.ndarray]
+        ``(volume, centroid)`` — non-negative volume in cubic metres and the
+        ``(easting, northing, altitude)`` centroid, shape ``(3,)``. A genuine
+        zero-extent (coplanar, ``|volume| < EPS_VOLUME``) Solid returns
+        ``(0.0, np.full(3, nan))``: the centroid is undefined, not the UTM
+        origin. A *non-finite* accumulation does **not** return here — see Raises.
+
+    Raises
+    ------
+    ValueError
+        If ``solid`` is a convex-hull facet shell rather than a cross-section
+        stack (propagated from :func:`solid_faces`). The underlying B-rep also
+        asserts at least two layers, but :meth:`Solid.__post_init__` already
+        rejects a 0- or 1-layer Solid at construction, so a real Solid can
+        never trigger that path. Also raised if the signed-volume accumulation
+        is non-finite (``nan``/``±inf``) — a corrupt computation from arithmetic
+        overflow at UTM magnitudes or nan/inf vertices — which is reported as an
+        error rather than folded into the clean zero-extent return.
+    """
+    faces = solid_faces(solid, objects, points)
+    # Anchor the accumulation at the first vertex to keep the tetra products in a
+    # small local frame; see the docstring for the UTM-cancellation rationale.
+    ref = faces[0][0] if faces else np.zeros(3, dtype=np.float64)
+    signed_v = np.float64(0.0)
+    moment = np.zeros(3, dtype=np.float64)
+    for face in faces:
+        v0 = face[0] - ref
+        for i in range(1, len(face) - 1):
+            v1 = face[i] - ref
+            v2 = face[i + 1] - ref
+            tetra = float(np.dot(v0, np.cross(v1, v2))) / 6.0
+            signed_v += tetra
+            moment += tetra * (v0 + v1 + v2) / 4.0
+    # A non-finite signed volume is a *corrupt* accumulation, not a degenerate
+    # solid: it means the tetra products overflowed (real at UTM magnitudes,
+    # where unshifted coordinates push intermediates toward float64's range) or a
+    # nan/inf vertex slipped through. It is distinct from the genuine zero-extent
+    # case below and must fail loud rather than masquerade as a clean zero —
+    # ``nan < EPS_VOLUME`` is False, so it would otherwise fall through to the
+    # final return as ``(nan, moment/nan)``.
+    if not math.isfinite(float(signed_v)):
+        raise ValueError(
+            "solid_volume_centroid: non-finite signed volume "
+            f"({float(signed_v)!r}) — overflow or nan/inf vertices corrupted the "
+            "accumulation"
+        )
+    # Genuine zero-extent (coplanar / degenerate) solid: report zero volume with
+    # an undefined (nan) centroid rather than a fabricated UTM origin.
+    if abs(signed_v) < EPS_VOLUME:
+        return np.float64(0.0), np.full(3, np.nan, dtype=np.float64)
+    # Centroid was computed in the shifted frame; translate it back by ``ref``.
+    return np.float64(abs(signed_v)), moment / signed_v + ref
+
+
+def solid_lateral_surface_area(
+    solid: Solid,
+    objects: Mapping[str, GeoObject],
+    points: Mapping[str, Point],
+) -> np.float64:
+    """Total area of a Solid's lateral faces (the bands between layers).
+
+    Raises
+    ------
+    ValueError
+        If ``solid`` is a convex-hull facet shell rather than a cross-section
+        stack, or its layers yield bands with differing vertex counts
+        (propagated from :func:`_solid_brep`). The underlying B-rep also
+        asserts at least two layers, but :meth:`Solid.__post_init__` already
+        rejects a 0- or 1-layer Solid at construction, so a real Solid can
+        never trigger that path.
+    """
+    _, laterals = _solid_brep(solid, objects, points)
+    return np.float64(sum(_face_area(f) for f in laterals))
+
+
+def solid_total_surface_area(
+    solid: Solid,
+    objects: Mapping[str, GeoObject],
+    points: Mapping[str, Point],
+) -> np.float64:
+    """Total surface area of a Solid: lateral bands plus the cap faces.
+
+    Raises
+    ------
+    ValueError
+        If ``solid`` is a convex-hull facet shell rather than a cross-section
+        stack, or its layers yield bands with differing vertex counts
+        (propagated from :func:`_solid_brep`). The underlying B-rep also
+        asserts at least two layers, but :meth:`Solid.__post_init__` already
+        rejects a 0- or 1-layer Solid at construction, so a real Solid can
+        never trigger that path.
+    """
+    caps, laterals = _solid_brep(solid, objects, points)
+    return np.float64(sum(_face_area(f) for f in caps + laterals))

@@ -12,32 +12,50 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for ``geometry.services.geometry`` (issue #13).
+"""Tests for ``geometry.services.geometry`` (issues #13, #60, #78).
 
-Every formula in the acceptance criteria gets a known-input/known-output
-test: direction (azimuth), Euclidean distance, convexity, convex hull,
-signed area, the four intersection types, the two polygon distances, the
-tangent direction, and the vector endpoint. Inputs are chosen so the
-expected results are exact (axis-aligned squares, 3-4-5 triangles) and can
-be asserted without depending on floating-point noise beyond a tight
-tolerance.
+Covers both the 2-D plane geometry and the 3-D solid geometry the module
+now provides. Each formula in the acceptance criteria gets a
+known-input/known-output test:
+
+* 2-D — direction (azimuth), 3-D Euclidean distance, elevation and the
+  three-point azimuth/elevation, convexity, 2-D convex hull, signed area,
+  the three intersection helpers (line-line, line-polygon, polygon-polygon)
+  plus the ray-polygon distance, the two polygon distances, the tangent
+  direction, and the vector endpoint.
+* 3-D solids — the 3-D convex hull (B-rep facet shell), ball volume /
+  surface area / cross-section radius / tangent, cylinder volume / surface
+  area / axis vector / planar cross-section classification
+  (:class:`CylinderCrossSection`), and Solid volume + centroid, lateral and
+  total surface area, and the B-rep face builder (Mirtich 1996 mass
+  properties, Wuttke 2021 cross-check).
+
+Inputs are chosen so the expected results are exact (axis-aligned squares,
+3-4-5 triangles, unit cubes/tetrahedra) and can be asserted without
+depending on floating-point noise beyond a tight tolerance. A
+far-from-origin UTM case additionally locks the centroid-precision fix.
 """
 
 from __future__ import annotations
 
+import logging
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from scipy.spatial import QhullError  # pylint: disable=no-name-in-module
 
 from geometry.models.common import DirectionMode, DirectionUnits
+from geometry.models.cylinder import Cylinder
 from geometry.models.line import Line
 from geometry.models.point import Point
 from geometry.models.polygon import Polygon
 from geometry.models.ray import Ray
+from geometry.models.solid import Solid
 from geometry.services import geometry as geo
 from geometry.utils.constants import EPS_DISTANCE
+from geometry.utils.id_factory import IDFactory
 
 # ---------------------------------------------------------------------------
 # builders
@@ -330,6 +348,25 @@ def test_convex_hull_raises_on_collinear():
     }
     poly = _poly("pg_k", ["k0", "k1", "k2"])
     with pytest.raises(QhullError):
+        geo.convex_hull(poly, pts, "pg_999")
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf], ids=["nan", "inf", "-inf"])
+def test_convex_hull_non_finite_coord_raises(bad):
+    # PR #78: the 2-D ``convex_hull`` gained the same up-front ``np.isfinite``
+    # screen as ``convex_hull_3d`` so a poisoned vertex fails loud here with an
+    # actionable message rather than surfacing as an opaque QHull error.
+    # ``Point.__post_init__`` forbids non-finite coordinates, so the corrupt
+    # vertex is supplied via a minimal stand-in exposing only the two attributes
+    # ``_polygon_coords`` reads — the exact seam the guard exists to catch.
+    pts = {
+        "g0": _pt("g0", 0, 0),
+        "g1": _pt("g1", 1, 0),
+        "g2": _pt("g2", 1, 1),
+        "g3": SimpleNamespace(easting=bad, northing=0.0),
+    }
+    poly = _poly("pg_g", ["g0", "g1", "g2", "g3"])
+    with pytest.raises(ValueError, match=r"nan or ±inf"):
         geo.convex_hull(poly, pts, "pg_999")
 
 
@@ -1032,3 +1069,1304 @@ def test_three_point_both_arms_vertical_positive_pi_elevation():
     az, el = geo.three_point_azimuth_elevation(a, b, c)
     assert az is None
     assert el == pytest.approx(math.pi)
+
+
+# ---------------------------------------------------------------------------
+# 3-D builders (issue #60)
+# ---------------------------------------------------------------------------
+
+
+def _cyl(
+    axis_mode: str,
+    az: float = 0.0,
+    el: float = math.pi / 2,
+    radius: float = 2.0,
+    height: float = 5.0,
+) -> Cylinder:
+    return Cylinder(
+        id="cy_001",
+        name="cyl",
+        alpha=1.0,
+        visibility=True,
+        base_center_id="pt_c",
+        radius=radius,
+        height=height,
+        axis_mode=axis_mode,
+        axis_azimuth=az,
+        axis_elevation=el,
+        direction_mode=DirectionMode.AZIMUTH,
+        direction_units=DirectionUnits.RADIANS,
+        line_color="#000000",
+        fill_color="#cccccc",
+    )
+
+
+def _solid(layers: tuple[str, ...]) -> Solid:
+    return Solid(
+        id="so_001",
+        name="solid",
+        alpha=1.0,
+        visibility=True,
+        layers=layers,
+        line_color="#000000",
+        fill_color="#cccccc",
+    )
+
+
+def _unit_cube():
+    """Return (solid, objects, points) for a unit cube via two square layers."""
+    pts = {
+        "pb0": _pt("pb0", 0, 0, 0.0),
+        "pb1": _pt("pb1", 1, 0, 0.0),
+        "pb2": _pt("pb2", 1, 1, 0.0),
+        "pb3": _pt("pb3", 0, 1, 0.0),
+        "pt0": _pt("pt0", 0, 0, 1.0),
+        "pt1": _pt("pt1", 1, 0, 1.0),
+        "pt2": _pt("pt2", 1, 1, 1.0),
+        "pt3": _pt("pt3", 0, 1, 1.0),
+    }
+    bottom = _poly("pg_b", ("pb0", "pb1", "pb2", "pb3"))
+    top = _poly("pg_t", ("pt0", "pt1", "pt2", "pt3"))
+    solid = _solid(("pg_b", "pg_t"))
+    objects = {"pg_b": bottom, "pg_t": top}
+    return solid, objects, pts
+
+
+def _tetra(height: float = 3.0):
+    """Return (solid, objects, points) for a triangular-base pyramid."""
+    pts = {
+        "pb0": _pt("pb0", 0, 0, 0.0),
+        "pb1": _pt("pb1", 1, 0, 0.0),
+        "pb2": _pt("pb2", 0, 1, 0.0),
+        "pt_apex": _pt("pt_apex", 0, 0, height),
+    }
+    base = _poly("pg_base", ("pb0", "pb1", "pb2"))
+    solid = _solid(("pg_base", "pt_apex"))
+    objects = {"pg_base": base}
+    return solid, objects, pts
+
+
+def _wuttke_volume(solid, objects, points) -> float:
+    """Independent Wuttke (2021) Eq. 22 cross-check: (1/3) Σ Ar(face)·r_perp."""
+    total = 0.0
+    for face in geo.solid_faces(solid, objects, points):
+        area_vec = geo._face_area_vector(face)  # pylint: disable=protected-access
+        area = float(np.linalg.norm(area_vec))
+        if area == 0.0:
+            continue
+        nhat = area_vec / area
+        total += area * float(np.dot(face[0], nhat)) / 3.0
+    return abs(total)
+
+
+# ---------------------------------------------------------------------------
+# Ball geometry
+# ---------------------------------------------------------------------------
+
+
+def test_ball_volume():
+    assert geo.ball_volume(2.0) == pytest.approx(4.0 / 3.0 * math.pi * 8.0)
+
+
+def test_ball_surface_area():
+    assert geo.ball_surface_area(3.0) == pytest.approx(4.0 * math.pi * 9.0)
+
+
+def test_ball_cross_section_radius_through_center():
+    assert geo.ball_cross_section_radius(5.0, 0.0) == pytest.approx(5.0)
+
+
+def test_ball_cross_section_radius_offset():
+    assert geo.ball_cross_section_radius(5.0, 3.0) == pytest.approx(4.0)
+
+
+def test_ball_cross_section_radius_tangent_plane():
+    assert geo.ball_cross_section_radius(5.0, 5.0) == pytest.approx(0.0)
+
+
+def test_ball_cross_section_radius_outside_returns_none():
+    assert geo.ball_cross_section_radius(5.0, 6.0) is None
+    assert geo.ball_cross_section_radius(5.0, -6.0) is None
+
+
+@pytest.mark.parametrize(
+    "bad", [-1.0, math.nan, math.inf, -math.inf], ids=["neg", "nan", "inf", "-inf"]
+)
+def test_ball_cross_section_radius_rejects_bad_radius(bad):
+    # ``ball_cross_section_radius`` now calls ``_require_non_negative_radius`` at
+    # entry. Without it a negative radius makes ``abs(distance) > ball_radius``
+    # always true and the function silently returns ``None``, masking the corrupt
+    # input. The guard raises instead — matching the other ball/cylinder measures.
+    with pytest.raises(ValueError, match="Radius"):
+        geo.ball_cross_section_radius(bad, 0.0)
+
+
+def test_ball_cross_section_radius_zero_radius_only_meets_at_center():
+    # Radius exactly 0 is permitted (a degenerate point ball): the plane meets it
+    # only at distance 0, where the cross-section radius is 0.0; any offset misses.
+    assert geo.ball_cross_section_radius(0.0, 0.0) == pytest.approx(0.0)
+    assert geo.ball_cross_section_radius(0.0, 1.0) is None
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf], ids=["nan", "inf", "-inf"])
+def test_ball_cross_section_radius_rejects_non_finite_distance(bad):
+    # A non-finite ``distance_to_plane`` must fail loud. ``nan`` makes the miss
+    # guard ``abs(distance) > ball_radius`` evaluate False, so the function would
+    # otherwise return ``sqrt(r² − nan) = nan`` and corrupt the
+    # ``None``-means-"plane misses ball" contract; ``±inf`` is non-physical for a
+    # signed plane distance. The guard rejects all three with a clear message.
+    with pytest.raises(ValueError, match="distance_to_plane must be finite"):
+        geo.ball_cross_section_radius(5.0, bad)
+
+
+def test_ball_cross_section_radius_finite_normal_and_miss():
+    # Confirms the guard left the normal contract intact: an in-range distance
+    # still returns √(r² − d²) and an out-of-range distance still returns None.
+    assert geo.ball_cross_section_radius(5.0, 3.0) == pytest.approx(4.0)  # √(25 − 9)
+    assert geo.ball_cross_section_radius(5.0, 7.0) is None  # |d| > r → plane misses
+
+
+def test_ball_tangent_direction_azimuth():
+    center = _pt("c", 0, 0, 0.0)
+    assert geo.ball_tangent_direction(center, _pt("n", 0, 1, 0.0)) == pytest.approx(0.0)
+    assert geo.ball_tangent_direction(center, _pt("e", 1, 0, 0.0)) == pytest.approx(math.pi / 2)
+
+
+def test_ball_tangent_direction_ignores_surface_point_altitude():
+    # The returned bearing is the *horizontal* azimuth of the radius and must not
+    # depend on the surface point's altitude. A north-and-up surface point yields
+    # the same azimuth (0) as a flat one; an east-and-up point yields π/2.
+    center = _pt("c", 0, 0, 0.0)
+    assert geo.ball_tangent_direction(center, _pt("nu", 0, 1, 7.0)) == pytest.approx(0.0)
+    assert geo.ball_tangent_direction(center, _pt("eu", 1, 0, 7.0)) == pytest.approx(math.pi / 2)
+
+
+# ---------------------------------------------------------------------------
+# Cylinder geometry
+# ---------------------------------------------------------------------------
+
+
+def test_cylinder_volume():
+    assert geo.cylinder_volume(2.0, 5.0) == pytest.approx(math.pi * 4.0 * 5.0)
+
+
+def test_cylinder_lateral_surface_area():
+    assert geo.cylinder_lateral_surface_area(2.0, 5.0) == pytest.approx(2.0 * math.pi * 2.0 * 5.0)
+
+
+def test_cylinder_total_surface_area():
+    expected = 2.0 * math.pi * 2.0 * 5.0 + 2.0 * math.pi * 4.0
+    assert geo.cylinder_total_surface_area(2.0, 5.0) == pytest.approx(expected)
+
+
+def test_cylinder_axis_vector_vertical():
+    assert np.allclose(geo.cylinder_axis_vector(_cyl("vertical")), [0.0, 0.0, 1.0])
+
+
+def test_cylinder_axis_vector_inclined():
+    cyl = _cyl("inclined", az=math.pi / 2, el=math.pi / 4)
+    inv_sqrt2 = 1.0 / math.sqrt(2.0)
+    assert np.allclose(geo.cylinder_axis_vector(cyl), [inv_sqrt2, 0.0, inv_sqrt2])
+
+
+def test_cylinder_axis_vector_inclined_pins_sin_cos_swap():
+    # az=π/6 gives sin(az)=0.5 ≠ cos(az)=√3/2, both nonzero, so this pins which
+    # trig term maps to which axis (domain invariant #7's sin/cos swap): easting
+    # is the SIN term, northing the COS term — a case az=π/2 cannot distinguish.
+    cyl = _cyl("inclined", az=math.pi / 6, el=math.pi / 6)
+    cos_el = math.cos(math.pi / 6)
+    expected = [0.5 * cos_el, (math.sqrt(3.0) / 2.0) * cos_el, 0.5]
+    assert np.allclose(geo.cylinder_axis_vector(cyl), expected)
+
+
+def test_cylinder_cross_section_circle():
+    cs = geo.cylinder_cross_section(_cyl("vertical"), np.array([0.0, 0.0, 1.0]))
+    assert cs.kind == "circle"
+    assert cs.radius == pytest.approx(2.0)
+    # Perpendicular cut: radius r regardless of offset → exact.
+    assert cs.approximate is False
+
+
+def test_cylinder_cross_section_rectangle():
+    cs = geo.cylinder_cross_section(_cyl("vertical"), np.array([1.0, 0.0, 0.0]))
+    assert cs.kind == "rectangle"
+    assert (cs.width, cs.height) == pytest.approx((4.0, 5.0))
+    # Full 2r width assumes a through-axis plane → simplified.
+    assert cs.approximate is True
+
+
+def test_cylinder_cross_section_ellipse():
+    cs = geo.cylinder_cross_section(_cyl("vertical"), np.array([1.0, 0.0, 1.0]))
+    assert cs.kind == "ellipse"
+    assert (cs.semi_major, cs.semi_minor) == pytest.approx((2.0 * math.sqrt(2.0), 2.0))
+    # Span depends on the perpendicular offset → simplified.
+    assert cs.approximate is True
+
+
+def test_cylinder_cross_section_zero_normal_raises():
+    with pytest.raises(ValueError):
+        geo.cylinder_cross_section(_cyl("vertical"), np.array([0.0, 0.0, 0.0]))
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf], ids=["nan", "inf", "-inf"])
+def test_cylinder_cross_section_non_finite_normal_raises(bad):
+    # A non-finite component in ``plane_normal`` must fail loud. A ``nan``
+    # component bypasses the zero-length guard (``norm`` is ``nan`` and
+    # ``nan < EPS_DISTANCE`` is False), after which ``cos_theta`` clamps to 1.0
+    # and the function would fabricate an exact ``circle`` from corrupt input.
+    # The up-front ``np.isfinite`` screen rejects it instead.
+    normal = np.array([bad, 0.0, 1.0], dtype=np.float64)
+    with pytest.raises(ValueError, match=r"nan or ±inf"):
+        geo.cylinder_cross_section(_cyl("vertical"), normal)
+
+
+# ---------------------------------------------------------------------------
+# Solid volume / centroid / area (Mirtich 1996)
+# ---------------------------------------------------------------------------
+
+
+def test_solid_volume_unit_cube():
+    solid, objects, pts = _unit_cube()
+    volume, centroid = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(1.0)
+    assert np.allclose(centroid, [0.5, 0.5, 0.5])
+
+
+def test_solid_volume_cube_matches_wuttke():
+    solid, objects, pts = _unit_cube()
+    volume, _ = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(_wuttke_volume(solid, objects, pts))
+
+
+def test_solid_volume_tetrahedron():
+    solid, objects, pts = _tetra(height=3.0)
+    # base area = 0.5, height = 3 → volume = 0.5 * 3 / 3 = 0.5
+    volume, _ = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(0.5)
+
+
+def test_solid_volume_tetra_matches_wuttke():
+    solid, objects, pts = _tetra(height=2.0)
+    volume, _ = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(_wuttke_volume(solid, objects, pts))
+
+
+def test_solid_total_surface_area_unit_cube():
+    solid, objects, pts = _unit_cube()
+    assert geo.solid_total_surface_area(solid, objects, pts) == pytest.approx(6.0)
+
+
+def test_solid_lateral_surface_area_unit_cube():
+    solid, objects, pts = _unit_cube()
+    assert geo.solid_lateral_surface_area(solid, objects, pts) == pytest.approx(4.0)
+
+
+@pytest.mark.parametrize(
+    "func",
+    [
+        geo.solid_volume_centroid,
+        geo.solid_lateral_surface_area,
+        geo.solid_total_surface_area,
+    ],
+    ids=["volume_centroid", "lateral_area", "total_area"],
+)
+def test_solid_lateral_band_differing_vertex_counts_raises(func):
+    # A 4-vertex bottom square stacked under a 3-vertex top triangle yields a
+    # lateral band whose vertex correspondence is ambiguous; ``_lateral_faces``
+    # rejects the differing-count band. All three measurement entry points reach
+    # that band via ``_solid_brep``, so each must surface the same ``ValueError``
+    # — parametrized rather than copied so a future divergence in one path is
+    # caught without duplicating the build.
+    pts = {
+        "pb0": _pt("pb0", 0, 0, 0.0),
+        "pb1": _pt("pb1", 2, 0, 0.0),
+        "pb2": _pt("pb2", 2, 2, 0.0),
+        "pb3": _pt("pb3", 0, 2, 0.0),
+        "pt0": _pt("pt0", 0, 0, 1.0),
+        "pt1": _pt("pt1", 1, 0, 1.0),
+        "pt2": _pt("pt2", 0, 1, 1.0),
+    }
+    objects = {
+        "pg_b": _poly("pg_b", ("pb0", "pb1", "pb2", "pb3")),
+        "pg_t": _poly("pg_t", ("pt0", "pt1", "pt2")),
+    }
+    with pytest.raises(ValueError, match="differing vertex counts"):
+        func(_solid(("pg_b", "pg_t")), objects, pts)
+
+
+def _frustum():
+    """Return (solid, objects, points) for a truncated square pyramid (frustum).
+
+    Two *differently sized* squares are stacked with equal vertex counts and
+    positional correspondence (``low[i]`` over ``up[i]``): a 2×2 bottom centred
+    on the origin at ``z=0`` and a 1×1 top centred on the origin at ``z=1``. The
+    existing quad-band fixtures (``_unit_cube``) use two identical footprints, so
+    their slanted quads degenerate to vertical rectangles; a frustum forces the
+    genuinely *slanted* quad builder and the multi-band ``zip(rings, rings[1:])``
+    loop to run together over non-congruent rings.
+
+    Closed-form volume
+    ------------------
+    A frustum of height ``h`` between parallel areas ``A₁`` (bottom) and ``A₂``
+    (top) has volume ``h/3·(A₁ + A₂ + √(A₁·A₂))``. Here ``A₁ = 4``, ``A₂ = 1``,
+    ``h = 1`` → ``1/3·(4 + 1 + 2) = 7/3``.
+    """
+    pts = {
+        "pb0": _pt("pb0", -1, -1, 0.0),
+        "pb1": _pt("pb1", 1, -1, 0.0),
+        "pb2": _pt("pb2", 1, 1, 0.0),
+        "pb3": _pt("pb3", -1, 1, 0.0),
+        "pt0": _pt("pt0", -0.5, -0.5, 1.0),
+        "pt1": _pt("pt1", 0.5, -0.5, 1.0),
+        "pt2": _pt("pt2", 0.5, 0.5, 1.0),
+        "pt3": _pt("pt3", -0.5, 0.5, 1.0),
+    }
+    bottom = _poly("pg_b", ("pb0", "pb1", "pb2", "pb3"))
+    top = _poly("pg_t", ("pt0", "pt1", "pt2", "pt3"))
+    solid = _solid(("pg_b", "pg_t"))
+    objects = {"pg_b": bottom, "pg_t": top}
+    return solid, objects, pts
+
+
+def test_solid_volume_frustum_matches_closed_form():
+    # Truncated square pyramid: bottom area A1=4, top area A2=1, height h=1.
+    # Frustum volume = h/3·(A1 + A2 + √(A1·A2)) = 1/3·(4 + 1 + 2) = 7/3. This
+    # exercises the slanted-quad lateral builder over differently sized rings,
+    # which the identical-footprint cube fixtures cannot.
+    solid, objects, pts = _frustum()
+    a1, a2, h = 4.0, 1.0, 1.0
+    expected = h / 3.0 * (a1 + a2 + math.sqrt(a1 * a2))
+    volume, _ = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(expected)
+
+
+def test_solid_volume_frustum_rotated_top_ring_twist_undetected():
+    # CHARACTERIZATION (PR #78 review): pins a KNOWN hazard in ``_lateral_faces``.
+    # It assumes positional vertex correspondence (``low[i]`` over ``up[i]``) and
+    # only rejects bands between polygons of *differing* vertex counts. Two rings
+    # with EQUAL vertex counts but a rotated start index produce a twisted,
+    # self-intersecting shell — and this is NOT detected: no exception is raised
+    # and the divergence-theorem volume comes out wrong.
+    #
+    # Reuse the frustum fixture (correct stacking → 7/3 ≈ 2.333) but rotate the
+    # top square's vertex order by one (pt1, pt2, pt3, pt0) so up[i] no longer
+    # sits above low[i]. The current code returns 1.0 instead of 7/3, silently.
+    # If a future change adds twist detection (e.g. an angle/winding screen), this
+    # test must be updated — either to expect a raise or the corrected 7/3.
+    _, objects, pts = _frustum()
+    twisted_top = _poly("pg_t", ("pt1", "pt2", "pt3", "pt0"))
+    twisted_objects = {"pg_b": objects["pg_b"], "pg_t": twisted_top}
+    correct = 1.0 / 3.0 * (4.0 + 1.0 + math.sqrt(4.0 * 1.0))  # 7/3, the aligned value
+    volume, _ = geo.solid_volume_centroid(_solid(("pg_b", "pg_t")), twisted_objects, pts)
+    assert volume == pytest.approx(1.0)  # the (wrong) value the twist yields
+    assert volume != pytest.approx(correct)  # twist went undetected, no raise
+
+
+def test_lateral_faces_reversed_upper_ring_makes_bowtie_quads_undetected():
+    # CHARACTERIZATION (PR #78 review): the SECOND, independently-regressing
+    # failure mode named in the ``_lateral_faces`` docstring — a *reversed*
+    # (CW vs CCW) upper ring of EQUAL vertex count. The rotated-start twist above
+    # is pinned through the volume; this pins the reversed case at the face level,
+    # directly on ``_lateral_faces``, since the two modes wind into different
+    # broken connectivity and a future fix could address one but not the other.
+    #
+    # With ``up`` reversed relative to ``low``, positional correspondence
+    # (``low[i]``↔``up[i]``) pairs each lower edge with a flipped upper edge, so
+    # the builder emits self-intersecting "bowtie" quads. Pin the exact
+    # connectivity the current code produces: alternating quads collapse to
+    # ZERO area (a degenerate normal) while the others warp into non-planar
+    # bowties — and crucially NO exception is raised (only the differing-count
+    # band is rejected). If twist/winding detection is added, update this test.
+    low = [
+        np.array([0.0, 0.0, 0.0]),
+        np.array([1.0, 0.0, 0.0]),
+        np.array([1.0, 1.0, 0.0]),
+        np.array([0.0, 1.0, 0.0]),
+    ]
+    up_aligned = [
+        np.array([0.0, 0.0, 1.0]),
+        np.array([1.0, 0.0, 1.0]),
+        np.array([1.0, 1.0, 1.0]),
+        np.array([0.0, 1.0, 1.0]),
+    ]
+    up_reversed = list(reversed(up_aligned))
+
+    faces = geo._lateral_faces((False, low), (False, up_reversed))  # pylint: disable=protected-access
+
+    # Four quads, one per lower edge — the band is built, not rejected.
+    assert len(faces) == 4
+    assert all(len(face) == 4 for face in faces)
+    # The reversed pairing degenerates the band: two quads collapse to zero area
+    # (their flipped edge folds them flat) and two warp into finite-area bowties.
+    areas = [float(geo._face_area(face)) for face in faces]  # pylint: disable=protected-access
+    zero_area = [a for a in areas if a == pytest.approx(0.0)]
+    bowtie_area = [a for a in areas if a == pytest.approx(math.sqrt(2.0))]
+    assert len(zero_area) == 2
+    assert len(bowtie_area) == 2
+    # Pin the exact stored vertex connectivity of the first (degenerate) quad:
+    # low[0], low[1], up_reversed[1], up_reversed[0].
+    first = faces[0]
+    assert np.allclose(first[0], low[0])
+    assert np.allclose(first[1], low[1])
+    assert np.allclose(first[2], up_reversed[1])
+    assert np.allclose(first[3], up_reversed[0])
+
+
+# ---------------------------------------------------------------------------
+# 3-D convex hull
+# ---------------------------------------------------------------------------
+
+
+def _facet_volume(facets, points) -> float:
+    """Signed-tetra volume over outward-oriented hull triangle facets."""
+    total = 0.0
+    for facet in facets:
+        v0, v1, v2 = (geo._xyz(points[pid]) for pid in facet.point_ids)  # pylint: disable=protected-access
+        total += float(np.dot(v0, np.cross(v1, v2))) / 6.0
+    return abs(total)
+
+
+def test_convex_hull_3d_unit_cube():
+    pts = {
+        f"p{i}": _pt(f"p{i}", x, y, z)
+        for i, (x, y, z) in enumerate(
+            [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
+        )
+    }
+    solid, facets, fallback = geo.convex_hull_3d(pts, list(pts), IDFactory())
+    assert fallback is geo.HullFallback.NONE  # genuine rank-3 hull, not a fallback
+    assert solid.id.startswith("so_")
+    assert all(f.id.startswith("pg_") for f in facets)
+    assert len(solid.layers) == len(facets)
+    assert all(len(f.point_ids) == 3 for f in facets)  # triangulated facets
+    assert _facet_volume(facets, pts) == pytest.approx(1.0)
+
+
+def test_convex_hull_3d_too_few_points_raises():
+    pts = {f"p{i}": _pt(f"p{i}", i, 0, 0.0) for i in range(3)}
+    with pytest.raises(ValueError):
+        geo.convex_hull_3d(pts, list(pts), IDFactory())
+
+
+def test_convex_hull_3d_coplanar_fallback_degenerate():
+    pts = {
+        "p0": _pt("p0", 0, 0, 0.0),
+        "p1": _pt("p1", 1, 0, 0.0),
+        "p2": _pt("p2", 1, 1, 0.0),
+        "p3": _pt("p3", 0, 1, 0.0),
+    }
+    solid, polygons, fallback = geo.convex_hull_3d(pts, list(pts), IDFactory())
+    # The deliberate rank<3 fallback: branch on the structured discriminator, not
+    # the Solid's display name.
+    assert fallback is geo.HullFallback.COPLANAR
+    assert len(polygons) == 1
+    # The Solid is the degenerate flat one: two identical zero-extent layers.
+    assert len(solid.layers) == 2
+    assert solid.layers[0] == solid.layers[1]  # two identical flat layers
+    objects = {polygons[0].id: polygons[0]}
+    volume, _ = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(0.0)  # zero extent → flagged via EPS_VOLUME
+
+
+def test_convex_hull_3d_qhull_error_routes_to_flat_fallback(monkeypatch, caplog):
+    # The coplanar test above reaches ``_coplanar_fallback_solid`` via the
+    # up-front rank screen. This drives the OTHER route: a rank-3 (non-coplanar)
+    # tetrahedron that passes the screen but trips ``ConvexHull`` itself — the
+    # ``except QhullError`` branch around geometry.py:1019-1029, which logs a
+    # WARNING and falls back to the flat 2-D hull. The branch is simulated by
+    # patching ``geo.ConvexHull`` to raise once on the first (3-D) call, then
+    # delegate to the real implementation so the fallback's 2-D hull still runs.
+    real_convex_hull = geo.ConvexHull
+    calls = {"n": 0}
+
+    def flaky_convex_hull(coords, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise QhullError("simulated precision/degeneracy borderline")
+        return real_convex_hull(coords, *args, **kwargs)
+
+    monkeypatch.setattr(geo, "ConvexHull", flaky_convex_hull)
+    pts = {
+        "p0": _pt("p0", 0, 0, 0.0),
+        "p1": _pt("p1", 1, 0, 0.0),
+        "p2": _pt("p2", 0, 1, 0.0),
+        "p3": _pt("p3", 0, 0, 1.0),  # apex lifts the set to full rank-3
+    }
+    with caplog.at_level(logging.WARNING, logger=geo._logger.name):  # pylint: disable=protected-access
+        solid, polygons, fallback = geo.convex_hull_3d(pts, list(pts), IDFactory())
+
+    # The fallback ran (real ConvexHull was reached on the 2-D retry) and
+    # produced the degenerate flat Solid: a single facet polygon stored twice.
+    # The QHull-failure route is distinguished from the deliberate-coplanar route
+    # by the enum, not by parsing the Solid's name.
+    assert fallback is geo.HullFallback.QHULL_FAILURE
+    assert calls["n"] == 2
+    assert len(polygons) == 1
+    assert len(solid.layers) == 2
+    assert solid.layers[0] == solid.layers[1]
+    objects = {polygons[0].id: polygons[0]}
+    volume, _ = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(0.0)  # zero extent → flagged via EPS_VOLUME
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("flat 2-D fallback" in r.getMessage() for r in warnings)
+
+
+def test_convex_hull_3d_collinear_raises():
+    pts = {f"p{i}": _pt(f"p{i}", i, i, 0.0) for i in range(4)}  # collinear in 3D
+    with pytest.raises(ValueError):
+        geo.convex_hull_3d(pts, list(pts), IDFactory())
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf], ids=["nan", "inf", "-inf"])
+def test_convex_hull_3d_non_finite_coord_raises(bad):
+    # The up-front ``np.isfinite`` guard rejects non-finite input so a nan/inf
+    # cannot be funnelled into the coplanar fallback and masquerade as flat
+    # geometry. ``Point.__post_init__`` forbids non-finite coordinates, so the
+    # corrupt vertex is supplied via a minimal stand-in exposing only the three
+    # attributes ``_xyz`` reads — the exact seam the defense-in-depth guard
+    # exists to catch.
+    points = {
+        "p0": _pt("p0", 0, 0, 0.0),
+        "p1": _pt("p1", 1, 0, 0.0),
+        "p2": _pt("p2", 0, 1, 0.0),
+        "p3": SimpleNamespace(easting=0.0, northing=0.0, altitude=bad),
+    }
+    with pytest.raises(ValueError, match=r"nan or ±inf"):
+        geo.convex_hull_3d(points, list(points), IDFactory())
+
+
+def test_convex_hull_3d_missing_point_id_raises_value_error():
+    # A ``point_ids`` entry absent from ``points_3d`` previously surfaced as a
+    # bare ``KeyError`` from the ``_xyz`` coordinate lookup; it now raises a
+    # descriptive ``ValueError`` naming the offending ID, so upstream
+    # referential-integrity bugs report against the input rather than an opaque
+    # mapping miss.
+    pts = {
+        "p0": _pt("p0", 0, 0, 0.0),
+        "p1": _pt("p1", 1, 0, 0.0),
+        "p2": _pt("p2", 0, 1, 0.0),
+        "p3": _pt("p3", 0, 0, 1.0),
+    }
+    ids = ["p0", "p1", "p2", "p3", "p_missing"]  # 5 ids clears the >=4 guard
+    with pytest.raises(ValueError, match="p_missing"):
+        geo.convex_hull_3d(pts, ids, IDFactory())
+
+
+def test_convex_hull_3d_facets_wound_outward():
+    # Every facet normal (right-hand rule over its stored vertex order) must
+    # point away from the hull interior. The unit-cube test above uses abs() on
+    # the volume and so would not notice an inconsistently-wound facet; this
+    # checks each facet's orientation directly: the dot of the facet normal with
+    # the vector from the hull centroid to the facet centroid must be positive.
+    pts = {
+        f"p{i}": _pt(f"p{i}", x, y, z)
+        for i, (x, y, z) in enumerate(
+            [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
+        )
+    }
+    _solid, facets, fallback = geo.convex_hull_3d(pts, list(pts), IDFactory())
+    assert fallback is geo.HullFallback.NONE  # genuine rank-3 hull
+    all_coords = np.array(
+        [geo._xyz(p) for p in pts.values()],  # pylint: disable=protected-access
+        dtype=np.float64,
+    )
+    hull_centroid = all_coords.mean(axis=0)
+    for facet in facets:
+        v0, v1, v2 = (geo._xyz(pts[pid]) for pid in facet.point_ids)  # pylint: disable=protected-access
+        normal = np.cross(v1 - v0, v2 - v0)
+        facet_centroid = (v0 + v1 + v2) / 3.0
+        assert float(np.dot(normal, facet_centroid - hull_centroid)) > 0.0
+
+
+def test_solid_volume_centroid_rejects_hull_facet_shell():
+    # The Solid returned by convex_hull_3d is a B-rep facet shell, not a
+    # bottom-to-top cross-section stack: its cube vertices are each shared by
+    # three or more facets, so _ensure_solid_is_stack must reject it rather than
+    # silently return a meaningless volume.
+    pts = {
+        f"p{i}": _pt(f"p{i}", x, y, z)
+        for i, (x, y, z) in enumerate(
+            [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
+        )
+    }
+    solid, facets, _fallback = geo.convex_hull_3d(pts, list(pts), IDFactory())
+    objects = {f.id: f for f in facets}
+    with pytest.raises(ValueError, match="facet shell"):
+        geo.solid_volume_centroid(solid, objects, pts)
+
+
+def test_solid_volume_centroid_accepts_legitimate_stack():
+    # The mirror of the facet-shell rejection: a genuine cross-section stack
+    # (the unit cube via two square layers) still passes the stack guard and
+    # returns its volume, confirming _ensure_solid_is_stack is not over-eager.
+    solid, objects, pts = _unit_cube()
+    volume, _ = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(1.0)
+
+
+def test_solid_volume_centroid_missing_layer_id_raises_value_error():
+    # A Solid layer ID absent from the object store previously surfaced as a bare
+    # ``KeyError`` from ``_ensure_solid_is_stack``'s lookup; it now raises a
+    # descriptive ``ValueError`` naming the missing layer. ``_ensure_solid_is_stack``
+    # runs first in ``_solid_brep``, so the public ``solid_volume_centroid`` entry
+    # point reaches the converted error.
+    _, objects, pts = _unit_cube()  # objects has pg_b and pg_t
+    solid = _solid(("pg_b", "pg_missing"))  # pg_missing is not in the object store
+    with pytest.raises(ValueError, match="pg_missing"):
+        geo.solid_volume_centroid(solid, objects, pts)
+
+
+def test_solid_surface_areas_reject_hull_facet_shell():
+    # Both surface-area functions go through the same _solid_brep /
+    # _ensure_solid_is_stack guard as solid_volume_centroid, so a B-rep facet
+    # shell (cube vertices shared by 3+ facets) must be rejected there too, not
+    # silently summed into a meaningless area.
+    pts = {
+        f"p{i}": _pt(f"p{i}", x, y, z)
+        for i, (x, y, z) in enumerate(
+            [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
+        )
+    }
+    solid, facets, _fallback = geo.convex_hull_3d(pts, list(pts), IDFactory())
+    objects = {f.id: f for f in facets}
+    with pytest.raises(ValueError, match="facet shell"):
+        geo.solid_lateral_surface_area(solid, objects, pts)
+    with pytest.raises(ValueError, match="facet shell"):
+        geo.solid_total_surface_area(solid, objects, pts)
+
+
+def test_solid_volume_centroid_tetrahedron_offcenter():
+    # A unit cube's centroid is symmetric, so abs(volume) masks a moment-sign
+    # bug. A tetrahedron is asymmetric: its centroid is the mean of its 4
+    # vertices — base (0,0,0),(1,0,0),(0,1,0) + apex (0,0,3) → (0.25, 0.25, 0.75)
+    # — which exposes any sign error in the centroid moment accumulation.
+    solid, objects, pts = _tetra(height=3.0)
+    volume, centroid = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(0.5)
+    assert centroid == pytest.approx([0.25, 0.25, 0.75])
+
+
+def _offset_unit_cube(origin: tuple[float, float, float]):
+    """Return (solid, objects, points) for a unit cube translated to ``origin``.
+
+    Same two-square-layer construction as :func:`_unit_cube` but with every
+    vertex shifted by ``origin`` (an ``(easting, northing, altitude)`` corner).
+    Used to exercise :func:`solid_volume_centroid` at realistic UTM magnitudes,
+    where the un-shifted Mirtich tetra products are ~1e17 and the unit volume
+    must emerge from their difference without catastrophic cancellation.
+    """
+    oe, on, oz = origin
+    pts = {
+        "qb0": _pt("qb0", oe + 0, on + 0, oz + 0.0),
+        "qb1": _pt("qb1", oe + 1, on + 0, oz + 0.0),
+        "qb2": _pt("qb2", oe + 1, on + 1, oz + 0.0),
+        "qb3": _pt("qb3", oe + 0, on + 1, oz + 0.0),
+        "qt0": _pt("qt0", oe + 0, on + 0, oz + 1.0),
+        "qt1": _pt("qt1", oe + 1, on + 0, oz + 1.0),
+        "qt2": _pt("qt2", oe + 1, on + 1, oz + 1.0),
+        "qt3": _pt("qt3", oe + 0, on + 1, oz + 1.0),
+    }
+    bottom = _poly("pg_b", ("qb0", "qb1", "qb2", "qb3"))
+    top = _poly("pg_t", ("qt0", "qt1", "qt2", "qt3"))
+    objects = {"pg_b": bottom, "pg_t": top}
+    return _solid(("pg_b", "pg_t")), objects, pts
+
+
+def test_solid_volume_centroid_far_from_origin_utm_is_precise():
+    # PRECISION REGRESSION (PR #78): a unit cube placed at a realistic UTM corner
+    # (E~5e5, N~4e6, Z~10.5). Without the reference-vertex shift in
+    # ``solid_volume_centroid`` the signed-tetra products are ~1e17 and the unit
+    # volume emerges as their difference, bleeding ~5 significant digits. The
+    # shifted accumulation keeps it exact (~1e-16), so the volume must hold to a
+    # TIGHT absolute tolerance and the centroid (cube centre = corner +
+    # (0.5,0.5,0.5)) must land on the offset centre even after the offset is
+    # added back. The 1e-12 volume tolerance is deliberately tighter than the
+    # ~9e-11 error the *unshifted* accumulation incurs at this UTM magnitude, so
+    # this test fails loud if the reference-vertex shift is ever removed.
+    origin = (500000.0, 4000000.0, 10.5)
+    solid, objects, pts = _offset_unit_cube(origin)
+    volume, centroid = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(1.0, abs=1e-12)
+    expected_centroid = [origin[0] + 0.5, origin[1] + 0.5, origin[2] + 0.5]
+    assert centroid == pytest.approx(expected_centroid, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Solid pyramid (apex / point-layer) surface area & volume
+# ---------------------------------------------------------------------------
+
+
+def _square_pyramid(height: float = 4.0):
+    """Return (solid, objects, points) for a square pyramid with an apex layer.
+
+    The base is the axis-aligned square ``(0,0)-(2,2)`` at ``z=0`` and the apex
+    sits above the base centroid at ``(1, 1, height)``. The Solid stacks the
+    square base polygon under a single ``pt_`` apex layer, so it exercises the
+    ``_solid_layer_rings`` point-layer branch and the ``upper_is_pt`` apex
+    branch of ``_lateral_faces`` (triangle fan from base edges to the apex).
+
+    Closed forms for the chosen base
+    --------------------------------
+    * base area = ``2 * 2 = 4`` → volume = ``(1/3) * 4 * height``;
+    * base apothem (centre→edge midpoint) = ``1`` → slant height
+      ``= √(height² + 1)`` → lateral area = ``4 * √(height² + 1)`` (four
+      congruent isosceles triangles, each ``½ * 2 * slant``);
+    * total surface area = base + lateral = ``4 + 4·√(height² + 1)``.
+    """
+    pts = {
+        "pb0": _pt("pb0", 0, 0, 0.0),
+        "pb1": _pt("pb1", 2, 0, 0.0),
+        "pb2": _pt("pb2", 2, 2, 0.0),
+        "pb3": _pt("pb3", 0, 2, 0.0),
+        "pt_apex": _pt("pt_apex", 1, 1, height),
+    }
+    base = _poly("pg_base", ("pb0", "pb1", "pb2", "pb3"))
+    solid = _solid(("pg_base", "pt_apex"))
+    objects = {"pg_base": base}
+    return solid, objects, pts
+
+
+def test_solid_volume_square_pyramid():
+    # The centroid assertion exercises the apex-fan moment accumulation (the
+    # ``upper_is_pt`` triangle-fan from base edges to the apex), not just the
+    # scalar volume. For the symmetric base square ``(0,0)-(2,2)`` the centroid
+    # sits over the base centre ``(1, 1)`` and a pyramid's centroid lies at 1/4
+    # of the height from the base toward the apex, so z = ``height / 4``.
+    height = 4.0
+    solid, objects, pts = _square_pyramid(height)
+    volume, centroid = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(4.0 * height / 3.0)
+    assert centroid == pytest.approx([1.0, 1.0, height / 4.0])
+
+
+def test_solid_lateral_surface_area_square_pyramid():
+    # Four congruent isosceles faces fanned from the base edges to the apex.
+    # A flipped apex-face winding would corrupt the band normals; the closed
+    # form 4·√(h²+1) pins the lateral area so that regression is caught.
+    height = 4.0
+    solid, objects, pts = _square_pyramid(height)
+    expected = 4.0 * math.sqrt(height**2 + 1.0)
+    assert geo.solid_lateral_surface_area(solid, objects, pts) == pytest.approx(expected)
+
+
+def test_solid_total_surface_area_square_pyramid():
+    height = 4.0
+    solid, objects, pts = _square_pyramid(height)
+    expected = 4.0 + 4.0 * math.sqrt(height**2 + 1.0)  # base + lateral
+    assert geo.solid_total_surface_area(solid, objects, pts) == pytest.approx(expected)
+
+
+def test_solid_volume_square_pyramid_matches_wuttke():
+    # Independent Wuttke (2021) cross-check over the apex-fan B-rep guards the
+    # triangle-fan winding produced by the lower/upper apex branches.
+    solid, objects, pts = _square_pyramid(height=4.0)
+    volume, _ = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(_wuttke_volume(solid, objects, pts))
+
+
+def test_solid_volume_pyramid_apex_first_layer_matches():
+    # The apex as the FIRST layer (nadir) exercises the lower_is_pt branch of
+    # _lateral_faces, the reverse-wound triangle fan. Reordering the same
+    # pyramid must not change its volume or surface area.
+    _, objects, pts = _square_pyramid(height=4.0)
+    flipped = _solid(("pt_apex", "pg_base"))
+    volume, _ = geo.solid_volume_centroid(flipped, objects, pts)
+    assert volume == pytest.approx(4.0 * 4.0 / 3.0)
+    expected_total = 4.0 + 4.0 * math.sqrt(4.0**2 + 1.0)
+    assert geo.solid_total_surface_area(flipped, objects, pts) == pytest.approx(expected_total)
+
+
+def _bipyramid(half_height: float = 3.0):
+    """Return (solid, objects, points) for a square bipyramid (apex-base-apex).
+
+    Two square pyramids joined base-to-base: a shared square base
+    ``(0,0)-(2,2)`` at ``z=0`` (area 4) with a bottom apex (nadir) at
+    ``(1, 1, -half_height)`` and a top apex at ``(1, 1, +half_height)``. The
+    layer stack is ``(pt_ nadir, pg_ base, pt_ apex)`` — a ``[pt_, pg_, pt_]``
+    pattern with point layers on **both** ends, which makes it the no-cap fan
+    B-rep: :func:`_solid_brep` emits no cap faces (both end layers are points)
+    and both lateral bands are triangle fans — the ``lower_is_pt`` reverse-wound
+    fan for the nadir→base band and the ``upper_is_pt`` fan for the base→apex
+    band. The single-apex :func:`_square_pyramid` only ever drives one fan branch
+    per Solid; this stack drives both, the branch the prior review flagged as
+    uncovered.
+
+    Stand-in Solid (model conflict)
+    -------------------------------
+    The real :class:`~geometry.models.solid.Solid` rejects a stack with **more
+    than one** Point-ID layer (``Solid.__post_init__``, spec §10: at most one
+    apex/nadir), so a genuine ``[pt_, pg_, pt_]`` bipyramid Solid cannot be
+    constructed through the model and the no-cap/both-fan B-rep path is
+    unreachable via a real Solid. To exercise that path the Solid is supplied as
+    a minimal :class:`~types.SimpleNamespace` stand-in exposing only the two
+    attributes the B-rep machinery reads — ``id`` and ``layers`` — mirroring the
+    ``SimpleNamespace`` seam this module already uses to reach code the data
+    models otherwise block.
+
+    Closed-form volume
+    ------------------
+    Two pyramids of base area ``A = 4`` and height ``half_height`` give
+    ``2 · (1/3 · A · half_height)``. For ``half_height = 3`` that is
+    ``2 · (1/3 · 4 · 3) = 8``. By the up/down symmetry of the two equal apexes
+    the centroid is the base centre ``(1, 1, 0)``.
+    """
+    pts = {
+        "pb0": _pt("pb0", 0, 0, 0.0),
+        "pb1": _pt("pb1", 2, 0, 0.0),
+        "pb2": _pt("pb2", 2, 2, 0.0),
+        "pb3": _pt("pb3", 0, 2, 0.0),
+        "pt_nadir": _pt("pt_nadir", 1, 1, -half_height),
+        "pt_apex": _pt("pt_apex", 1, 1, half_height),
+    }
+    base = _poly("pg_base", ("pb0", "pb1", "pb2", "pb3"))
+    solid = SimpleNamespace(id="so_bipyramid", layers=("pt_nadir", "pg_base", "pt_apex"))
+    objects = {"pg_base": base}
+    return solid, objects, pts
+
+
+def test_solid_volume_bipyramid_double_point_layers():
+    # The [pt_, pg_, pt_] stack drives the no-cap, both-fan B-rep branch the
+    # single-apex pyramid leaves half-covered (see _bipyramid for why a stand-in
+    # Solid is required — the model forbids two Point layers). Two pyramids
+    # base-to-base over a 2x2 base (area 4) with half-height 3 give volume
+    # 2·(1/3·4·3) = 8, and by symmetry the centroid is the base centre (1, 1, 0).
+    # The Wuttke (2021) cross-check guards the triangle-fan winding of both
+    # apex branches independently of the divergence-theorem accumulation.
+    solid, objects, pts = _bipyramid(half_height=3.0)
+    volume, centroid = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(8.0)
+    assert centroid == pytest.approx([1.0, 1.0, 0.0])
+    assert volume == pytest.approx(_wuttke_volume(solid, objects, pts))
+
+
+def test_solid_volume_centroid_degenerate_returns_nan_not_origin():
+    # A coplanar, zero-extent Solid (two identical flat layers) returns volume
+    # 0.0 paired with a nan-filled centroid — NOT a fabricated (0,0,0), which in
+    # UTM metres would plant the centroid hundreds of km away in the ocean.
+    pts = {
+        "fb0": _pt("fb0", 0, 0, 0.0),
+        "fb1": _pt("fb1", 2, 0, 0.0),
+        "fb2": _pt("fb2", 2, 2, 0.0),
+        "fb3": _pt("fb3", 0, 2, 0.0),
+    }
+    flat = _poly("pg_flat", ("fb0", "fb1", "fb2", "fb3"))
+    objects = {"pg_flat": flat}
+    volume, centroid = geo.solid_volume_centroid(_solid(("pg_flat", "pg_flat")), objects, pts)
+    assert volume == pytest.approx(0.0)
+    assert np.isnan(centroid).all()
+
+
+def test_solid_volume_centroid_non_finite_volume_raises():
+    # The degeneracy gate has two halves: ``abs(signed_v) < EPS_VOLUME`` (the
+    # genuine zero-extent case exercised above, which returns a nan centroid) and
+    # ``not isfinite(signed_v)``. This drives the second half — which is NOT a
+    # degenerate solid but a *corrupt* accumulation (overflow at huge magnitudes
+    # or a nan/inf vertex). The contract now RAISES ``ValueError`` here rather
+    # than folding the corruption into the clean ``(0.0, nan)`` zero-extent
+    # return, so the two failure modes stay distinguishable. Point construction
+    # forbids non-finite coordinates, so a nan/inf cannot be injected as a vertex
+    # directly; instead huge-but-finite coordinates overflow the signed-
+    # tetrahedron product ``dot(v0, cross(v1, v2))`` to ``inf``, making
+    # ``signed_v`` non-finite. ``np.errstate`` silences the expected overflow
+    # warning without depending on the global warning filter.
+    big = 1e160
+    pts = {
+        "hb0": _pt("hb0", 0, 0, 0.0),
+        "hb1": _pt("hb1", big, 0, 0.0),
+        "hb2": _pt("hb2", big, big, 0.0),
+        "hb3": _pt("hb3", 0, big, 0.0),
+        "ht0": _pt("ht0", 0, 0, big),
+        "ht1": _pt("ht1", big, 0, big),
+        "ht2": _pt("ht2", big, big, big),
+        "ht3": _pt("ht3", 0, big, big),
+    }
+    bottom = _poly("pg_b", ("hb0", "hb1", "hb2", "hb3"))
+    top = _poly("pg_t", ("ht0", "ht1", "ht2", "ht3"))
+    objects = {"pg_b": bottom, "pg_t": top}
+    with np.errstate(over="ignore", invalid="ignore"):
+        with pytest.raises(ValueError, match="non-finite signed volume"):
+            geo.solid_volume_centroid(_solid(("pg_b", "pg_t")), objects, pts)
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf], ids=["nan", "inf", "-inf"])
+@pytest.mark.parametrize(
+    "func",
+    [geo.solid_lateral_surface_area, geo.solid_total_surface_area, geo.solid_faces],
+    ids=["lateral_area", "total_area", "faces"],
+)
+def test_solid_layer_rings_non_finite_vertex_makes_area_raise(func, bad):
+    # PR #78: ``_solid_layer_rings`` — the shared resolver behind
+    # ``solid_faces``/``solid_lateral_surface_area``/``solid_total_surface_area``
+    # — now screens every resolved vertex for finiteness up front. Before the
+    # guard a nan/inf vertex flowed through the Newell area sum and the call
+    # returned a silent ``nan`` area instead of failing; now it raises. The
+    # volume path keeps its own late gate (returns nan-centroid), but the
+    # surface-area paths have no such fallback and must fail loud. ``Point``
+    # forbids non-finite coordinates, so a corrupt vertex is injected via a
+    # minimal ``_xyz`` stand-in exposing only easting/northing/altitude.
+    pts = {
+        "rb0": _pt("rb0", 0, 0, 0.0),
+        "rb1": _pt("rb1", 1, 0, 0.0),
+        "rb2": _pt("rb2", 1, 1, 0.0),
+        "rb3": _pt("rb3", 0, 1, 0.0),
+        "rt0": _pt("rt0", 0, 0, 1.0),
+        "rt1": _pt("rt1", 1, 0, 1.0),
+        "rt2": _pt("rt2", 1, 1, 1.0),
+        "rt3": SimpleNamespace(easting=0.0, northing=1.0, altitude=bad),
+    }
+    bottom = _poly("pg_b", ("rb0", "rb1", "rb2", "rb3"))
+    top = _poly("pg_t", ("rt0", "rt1", "rt2", "rt3"))
+    objects = {"pg_b": bottom, "pg_t": top}
+    with pytest.raises(ValueError, match=r"nan or ±inf"):
+        func(_solid(("pg_b", "pg_t")), objects, pts)
+
+
+# ---------------------------------------------------------------------------
+# Ball / cylinder measurement guards (non-finite, negative, exact-zero)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "func",
+    [geo.ball_volume, geo.ball_surface_area],
+    ids=["volume", "surface_area"],
+)
+@pytest.mark.parametrize(
+    "bad", [-1.0, math.nan, math.inf, -math.inf], ids=["neg", "nan", "inf", "-inf"]
+)
+def test_ball_measure_rejects_bad_radius(func, bad):
+    with pytest.raises(ValueError, match="Radius"):
+        func(bad)
+
+
+@pytest.mark.parametrize(
+    ("func", "expected"),
+    [(geo.ball_volume, 0.0), (geo.ball_surface_area, 0.0)],
+    ids=["volume", "surface_area"],
+)
+def test_ball_measure_zero_radius_is_zero(func, expected):
+    assert func(0.0) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "func",
+    [
+        geo.cylinder_volume,
+        geo.cylinder_lateral_surface_area,
+        geo.cylinder_total_surface_area,
+    ],
+    ids=["volume", "lateral", "total"],
+)
+@pytest.mark.parametrize(
+    "bad", [-1.0, math.nan, math.inf, -math.inf], ids=["neg", "nan", "inf", "-inf"]
+)
+def test_cylinder_measure_rejects_bad_radius(func, bad):
+    with pytest.raises(ValueError, match="Radius"):
+        func(bad, 5.0)
+
+
+@pytest.mark.parametrize(
+    "func",
+    [
+        geo.cylinder_volume,
+        geo.cylinder_lateral_surface_area,
+        geo.cylinder_total_surface_area,
+    ],
+    ids=["volume", "lateral", "total"],
+)
+@pytest.mark.parametrize(
+    "bad", [-1.0, math.nan, math.inf, -math.inf], ids=["neg", "nan", "inf", "-inf"]
+)
+def test_cylinder_measure_rejects_bad_height(func, bad):
+    with pytest.raises(ValueError, match="Height"):
+        func(2.0, bad)
+
+
+@pytest.mark.parametrize(
+    "func",
+    [
+        geo.cylinder_volume,
+        geo.cylinder_lateral_surface_area,
+        geo.cylinder_total_surface_area,
+    ],
+    ids=["volume", "lateral", "total"],
+)
+def test_cylinder_measure_zero_radius_is_zero(func):
+    # Radius exactly 0 collapses the cylinder to its axis segment: every
+    # measure is a well-defined 0.0, not a raise.
+    assert func(0.0, 5.0) == pytest.approx(0.0)
+
+
+def test_cylinder_measure_zero_height():
+    # Height 0 zeros the volume and the lateral wall, but the total surface
+    # area keeps the two end caps: 2*pi*r**2.
+    assert geo.cylinder_volume(2.0, 0.0) == pytest.approx(0.0)
+    assert geo.cylinder_lateral_surface_area(2.0, 0.0) == pytest.approx(0.0)
+    assert geo.cylinder_total_surface_area(2.0, 0.0) == pytest.approx(2 * math.pi * 4.0)
+
+
+# ---------------------------------------------------------------------------
+# CylinderCrossSection __post_init__ invariants
+# ---------------------------------------------------------------------------
+
+
+def test_cylinder_cross_section_accepts_valid_kinds():
+    assert geo.CylinderCrossSection.circle(1.0).radius == 1.0
+    assert geo.CylinderCrossSection.ellipse(2.0, 1.0).kind == "ellipse"
+    assert geo.CylinderCrossSection.rectangle(4.0, 5.0).kind == "rectangle"
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"approximate": True}], ids=["bare", "approximate-true"])
+def test_cylinder_cross_section_direct_construction_raises_type_error(kwargs):
+    # Direct construction bypasses the kind-specific factories and would leave
+    # ``kind``/``_dimensions`` unset — a zombie instance that only raises
+    # ``AttributeError`` on later access. ``__post_init__`` now closes that path
+    # immediately with a ``TypeError`` pointing at the ``.circle`` / ``.ellipse``
+    # / ``.rectangle`` factories. Both the bare call and the one that passes the
+    # sole real init field (``approximate``) must be rejected.
+    with pytest.raises(TypeError, match="cannot be constructed directly"):
+        geo.CylinderCrossSection(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("kind", "dimensions"),
+    [
+        ("circle", (1.0, 2.0)),  # arity 1 expected, got 2
+        ("ellipse", (1.0,)),  # arity 2 expected, got 1
+        ("rectangle", (1.0, 2.0, 3.0)),  # arity 2 expected, got 3
+    ],
+    ids=["circle-too-many", "ellipse-too-few", "rectangle-too-many"],
+)
+def test_cylinder_cross_section_rejects_wrong_arity(kind, dimensions):
+    # The public classmethods make a wrong (kind, arity) pairing structurally
+    # impossible, but ``__validate__`` still enforces arity for defence in depth.
+    # Drive it through the private ``_build`` factory — the only path that can
+    # reach the arity guard now — so the guard stays covered.
+    with pytest.raises(ValueError, match="dimension"):
+        geo.CylinderCrossSection._build(kind, dimensions, approximate=False)  # pylint: disable=protected-access
+
+
+def test_cylinder_cross_section_rejects_unknown_kind():
+    # ``_build`` looks ``kind`` up in ``_CROSS_SECTION_ARITY``; an unknown kind
+    # raises ``KeyError`` there before ``__validate__`` runs, so this no longer
+    # reaches a ValueError. The public API cannot express an unknown kind at all.
+    with pytest.raises(KeyError):
+        geo.CylinderCrossSection._build("triangle", (1.0, 2.0), approximate=False)  # type: ignore[arg-type]  # pylint: disable=protected-access
+
+
+@pytest.mark.parametrize(
+    ("ctor", "dimensions"),
+    [
+        (geo.CylinderCrossSection.circle, (0.0,)),
+        (geo.CylinderCrossSection.circle, (-1.0,)),
+        (geo.CylinderCrossSection.ellipse, (2.0, 0.0)),
+        (geo.CylinderCrossSection.rectangle, (-4.0, 5.0)),
+        (geo.CylinderCrossSection.rectangle, (4.0, math.inf)),
+    ],
+    ids=["circle-zero", "circle-neg", "ellipse-zero", "rect-neg", "rect-inf"],
+)
+def test_cylinder_cross_section_rejects_non_positive_dimensions(ctor, dimensions):
+    with pytest.raises(ValueError, match="finite and > 0"):
+        ctor(*dimensions)
+
+
+def test_cylinder_cross_section_rejects_ellipse_semi_major_lt_minor():
+    with pytest.raises(ValueError, match="semi_major must be >= semi_minor"):
+        geo.CylinderCrossSection.ellipse(1.0, 2.0)
+
+
+def test_cylinder_cross_section_allows_ellipse_equal_axes():
+    cs = geo.CylinderCrossSection.ellipse(2.0, 2.0)
+    assert cs.semi_major == 2.0
+    assert cs.semi_minor == 2.0
+
+
+def test_cylinder_cross_section_default_approximate_is_false():
+    assert geo.CylinderCrossSection.circle(1.0).approximate is False
+
+
+def test_cylinder_cross_section_circle_classmethod_forbids_approximate_true():
+    # TASK 2 (PR #78 review): the circle-is-always-exact guard in
+    # ``__validate__`` (geometry.py ~1552) rejects ``kind="circle"`` paired with
+    # ``approximate=True``. The public ``circle`` classmethod hard-codes
+    # ``approximate=False``, so the invalid combo is unconstructable through the
+    # supported API — confirmed by reading the source. The only path that can
+    # still feed ``approximate=True`` for a circle is the private ``_build``
+    # factory, so drive the guard there to keep it covered.
+    with pytest.raises(ValueError, match="circle is always exact"):
+        geo.CylinderCrossSection._build("circle", (2.0,), approximate=True)  # pylint: disable=protected-access
+    # And the supported constructor can never reach that bad state:
+    assert geo.CylinderCrossSection.circle(2.0).approximate is False
+
+
+# ---------------------------------------------------------------------------
+# CylinderCrossSection read-only accessors
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("cs", "valid", "invalid"),
+    [
+        # ``radius`` of an ellipse is its semi-minor axis (the cylinder radius).
+        (geo.CylinderCrossSection.circle(3.0), {"radius": 3.0}, ["semi_major", "width"]),
+        (
+            geo.CylinderCrossSection.ellipse(5.0, 3.0),
+            {"semi_major": 5.0, "semi_minor": 3.0, "radius": 3.0},
+            ["width", "height"],
+        ),
+        (
+            geo.CylinderCrossSection.rectangle(4.0, 5.0),
+            {"width": 4.0, "height": 5.0},
+            ["radius", "semi_major", "semi_minor"],
+        ),
+    ],
+    ids=["circle", "ellipse", "rectangle"],
+)
+def test_cross_section_accessors(cs, valid, invalid):
+    for attr, expected in valid.items():
+        assert getattr(cs, attr) == expected
+    for attr in invalid:
+        with pytest.raises(AttributeError):
+            getattr(cs, attr)
+
+
+# ---------------------------------------------------------------------------
+# Cylinder cross-section boundary classification (cos-θ domain thresholds)
+# ---------------------------------------------------------------------------
+
+
+def test_cylinder_cross_section_near_circle_boundary_stays_circle():
+    # A normal tilted off the vertical axis by a tiny but realistic 1e-5 rad:
+    # 1 - cos(1e-5) ~ 5e-11 < EPS_ANGLE (1e-9), so it must still classify as a
+    # circle, NOT an ellipse with a blown-up semi_major. Uses a trig-derived
+    # inclined normal rather than the exact [0,0,1] axis.
+    tilt = 1e-5
+    normal = np.array([math.sin(tilt), 0.0, math.cos(tilt)], dtype=np.float64)
+    cs = geo.cylinder_cross_section(_cyl("vertical"), normal)
+    assert cs.kind == "circle"
+    assert cs.radius == pytest.approx(2.0)
+
+
+def test_cylinder_cross_section_just_off_circle_boundary_is_ellipse():
+    # The ellipse side of the circle boundary: tilt 1e-3 rad gives
+    # 1 - cos(1e-3) ~ 5e-7 > EPS_ANGLE, so it is an ellipse with a finite
+    # semi_major = r / cos(tilt) and semi_minor = r.
+    tilt = 1e-3
+    normal = np.array([math.sin(tilt), 0.0, math.cos(tilt)], dtype=np.float64)
+    cs = geo.cylinder_cross_section(_cyl("vertical"), normal)
+    assert cs.kind == "ellipse"
+    assert cs.semi_major == pytest.approx(2.0 / math.cos(tilt))
+    assert cs.semi_minor == pytest.approx(2.0)
+    assert math.isfinite(cs.semi_major)
+
+
+def test_cylinder_cross_section_near_rectangle_boundary_stays_rectangle():
+    # A normal nearly perpendicular to the axis: tilted only 1e-12 rad off
+    # horizontal, so cos_theta = sin(1e-12) ~ 1e-12 < EPS_ANGLE → rectangle.
+    off = 1e-12
+    normal = np.array([math.cos(off), 0.0, math.sin(off)], dtype=np.float64)
+    cs = geo.cylinder_cross_section(_cyl("vertical"), normal)
+    assert cs.kind == "rectangle"
+    assert (cs.width, cs.height) == pytest.approx((4.0, 5.0))
+
+
+def test_cylinder_cross_section_just_off_rectangle_boundary_is_ellipse():
+    # The ellipse side of the rectangle boundary: an axis–normal angle 1e-3 rad
+    # short of perpendicular gives cos_theta ~ 1e-3 > EPS_ANGLE, so it is a
+    # (very elongated but finite) ellipse rather than a rectangle.
+    off = 1e-3
+    normal = np.array([math.cos(off), 0.0, math.sin(off)], dtype=np.float64)
+    cs = geo.cylinder_cross_section(_cyl("vertical"), normal)
+    assert cs.kind == "ellipse"
+    assert cs.semi_major == pytest.approx(2.0 / math.sin(off))
+    assert math.isfinite(cs.semi_major)
+
+
+def test_cylinder_cross_section_clearly_inclined_normal_is_finite_ellipse():
+    # A 45° normal is unambiguously an ellipse with semi_major = r / cos(π/4) =
+    # r·√2 — finite, not a degenerate blow-up.
+    inv_sqrt2 = 1.0 / math.sqrt(2.0)
+    normal = np.array([inv_sqrt2, 0.0, inv_sqrt2], dtype=np.float64)
+    cs = geo.cylinder_cross_section(_cyl("vertical"), normal)
+    assert cs.kind == "ellipse"
+    assert cs.semi_major == pytest.approx(2.0 * math.sqrt(2.0))
+    assert cs.semi_minor == pytest.approx(2.0)
+
+
+# ---------------------------------------------------------------------------
+# Inclined-cylinder cross-section (axis → θ interaction)
+# ---------------------------------------------------------------------------
+
+
+def test_cylinder_cross_section_inclined_axis_circle_along_axis():
+    # Cutting an inclined cylinder with a plane whose normal IS the axis
+    # direction gives cos_theta = 1 → a circle of the cylinder radius,
+    # regardless of the (non-vertical) axis tilt.
+    cyl = _cyl("inclined", az=math.pi / 2, el=math.pi / 4)
+    axis = geo.cylinder_axis_vector(cyl)  # (1/√2, 0, 1/√2)
+    cs = geo.cylinder_cross_section(cyl, axis)
+    assert cs.kind == "circle"
+    assert cs.radius == pytest.approx(2.0)
+
+
+def test_cylinder_cross_section_inclined_axis_horizontal_plane_is_ellipse():
+    # The inclined axis (1/√2, 0, 1/√2) cut by a horizontal plane normal
+    # (0,0,1): cos_theta = 1/√2 → θ = π/4 → ellipse with
+    # semi_major = r / cos(π/4) = r·√2 and semi_minor = r. This pins the
+    # axis→θ interaction for a non-vertical cylinder (all existing cross-section
+    # tests use a vertical cylinder).
+    cyl = _cyl("inclined", az=math.pi / 2, el=math.pi / 4)
+    cs = geo.cylinder_cross_section(cyl, np.array([0.0, 0.0, 1.0]))
+    assert cs.kind == "ellipse"
+    assert cs.semi_major == pytest.approx(2.0 * math.sqrt(2.0))
+    assert cs.semi_minor == pytest.approx(2.0)
+
+
+def test_cylinder_cross_section_inclined_axis_perpendicular_plane_is_rectangle():
+    # A plane whose normal is perpendicular to the inclined axis cuts parallel
+    # to it → a rectangle 2r wide by h tall. The axis is (1/√2, 0, 1/√2); the
+    # easting unit vector (1,0,0) is not perpendicular to it, but (1,0,-1)/√2
+    # is (dot = 0), so use that.
+    cyl = _cyl("inclined", az=math.pi / 2, el=math.pi / 4)
+    perp = np.array([1.0, 0.0, -1.0], dtype=np.float64)  # ⟂ to (1,0,1)
+    cs = geo.cylinder_cross_section(cyl, perp)
+    assert cs.kind == "rectangle"
+    assert (cs.width, cs.height) == pytest.approx((4.0, 5.0))
+
+
+# ---------------------------------------------------------------------------
+# Ball extras: symmetric in-range cross-section, non-cardinal tangent azimuth
+# ---------------------------------------------------------------------------
+
+
+def test_ball_cross_section_radius_negative_distance_is_symmetric():
+    # The cross-section radius depends on |d|, so a negative in-range distance
+    # yields the same radius as its positive mirror (√(r² − d²) is even in d).
+    pos = geo.ball_cross_section_radius(5.0, 3.0)
+    neg = geo.ball_cross_section_radius(5.0, -3.0)
+    assert neg == pytest.approx(4.0)
+    assert neg == pytest.approx(pos)
+
+
+def test_ball_tangent_direction_non_cardinal_azimuth():
+    # A surface point NE of the centre (Δe = Δn = 1) has radius azimuth
+    # atan2(1, 1) = π/4 — a non-cardinal bearing the existing N/E cases miss.
+    center = _pt("c", 0, 0, 0.0)
+    ne = _pt("ne", 1, 1, 0.0)
+    assert geo.ball_tangent_direction(center, ne) == pytest.approx(math.pi / 4)
+
+
+def test_ball_tangent_direction_coincident_point_returns_zero():
+    # REGRESSION/CHARACTERIZATION (PR #78 review): pins the *current* degenerate
+    # behaviour when ``center == surface_point``. With Δe = Δn = 0 the function
+    # delegates to ``azimuth`` → ``arctan2(0, 0) == 0.0``, so it silently returns
+    # bearing 0.0 with no error. ``ball_tangent_direction`` itself is unguarded;
+    # rejecting a zero-radius ball is the validation layer's job upstream. This
+    # test locks what the geometry function alone does today — if a future change
+    # adds a coincident-point guard here, update this test to expect the raise.
+    center = _pt("c", 0, 0, 0.0)
+    coincident = _pt("same", 0, 0, 0.0)
+    result = geo.ball_tangent_direction(center, coincident)
+    assert result == pytest.approx(0.0)
+    assert result == np.float64(0.0)
