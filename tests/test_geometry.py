@@ -1440,43 +1440,27 @@ def test_solid_volume_frustum_matches_closed_form():
     assert volume == pytest.approx(expected)
 
 
-def test_solid_volume_frustum_rotated_top_ring_twist_undetected():
-    # CHARACTERIZATION (PR #78 review): pins a KNOWN hazard in ``_lateral_faces``.
-    # It assumes positional vertex correspondence (``low[i]`` over ``up[i]``) and
-    # only rejects bands between polygons of *differing* vertex counts. Two rings
-    # with EQUAL vertex counts but a rotated start index produce a twisted,
-    # self-intersecting shell — and this is NOT detected: no exception is raised
-    # and the divergence-theorem volume comes out wrong.
-    #
-    # Reuse the frustum fixture (correct stacking → 7/3 ≈ 2.333) but rotate the
-    # top square's vertex order by one (pt1, pt2, pt3, pt0) so up[i] no longer
-    # sits above low[i]. The current code returns 1.0 instead of 7/3, silently.
-    # If a future change adds twist detection (e.g. an angle/winding screen), this
-    # test must be updated — either to expect a raise or the corrected 7/3.
+def test_solid_volume_frustum_rotated_top_ring_corrected_by_canonicalization():
+    # REGRESSION (PR #78 Coderabbit review): ``_lateral_faces`` previously assumed
+    # positional correspondence ``low[i] ↔ up[i]`` and silently built a twisted shell
+    # when the upper ring started at a different vertex. It now canonicalizes the
+    # upper ring (see ``_canonicalize_ring``) before connecting, so a rotated top
+    # square must still yield the correct frustum volume rather than the wrong 1.0.
     _, objects, pts = _frustum()
+    # Same 4 points, different starting index (rotation by one).
     twisted_top = _poly("pg_t", ("pt1", "pt2", "pt3", "pt0"))
     twisted_objects = {"pg_b": objects["pg_b"], "pg_t": twisted_top}
-    correct = 1.0 / 3.0 * (4.0 + 1.0 + math.sqrt(4.0 * 1.0))  # 7/3, the aligned value
+    correct = 1.0 / 3.0 * (4.0 + 1.0 + math.sqrt(4.0 * 1.0))  # 7/3
     volume, _ = geo.solid_volume_centroid(_solid(("pg_b", "pg_t")), twisted_objects, pts)
-    assert volume == pytest.approx(1.0)  # the (wrong) value the twist yields
-    assert volume != pytest.approx(correct)  # twist went undetected, no raise
+    assert volume == pytest.approx(correct)
 
 
-def test_lateral_faces_reversed_upper_ring_makes_bowtie_quads_undetected():
-    # CHARACTERIZATION (PR #78 review): the SECOND, independently-regressing
-    # failure mode named in the ``_lateral_faces`` docstring — a *reversed*
-    # (CW vs CCW) upper ring of EQUAL vertex count. The rotated-start twist above
-    # is pinned through the volume; this pins the reversed case at the face level,
-    # directly on ``_lateral_faces``, since the two modes wind into different
-    # broken connectivity and a future fix could address one but not the other.
-    #
-    # With ``up`` reversed relative to ``low``, positional correspondence
-    # (``low[i]``↔``up[i]``) pairs each lower edge with a flipped upper edge, so
-    # the builder emits self-intersecting "bowtie" quads. Pin the exact
-    # connectivity the current code produces: alternating quads collapse to
-    # ZERO area (a degenerate normal) while the others warp into non-planar
-    # bowties — and crucially NO exception is raised (only the differing-count
-    # band is rejected). If twist/winding detection is added, update this test.
+def test_lateral_faces_reversed_upper_ring_corrected_by_canonicalization():
+    # REGRESSION (PR #78 Coderabbit review): a reversed (CW vs CCW) upper ring of
+    # equal vertex count previously produced twisted "bowtie" quads with silently
+    # wrong geometry. ``_lateral_faces`` now canonicalizes the upper ring
+    # (rotation + reversal) before connecting, so the reversed case must yield
+    # the same proper unit-height square quads as the aligned case.
     low = [
         np.array([0.0, 0.0, 0.0]),
         np.array([1.0, 0.0, 0.0]),
@@ -1493,23 +1477,29 @@ def test_lateral_faces_reversed_upper_ring_makes_bowtie_quads_undetected():
 
     faces = geo._lateral_faces((False, low), (False, up_reversed))  # pylint: disable=protected-access
 
-    # Four quads, one per lower edge — the band is built, not rejected.
+    # Canonicalization should have undone the reversal: 4 proper quads, each a
+    # unit square (area 1.0) — identical to the aligned case.
     assert len(faces) == 4
     assert all(len(face) == 4 for face in faces)
-    # The reversed pairing degenerates the band: two quads collapse to zero area
-    # (their flipped edge folds them flat) and two warp into finite-area bowties.
     areas = [float(geo._face_area(face)) for face in faces]  # pylint: disable=protected-access
-    zero_area = [a for a in areas if a == pytest.approx(0.0)]
-    bowtie_area = [a for a in areas if a == pytest.approx(math.sqrt(2.0))]
-    assert len(zero_area) == 2
-    assert len(bowtie_area) == 2
-    # Pin the exact stored vertex connectivity of the first (degenerate) quad:
-    # low[0], low[1], up_reversed[1], up_reversed[0].
-    first = faces[0]
-    assert np.allclose(first[0], low[0])
-    assert np.allclose(first[1], low[1])
-    assert np.allclose(first[2], up_reversed[1])
-    assert np.allclose(first[3], up_reversed[0])
+    assert all(a == pytest.approx(1.0) for a in areas)
+
+
+def test_canonicalize_ring_handles_rotation_and_reversal():
+    # Direct unit test for the helper that ``_lateral_faces`` uses to align equal-
+    # count rings before building lateral quads.
+    low = [
+        np.array([0.0, 0.0, 0.0]),
+        np.array([1.0, 0.0, 0.0]),
+        np.array([1.0, 1.0, 0.0]),
+        np.array([0.0, 1.0, 0.0]),
+    ]
+    # Rotated by one (start at index 1) and reversed — the worst case.
+    rotated_reversed = [low[0], low[3], low[2], low[1]]
+    aligned = geo._canonicalize_ring(low, rotated_reversed)  # pylint: disable=protected-access
+    # Canonicalized ring should match ``low`` vertex-for-vertex.
+    for got, want in zip(aligned, low):
+        assert np.allclose(got, want)
 
 
 # ---------------------------------------------------------------------------
@@ -1566,6 +1556,44 @@ def test_convex_hull_3d_coplanar_fallback_degenerate():
     objects = {polygons[0].id: polygons[0]}
     volume, _ = geo.solid_volume_centroid(solid, objects, pts)
     assert volume == pytest.approx(0.0)  # zero extent → flagged via EPS_VOLUME
+
+
+@pytest.mark.parametrize(
+    "pts_3d, label",
+    [
+        # Vertical plane (x = const): XY projection is collinear → old code raised.
+        (
+            [(0, 0, 0), (0, 1, 0), (0, 1, 1), (0, 0, 1)],
+            "vertical (x=const)",
+        ),
+        # Sloped plane (z = x + y): XY projection is a line → old code raised.
+        (
+            [(0, 0, 0), (1, 1, 2), (2, 2, 4), (3, 3, 6), (2, 0, 2)],
+            "sloped (z=x+y)",
+        ),
+    ],
+)
+def test_convex_hull_3d_vertical_and_sloped_coplanar_fallback(pts_3d, label):
+    # REGRESSION (PR #78 Coderabbit review): the old coplanar fallback used
+    # ``coords[:, :2]`` (XY projection), which collapses a *vertical* or *sloped*
+    # coplanar set to a line and raised "collinear" instead of returning the
+    # documented degenerate flat Solid. The fix projects onto the plane's own
+    # intrinsic axes via SVD, so a valid flat hull is built regardless of the
+    # plane's orientation. ``pytest.skip`` on the degenerate-all-collinear-in-3D
+    # check: these sets are coplanar but NOT collinear in 3-D, so they must fall
+    # back (not raise).
+    pts = {f"p{i}": _pt(f"p{i}", e, n, z) for i, (e, n, z) in enumerate(pts_3d)}
+    ids = list(pts)
+    if len(ids) < 4:
+        pytest.skip(f"need >= 4 points for {label}")
+    solid, polygons, fallback = geo.convex_hull_3d(pts, ids, IDFactory())
+    # The points are coplanar (rank < 3) but not collinear, so we expect the
+    # deliberate coplanar fallback — not a QHull failure or a raised ValueError.
+    assert fallback is geo.HullFallback.COPLANAR
+    assert len(polygons) == 1
+    objects = {polygons[0].id: polygons[0]}
+    volume, _ = geo.solid_volume_centroid(solid, objects, pts)
+    assert volume == pytest.approx(0.0)  # flat → zero volume
 
 
 def test_convex_hull_3d_qhull_error_routes_to_flat_fallback(monkeypatch, caplog):
@@ -1790,6 +1818,24 @@ def test_solid_volume_centroid_far_from_origin_utm_is_precise():
     assert volume == pytest.approx(1.0, abs=1e-12)
     expected_centroid = [origin[0] + 0.5, origin[1] + 0.5, origin[2] + 0.5]
     assert centroid == pytest.approx(expected_centroid, abs=1e-9)
+
+
+def test_solid_surface_area_far_from_origin_utm_is_precise():
+    # PRECISION REGRESSION (PR #78 Coderabbit review): ``_face_area_vector``
+    # (Newell's method) previously accumulated ``Σ vᵢ × vᵢ₊₁`` in absolute UTM
+    # coordinates (~1e17 terms), losing precision on small-area faces at large
+    # (E, N) offsets. The fix shifts to a local origin (face[0]) before the
+    # cross-product sum — translation-invariant for Newell, but numerically
+    # stable. A unit cube at a UTM corner has each face area = 1.0 exactly; the
+    # unsifted accumulation bleeds significant digits. The 1e-12 tolerance is
+    # tighter than the error the *unshifted* path incurs at this magnitude.
+    origin = (500_000.0, 4_000_000.0, 10.5)
+    solid, objects, pts = _offset_unit_cube(origin)
+    lateral = geo.solid_lateral_surface_area(solid, objects, pts)
+    total = geo.solid_total_surface_area(solid, objects, pts)
+    # Unit cube: 4 lateral faces of area 1 + 2 caps of area 1 = 6 total, 4 lateral.
+    assert lateral == pytest.approx(4.0, abs=1e-12)
+    assert total == pytest.approx(6.0, abs=1e-12)
 
 
 # ---------------------------------------------------------------------------

@@ -52,8 +52,9 @@ max-line-length = 100
 # accommodate that intentional cohesion rather than to invite an arbitrary split.
 # Bumped 2300→2400 as tests/test_geometry.py grew with the issue #60/#78 3-D
 # solid coverage (HullFallback discriminator, bipyramid double-point B-rep branch,
-# KeyError→ValueError and TypeError guards).
-max-module-lines = 2400
+# KeyError→ValueError and TypeError guards), then 2400→2500 for the additional
+# canonicalization / vertical-coplanar / surface-area precision regression tests.
+max-module-lines = 2500
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

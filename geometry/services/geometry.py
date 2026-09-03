@@ -115,6 +115,7 @@ __all__ = [
     "polygon_polygon_distance",
     "tangent_direction",
     "vector_endpoint",
+    "HullFallback",
     "convex_hull_3d",
     "ball_volume",
     "ball_surface_area",
@@ -949,6 +950,13 @@ class HullFallback(enum.Enum):
     separate DEFERRED fast-follow — see ``docs/implementation-design.md`` §13.7
     — and is intentionally *not* implemented here.
 
+    Fields
+    ------
+    value : str
+        The machine-readable tag for this fallback path (``"none"``,
+        ``"coplanar"``, ``"qhull_failure"``). Use this for logging, matching,
+        and branching — not the Solid's human-readable ``name``.
+
     Members
     -------
     NONE
@@ -977,6 +985,28 @@ def _is_coplanar(coords: np.ndarray) -> bool:
     """
     centered = coords - coords.mean(axis=0)
     return bool(np.linalg.matrix_rank(centered, tol=EPS_DISTANCE) < 3)
+
+
+def _project_to_2d_inplane(coords: np.ndarray) -> np.ndarray:
+    """Project 3-D coplanar ``coords`` onto two intrinsic in-plane axes.
+
+    The old code used ``coords[:, :2]`` (XY projection), which collapses a
+    *vertical* or *sloped* coplanar set to a line — making ``ConvexHull``
+    raise "collinear" instead of returning the documented flat fallback. Instead,
+    take the SVD of the mean-centred cloud: the smallest singular vector is the
+    plane normal and the two leading right-singular vectors ``vh[:2]`` are an
+    orthonormal basis for the plane. Projecting onto those gives a genuine 2-D
+    embedding where the convex hull is well-defined.
+
+    Returns
+    -------
+    numpy.ndarray
+        2-D projection, shape ``(n, 2)``, with indices aligned to ``coords`` rows.
+    """
+    centered = coords - coords.mean(axis=0)
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    basis = vh[:2]  # (2, 3): two orthonormal axes spanning the plane
+    return centered @ basis.T
 
 
 def _hull_facets(
@@ -1077,9 +1107,10 @@ def convex_hull_3d(
     rather than inferred from a QHull exception, so a genuine coplanar set is
     distinguished from non-finite coordinates or other precision failures (which
     raise a clear error instead of silently taking the flat-Solid path). On the
-    coplanar branch the function builds the 2-D hull on ``(easting, northing)``
-    and returns a *degenerate* Solid with two identical Polygon layers (zero
-    vertical extent, hence zero volume). The caller is expected to flag it via
+    coplanar branch the function builds the 2-D hull on an intrinsic in-plane projection
+    of the coordinates (not the raw XY plane, which would collapse vertical/sloped
+    coplanar sets to a line) and returns a *degenerate* Solid with two identical Polygon
+    layers (zero vertical extent, hence zero volume). The caller is expected to flag it via
     :func:`geometry.services.validation.validate_solid_non_degenerate` against
     :data:`~geometry.utils.constants.EPS_VOLUME` and warn the user rather than
     silently storing an invisible zero-extent Solid.
@@ -1192,9 +1223,13 @@ def _coplanar_fallback_solid(
 ) -> tuple[Solid, list[Polygon]]:
     """Degenerate flat Solid for the coplanar :func:`convex_hull_3d` case.
 
-    Computes the 2-D hull on ``(easting, northing)`` and wraps it in a Solid
-    with two identical Polygon layers (zero extent → zero volume). Raises
-    ``ValueError`` if the 2-D hull is itself degenerate (collinear points).
+    Computes the 2-D hull on an **intrinsic in-plane projection** of the
+    coordinates (via :func:`_project_to_2d_inplane`) and wraps it in a Solid
+    with two identical Polygon layers (zero extent → zero volume). Projecting
+    onto the point set's own plane — rather than the XY plane — is what lets a
+    *vertical* or *sloped* coplanar set fall back correctly instead of appearing
+    collinear. Raises ``ValueError`` if the 2-D hull is itself degenerate (all
+    points collinear within their plane).
 
     Two :func:`convex_hull_3d` call sites share this helper and pass distinct
     ``name`` values purely as **display labels**:
@@ -1224,7 +1259,7 @@ def _coplanar_fallback_solid(
         Name for the resulting degenerate Solid; see the two callers above.
     """
     try:
-        flat = ConvexHull(coords[:, :2])
+        flat = ConvexHull(_project_to_2d_inplane(coords))
     except QhullError as exc:
         raise ValueError("convex_hull_3d: input points are collinear; no hull exists") from exc
     hull_ids = [ids[i] for i in flat.vertices]
@@ -1901,6 +1936,48 @@ def _solid_layer_rings(
     return rings
 
 
+def _canonicalize_ring(low: list[np.ndarray], up: list[np.ndarray]) -> list[np.ndarray]:
+    """Align ``up`` to ``low``'s positional correspondence.
+
+    Two rings with the same vertex count may still be misaligned: the upper ring
+    can start at a different vertex (cyclic rotation) or wind in the opposite
+    direction (reversal). This tries all ``n`` rotations of both the original and
+    the reversed upper ring, and returns the variant whose total
+    vertex-to-vertex distance to ``low`` is smallest — i.e. the alignment where
+    ``low[i]`` sits above ``up[i]`` as closely as possible.
+
+    Returns
+    -------
+    list[numpy.ndarray]
+        The re-ordered upper ring.
+
+    Raises
+    ------
+    ValueError
+        If ``len(low)`` != ``len(up)`` (the caller should reject unequal counts
+        before calling).
+    """
+    n = len(low)
+    if n != len(up):
+        raise ValueError(f"_canonicalize_ring: rings have differing sizes {n} vs {len(up)}")
+    if n == 0:
+        return []
+    best: list[np.ndarray] | None = None
+    best_score = math.inf
+    for variant in (up, list(reversed(up))):
+        for offset in range(n):
+            score = 0.0
+            for i in range(n):
+                diff = low[i] - variant[(i + offset) % n]
+                score += float(np.dot(diff, diff))
+            if score <= best_score:
+                best_score = score
+                best = [variant[(i + offset) % n] for i in range(n)]
+    if best is None:  # pragma: no cover - guarded by n>0 check, but defensive
+        best = list(up)
+    return best
+
+
 def _lateral_faces(
     lower: tuple[bool, list[np.ndarray]], upper: tuple[bool, list[np.ndarray]]
 ) -> list[list[np.ndarray]]:
@@ -1911,19 +1988,12 @@ def _lateral_faces(
     *differing* vertex counts are rejected — the vertex correspondence is
     ambiguous and outside this issue's scope.
 
-    .. note::
-       For an equal-count polygon band this assumes **positional vertex
-       correspondence**: ``low[i]`` connects to ``up[i]`` (and ``low[i+1]`` to
-       ``up[i+1]``). If the upper polygon is rotated relative to the lower —
-       same vertex count but offset start index, or reversed winding — the quads
-       wind into a twisted, self-intersecting shell whose volume is wrong, and
-       the only thing rejected today is the *differing*-count case. A twist is
-       **not** caught here: a cheap zero-area-quad screen was considered and
-       rejected because the legitimate coplanar-hull fallback (two identical
-       flat layers, :func:`_coplanar_fallback_solid`) produces zero-area bands
-       by design, so such a screen would false-positive on valid degenerate
-       input. Callers must therefore supply layers in corresponding vertex
-       order.
+    For the equal-count polygon case the upper ring is **canonicalized** to
+    align with the lower ring's vertex order (see :func:`_canonicalize_ring`)
+    before connecting ``low[i] ↔ up[i]``. This neutralises both a cyclic
+    rotation (different starting vertex) and a reversed winding between the two
+    layers — the two failure modes that previously produced twisted,
+    self-intersecting shells with a silently wrong volume.
     """
     lower_is_pt, low = lower
     upper_is_pt, up = upper
@@ -1943,6 +2013,7 @@ def _lateral_faces(
             raise ValueError(
                 "solid lateral band between polygons of differing vertex counts is not supported"
             )
+        up = _canonicalize_ring(low, up)
         n = len(low)
         for i in range(n):
             faces.append([low[i], low[(i + 1) % n], up[(i + 1) % n], up[i]])
@@ -2025,11 +2096,20 @@ def _solid_brep(
 
 
 def _face_area_vector(face: Sequence[np.ndarray]) -> np.ndarray:
-    """Newell area vector of a planar polygon face (½·Σ vᵢ × vᵢ₊₁)."""
+    """Newell area vector of a planar polygon face (½·Σ vᵢ × vᵢ₊₁).
+
+    Accumulated in a frame shifted by the first vertex (``ref = face[0]``) so
+    the cross-product terms stay small. The Newell sum is translation-invariant
+    (the shift terms ``ref × (vᵢ − vᵢ₊₁)`` telescope to zero over a closed loop),
+    so this is exact — it just avoids the ~1e17 intermediate magnitudes that
+    absolute UTM coordinates produce and the catastrophic cancellation they
+    cause for small-area faces at large (E, N) offsets.
+    """
     total = np.zeros(3, dtype=np.float64)
     n = len(face)
+    ref = face[0]
     for i in range(n):
-        total += np.cross(face[i], face[(i + 1) % n])
+        total += np.cross(face[i] - ref, face[(i + 1) % n] - ref)
     return 0.5 * total
 
 
