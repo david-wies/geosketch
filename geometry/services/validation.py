@@ -76,18 +76,18 @@ from geometry.services import geometry as geo
 from geometry.utils.constants import EPS_ANGLE, EPS_AREA, EPS_DISTANCE, EPS_VOLUME
 
 __all__ = [
+    "validate_altitude_finite",
+    "validate_ball_tangent_perpendicular",
+    "validate_ball_tangent_point",
+    "validate_circle_tangent_point",
+    "validate_cylinder_axis_elevation",
     "validate_polygon_non_degenerate",
     "validate_polygon_simple",
     "validate_polygon_vertex_count",
-    "validate_circle_tangent_point",
-    "validate_ball_tangent_point",
-    "validate_ball_tangent_perpendicular",
-    "validate_cylinder_axis_elevation",
     "validate_positive_radius",
+    "validate_reference_exists",
     "validate_solid_layers",
     "validate_solid_non_degenerate",
-    "validate_reference_exists",
-    "validate_altitude_finite",
 ]
 
 

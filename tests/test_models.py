@@ -25,9 +25,9 @@ from geometry.models import (
     Ball,
     Circle,
     Cylinder,
-    ElevatedObject,
     DirectionMode,
     DirectionUnits,
+    ElevatedObject,
     GeoObject,
     Line,
     Point,
@@ -674,12 +674,12 @@ def test_elevated_object_rejects_non_finite_direction():
 def test_elevated_object_rejects_raw_string_direction_mode():
     # The wire format uses lowercase strings ("azimuth"); the deserialiser must
     # map them to DirectionMode before construction. A raw string must raise.
-    with pytest.raises(ValueError, match="direction_mode"):
+    with pytest.raises(TypeError, match="direction_mode"):
         Line(**_line_kwargs(direction_mode="azimuth"))
 
 
 def test_elevated_object_rejects_raw_string_direction_units():
-    with pytest.raises(ValueError, match="direction_units"):
+    with pytest.raises(TypeError, match="direction_units"):
         Line(**_line_kwargs(direction_units="radians"))
 
 
@@ -875,12 +875,12 @@ def test_cylinder_inclined_rejects_negative_axis_elevation():
 
 
 def test_cylinder_rejects_raw_string_direction_mode():
-    with pytest.raises(ValueError, match="direction_mode"):
+    with pytest.raises(TypeError, match="direction_mode"):
         Cylinder(**_cylinder_kwargs(direction_mode="azimuth"))
 
 
 def test_cylinder_rejects_raw_string_direction_units():
-    with pytest.raises(ValueError, match="direction_units"):
+    with pytest.raises(TypeError, match="direction_units"):
         Cylinder(**_cylinder_kwargs(direction_units="radians"))
 
 

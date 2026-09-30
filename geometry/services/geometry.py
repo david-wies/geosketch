@@ -77,6 +77,7 @@ that invariant, not a recoverable condition.
 from __future__ import annotations
 
 import enum
+import itertools
 import logging
 import math
 from collections.abc import Mapping, Sequence
@@ -87,7 +88,7 @@ import numpy as np
 import shapely
 from scipy.spatial import ConvexHull, QhullError  # pylint: disable=no-name-in-module
 
-from geometry.models.common import ElevatedObject, DirectionMode, GeoObject
+from geometry.models.common import DirectionMode, ElevatedObject, GeoObject
 from geometry.models.cylinder import Cylinder
 from geometry.models.line import Line
 from geometry.models.point import Point
@@ -99,38 +100,38 @@ from geometry.utils.constants import EPS_ANGLE, EPS_DISTANCE, EPS_PARAM, EPS_VOL
 from geometry.utils.id_factory import IDFactory
 
 __all__ = [
-    "azimuth",
-    "distance",
-    "elevation",
-    "three_point_azimuth_elevation",
-    "signed_area",
-    "is_convex",
-    "convex_hull",
-    "horizontal_unit_vector",
-    "line_intersection",
-    "line_polygon_intersections",
-    "polygon_polygon_intersections",
-    "ray_polygon_distance",
-    "point_polygon_distance",
-    "polygon_polygon_distance",
-    "tangent_direction",
-    "vector_endpoint",
+    "CylinderCrossSection",
     "HullFallback",
-    "convex_hull_3d",
-    "ball_volume",
-    "ball_surface_area",
+    "azimuth",
     "ball_cross_section_radius",
+    "ball_surface_area",
     "ball_tangent_direction",
-    "cylinder_volume",
-    "cylinder_lateral_surface_area",
-    "cylinder_total_surface_area",
+    "ball_volume",
+    "convex_hull",
+    "convex_hull_3d",
     "cylinder_axis_vector",
     "cylinder_cross_section",
-    "CylinderCrossSection",
+    "cylinder_lateral_surface_area",
+    "cylinder_total_surface_area",
+    "cylinder_volume",
+    "distance",
+    "elevation",
+    "horizontal_unit_vector",
+    "is_convex",
+    "line_intersection",
+    "line_polygon_intersections",
+    "point_polygon_distance",
+    "polygon_polygon_distance",
+    "polygon_polygon_intersections",
+    "ray_polygon_distance",
+    "signed_area",
     "solid_faces",
-    "solid_volume_centroid",
     "solid_lateral_surface_area",
     "solid_total_surface_area",
+    "solid_volume_centroid",
+    "tangent_direction",
+    "three_point_azimuth_elevation",
+    "vector_endpoint",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -1557,7 +1558,7 @@ class CylinderCrossSection:
     approximate: bool = False
 
     @classmethod
-    def circle(cls, radius: float) -> "CylinderCrossSection":
+    def circle(cls, radius: float) -> CylinderCrossSection:
         """Build a circular cross-section (offset-independent perpendicular cut).
 
         Parameters
@@ -1576,7 +1577,7 @@ class CylinderCrossSection:
     @classmethod
     def ellipse(
         cls, semi_major: float, semi_minor: float, *, approximate: bool = True
-    ) -> "CylinderCrossSection":
+    ) -> CylinderCrossSection:
         """Build an elliptical cross-section (oblique cut).
 
         Parameters
@@ -1598,7 +1599,7 @@ class CylinderCrossSection:
     @classmethod
     def rectangle(
         cls, width: float, height: float, *, approximate: bool = True
-    ) -> "CylinderCrossSection":
+    ) -> CylinderCrossSection:
         """Build a rectangular cross-section (cut parallel to the axis).
 
         Parameters
@@ -1624,7 +1625,7 @@ class CylinderCrossSection:
         dimensions: tuple[float, ...],
         *,
         approximate: bool,
-    ) -> "CylinderCrossSection":
+    ) -> CylinderCrossSection:
         """Set the ``init=False`` fields on a fresh frozen instance.
 
         Routing every classmethod through this single factory keeps the
@@ -2090,7 +2091,7 @@ def _solid_brep(
     if not last_is_pt:
         caps.append(list(last))  # top cap: outward normal points up
     laterals: list[list[np.ndarray]] = []
-    for lower, upper in zip(rings, rings[1:]):
+    for lower, upper in itertools.pairwise(rings):
         laterals.extend(_lateral_faces(lower, upper))
     return caps, laterals
 

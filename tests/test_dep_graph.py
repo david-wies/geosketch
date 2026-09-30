@@ -44,7 +44,6 @@ from geometry.models import (
 )
 from geometry.services.dep_graph import DependencyGraph, deps_for_type
 
-
 # ---------------------------------------------------------------------------
 # Compact model builders. Only the reference fields matter for deps_for_type;
 # the rest are filled with valid-but-arbitrary envelope values.

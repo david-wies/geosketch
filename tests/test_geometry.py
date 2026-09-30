@@ -2030,9 +2030,11 @@ def test_solid_volume_centroid_non_finite_volume_raises():
     bottom = _poly("pg_b", ("hb0", "hb1", "hb2", "hb3"))
     top = _poly("pg_t", ("ht0", "ht1", "ht2", "ht3"))
     objects = {"pg_b": bottom, "pg_t": top}
-    with np.errstate(over="ignore", invalid="ignore"):
-        with pytest.raises(ValueError, match="non-finite signed volume"):
-            geo.solid_volume_centroid(_solid(("pg_b", "pg_t")), objects, pts)
+    with (
+        np.errstate(over="ignore", invalid="ignore"),
+        pytest.raises(ValueError, match="non-finite signed volume"),
+    ):
+        geo.solid_volume_centroid(_solid(("pg_b", "pg_t")), objects, pts)
 
 
 @pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf], ids=["nan", "inf", "-inf"])
