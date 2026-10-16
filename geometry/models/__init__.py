@@ -14,7 +14,7 @@
 
 from geometry.models.ball import Ball
 from geometry.models.circle import Circle
-from geometry.models.common import ElevatedObject, DirectionMode, DirectionUnits, GeoObject
+from geometry.models.common import DirectionMode, DirectionUnits, ElevatedObject, GeoObject
 from geometry.models.cylinder import Cylinder
 from geometry.models.line import Line
 from geometry.models.point import Point
@@ -26,19 +26,19 @@ from geometry.models.tangent import Tangent
 from geometry.models.vector import Vector
 
 __all__ = [
-    "GeoObject",
-    "ElevatedObject",
+    "Ball",
+    "Circle",
+    "Cylinder",
     "DirectionMode",
     "DirectionUnits",
-    "Point",
+    "ElevatedObject",
+    "GeoObject",
     "Line",
+    "Point",
     "Polygon",
     "Ray",
-    "Vector",
-    "Circle",
-    "Ball",
-    "Cylinder",
+    "SlicePlane",
     "Solid",
     "Tangent",
-    "SlicePlane",
+    "Vector",
 ]

@@ -16,7 +16,7 @@ geosketch = "geometry.__main__:main"
 [tool.ruff]
 line-length = 100
 target-version = "py314"
-extend-exclude = [".claude", ".github", "spec"]
+extend-exclude = [".claude", ".github", "spec", "docs"]
 
 [tool.pylint.main]
 ignore-paths = ["spec", ".claude", ".github", ".venv"]

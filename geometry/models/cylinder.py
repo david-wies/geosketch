@@ -98,12 +98,12 @@ class Cylinder(GeoObject):
         # Reject raw wire strings that bypass the enum, mirroring ElevatedObject:
         # the deserialiser must map "azimuth"/"radians" to the enum members.
         if not isinstance(self.direction_mode, DirectionMode):
-            raise ValueError(
+            raise TypeError(
                 f"Cylinder.direction_mode must be a DirectionMode member; "
                 f"got {self.direction_mode!r}"
             )
         if not isinstance(self.direction_units, DirectionUnits):
-            raise ValueError(
+            raise TypeError(
                 f"Cylinder.direction_units must be a DirectionUnits member; "
                 f"got {self.direction_units!r}"
             )

@@ -53,30 +53,26 @@ from geometry.utils.id_factory import IDFactory
 # R0801 fires because this re-export list necessarily mirrors the submodule's
 # own __all__. Both lists are intentional public surface declarations.
 __all__ = [
-    # constants
+    "CANVAS_STALE",
+    "DEFINED_EVENTS",
     "EPS_ALTITUDE",
     "EPS_ANGLE",
     "EPS_AREA",
     "EPS_DISTANCE",
     "EPS_PARAM",
     "EPS_VOLUME",
-    # angles
-    "angle_to_azimuth",
-    "azimuth_to_angle",
-    "normalize_to_2pi",
-    "to_degrees",
-    "to_radians",
-    # id factory
-    "IDFactory",
-    # events
-    "CANVAS_STALE",
-    "DEFINED_EVENTS",
-    "EventBus",
-    "EventHandler",
     "HISTORY_CHANGED",
     "OBJECT_CREATED",
     "OBJECT_DELETED",
     "OBJECT_MODIFIED",
     "PROJECT_LOADED",
     "SELECTION_CHANGED",
+    "EventBus",
+    "EventHandler",
+    "IDFactory",
+    "angle_to_azimuth",
+    "azimuth_to_angle",
+    "normalize_to_2pi",
+    "to_degrees",
+    "to_radians",
 ]

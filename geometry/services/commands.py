@@ -76,7 +76,7 @@ import logging
 import math
 from collections import deque
 from collections.abc import Sequence
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 from geometry.models import GeoObject
 from geometry.models.common import DirectionMode
@@ -107,14 +107,14 @@ from geometry.utils.events import (
 __all__ = [
     "MAX_HISTORY",
     "REFERENCE_FIELDS",
+    "BulkImportCommand",
+    "CascadeDeleteCommand",
     "Command",
     "CommandHistory",
     "CreateObjectCommand",
-    "CascadeDeleteCommand",
     "ModifyObjectCommand",
-    "MovePointCommand",
     "ModifyPolygonVerticesCommand",
-    "BulkImportCommand",
+    "MovePointCommand",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -496,11 +496,10 @@ class CreateObjectCommand:
         try:
             self._graph.add(self._obj)
         except Exception:
-            _logger.error(
+            _logger.exception(
                 "CreateObjectCommand.do: graph registration failed for %r; "
                 "removing the just-inserted store entry",
                 self._obj.id,
-                exc_info=True,
             )
             del self._objects[self._obj.id]
             raise
@@ -615,7 +614,7 @@ class CascadeDeleteCommand:
                 del self._objects[oid]
                 store_removed.append(obj)  # record before the graph call can raise
                 self._graph.unregister(oid)
-        except Exception as original_exc:  # pylint: disable=broad-exception-caught
+        except Exception as original_exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
             self._rollback_failed_do(store_removed, original_exc)
         else:
             # Fire only on the success path. ``_rollback_failed_do`` always
@@ -652,29 +651,27 @@ class CascadeDeleteCommand:
             "removing %d store entr(ies); rolling back",
             self._root_id,
             len(store_removed),
-            exc_info=True,
+            exc_info=original_exc,
         )
         failures: list[tuple[str, BaseException]] = []
         for obj in store_removed:
             try:
                 self._objects[obj.id] = obj
-            except Exception as rollback_exc:  # noqa: BLE001  pylint: disable=broad-exception-caught
-                _logger.error(
+            except Exception as rollback_exc:  # pylint: disable=broad-exception-caught
+                _logger.exception(
                     "CascadeDeleteCommand.do: rollback failed to restore store "
                     "entry %r; continuing",
                     obj.id,
-                    exc_info=True,
                 )
                 failures.append((obj.id, rollback_exc))
         for obj in self._snapshot.values():
             try:
                 self._graph.add(obj)
-            except Exception as rollback_exc:  # noqa: BLE001  pylint: disable=broad-exception-caught
-                _logger.error(
+            except Exception as rollback_exc:  # pylint: disable=broad-exception-caught
+                _logger.exception(
                     "CascadeDeleteCommand.do: rollback failed to re-register "
                     "edges for %r; continuing",
                     obj.id,
-                    exc_info=True,
                 )
                 failures.append((obj.id, rollback_exc))
         self._snapshot = {}
@@ -719,12 +716,11 @@ class CascadeDeleteCommand:
                 self._graph.add(obj)
                 self._bus.fire(OBJECT_CREATED, obj_id=obj.id)
         except Exception as original_exc:  # pylint: disable=broad-exception-caught
-            _logger.error(
+            _logger.exception(
                 "CascadeDeleteCommand.undo: failed mid-restore for root %r after "
                 "restoring %d object(s); rolling back the partial restore",
                 self._root_id,
                 len(restored),
-                exc_info=True,
             )
             # Attempt every cleanup step, but record (do not swallow) any step
             # that itself raises so a partially-failed rollback is surfaced
@@ -734,12 +730,11 @@ class CascadeDeleteCommand:
                 try:
                     self._objects.pop(obj.id, None)
                     self._graph.unregister(obj.id)
-                except Exception as rollback_exc:  # noqa: BLE001  pylint: disable=broad-exception-caught
-                    _logger.error(
+                except Exception as rollback_exc:  # pylint: disable=broad-exception-caught
+                    _logger.exception(
                         "CascadeDeleteCommand.undo: rollback failed to remove "
                         "partial restore of %r; continuing",
                         obj.id,
-                        exc_info=True,
                     )
                     rollback_failures.append((obj.id, rollback_exc))
             # Mirror do()'s contract: clear the snapshot on any restore failure.
@@ -1018,13 +1013,11 @@ class MovePointCommand:
                 # no tangent". The failure happens here in ``__init__`` before any
                 # store mutation, so the store/graph stay clean; re-raise with the
                 # moved point and offending dependent named, and the move rejected.
-                _logger.error(
+                _logger.exception(
                     "MovePointCommand: moving point %r would invalidate dependent "
-                    "%r; rejecting the move (%s)",
+                    "%r; rejecting the move",
                     point_id,
                     dep_id,
-                    exc,
-                    exc_info=True,
                 )
                 raise ValueError(
                     f"Cannot move point {point_id!r}: it would invalidate dependent "
@@ -1040,13 +1033,11 @@ class MovePointCommand:
                 # None of these is a user-rejectable geometry error, so surface
                 # them all as a ``RuntimeError`` naming the move and the
                 # offending dependent, chained from the original exception.
-                _logger.error(
+                _logger.exception(
                     "MovePointCommand: recompute of dependent %r for moved point %r "
-                    "hit a structural inconsistency (%r)",
+                    "hit a structural inconsistency",
                     dep_id,
                     point_id,
-                    exc,
-                    exc_info=True,
                 )
                 raise RuntimeError(
                     f"Cannot move point {point_id!r}: dependent {dep_id!r} is "
@@ -1096,9 +1087,11 @@ class MovePointCommand:
         """
         result = copy.deepcopy(obj)
         if isinstance(result, Line):
-            az = float(_azimuth(store[result.point_a_id], store[result.point_b_id]))
+            pa = cast(Point, store[result.point_a_id])
+            pb = cast(Point, store[result.point_b_id])
+            az = float(_azimuth(pa, pb))
             result.direction = MovePointCommand._directed_value(az, result.direction_mode)
-            result.elevation = float(_elevation(store[result.point_a_id], store[result.point_b_id]))
+            result.elevation = float(_elevation(pa, pb))
         elif isinstance(result, Vector):
             # Length+Direction vectors (endpoint_id is None) translate with the
             # origin and store no point-derived geometry, so leave them as-is.
@@ -1348,11 +1341,10 @@ class BulkImportCommand:
                 cmd.do()
                 applied.append(cmd)
         except Exception as original_exc:  # pylint: disable=broad-exception-caught
-            _logger.error(
+            _logger.exception(
                 "BulkImportCommand.do: failed after applying %d of %d creation(s); rolling back",
                 len(applied),
                 len(self._commands),
-                exc_info=True,
             )
             # Fault-tolerant rollback: every wrapped ``undo`` is still attempted
             # even when one fails. Mirroring :class:`CascadeDeleteCommand`, a
@@ -1367,11 +1359,10 @@ class BulkImportCommand:
             for cmd in reversed(applied):
                 try:
                     cmd.undo()
-                except Exception as rollback_exc:  # noqa: BLE001  pylint: disable=broad-exception-caught
-                    _logger.error(
+                except Exception as rollback_exc:  # pylint: disable=broad-exception-caught
+                    _logger.exception(
                         "BulkImportCommand.do: rollback undo of %r failed; continuing",
                         cmd.description,
-                        exc_info=True,
                     )
                     rollback_failures.append((cmd.description, rollback_exc))
             if rollback_failures:
@@ -1398,11 +1389,10 @@ class BulkImportCommand:
                 cmd.undo()
                 reversed_so_far.append(cmd)
         except Exception as original_exc:  # pylint: disable=broad-exception-caught
-            _logger.error(
+            _logger.exception(
                 "BulkImportCommand.undo: failed after reversing %d of %d creation(s); restoring",
                 len(reversed_so_far),
                 len(self._commands),
-                exc_info=True,
             )
             # Fault-tolerant restoration: every wrapped ``do`` is still attempted
             # even when one fails. Mirroring :class:`CascadeDeleteCommand`, a
@@ -1417,11 +1407,10 @@ class BulkImportCommand:
             for cmd in reversed(reversed_so_far):
                 try:
                     cmd.do()
-                except Exception as rollback_exc:  # noqa: BLE001  pylint: disable=broad-exception-caught
-                    _logger.error(
+                except Exception as rollback_exc:  # pylint: disable=broad-exception-caught
+                    _logger.exception(
                         "BulkImportCommand.undo: restoration do of %r failed; continuing",
                         cmd.description,
-                        exc_info=True,
                     )
                     rollback_failures.append((cmd.description, rollback_exc))
             if rollback_failures:

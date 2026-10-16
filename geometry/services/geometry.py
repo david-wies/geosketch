@@ -73,7 +73,7 @@ import numpy as np
 import shapely
 from scipy.spatial import ConvexHull  # pylint: disable=no-name-in-module
 
-from geometry.models.common import ElevatedObject, DirectionMode
+from geometry.models.common import DirectionMode, ElevatedObject
 from geometry.models.line import Line
 from geometry.models.point import Point
 from geometry.models.polygon import Polygon
@@ -83,20 +83,20 @@ from geometry.utils.constants import EPS_ANGLE, EPS_DISTANCE, EPS_PARAM
 
 __all__ = [
     "azimuth",
+    "convex_hull",
     "distance",
     "elevation",
-    "three_point_azimuth_elevation",
-    "signed_area",
-    "is_convex",
-    "convex_hull",
     "horizontal_unit_vector",
+    "is_convex",
     "line_intersection",
     "line_polygon_intersections",
-    "polygon_polygon_intersections",
-    "ray_polygon_distance",
     "point_polygon_distance",
     "polygon_polygon_distance",
+    "polygon_polygon_intersections",
+    "ray_polygon_distance",
+    "signed_area",
     "tangent_direction",
+    "three_point_azimuth_elevation",
     "vector_endpoint",
 ]
 
