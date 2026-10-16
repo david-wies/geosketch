@@ -338,7 +338,7 @@ class _FaultInjectGraph(DependencyGraph):
             raise RuntimeError(f"induced unregister failure for {obj_id!r}")
         super().unregister(obj_id, strict=strict)
 
-    def add(self, obj) -> None:  # noqa: ANN001 - GeoObject, matches base signature
+    def add(self, obj) -> None:
         self.add_attempts.append(obj.id)
         if obj.id == self._add_fail_id:
             self._add_fail_id = None  # fire once

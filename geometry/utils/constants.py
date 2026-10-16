@@ -60,10 +60,10 @@ EPS_ALTITUDE: float = 1e-6
 EPS_VOLUME: float = 1e-9
 
 __all__ = [
-    "EPS_DISTANCE",
+    "EPS_ALTITUDE",
     "EPS_ANGLE",
     "EPS_AREA",
+    "EPS_DISTANCE",
     "EPS_PARAM",
-    "EPS_ALTITUDE",
     "EPS_VOLUME",
 ]

@@ -208,12 +208,12 @@ class EventBus:
 __all__ = [
     "CANVAS_STALE",
     "DEFINED_EVENTS",
-    "EventBus",
-    "EventHandler",
     "HISTORY_CHANGED",
     "OBJECT_CREATED",
     "OBJECT_DELETED",
     "OBJECT_MODIFIED",
     "PROJECT_LOADED",
     "SELECTION_CHANGED",
+    "EventBus",
+    "EventHandler",
 ]

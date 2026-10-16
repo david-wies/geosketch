@@ -182,12 +182,12 @@ class ElevatedObject(GeoObject):
         # deserialiser must map them to ``DirectionMode``/``DirectionUnits``
         # before construction, never hand them through verbatim.
         if not isinstance(self.direction_mode, DirectionMode):
-            raise ValueError(
+            raise TypeError(
                 f"ElevatedObject.direction_mode must be a DirectionMode member; "
                 f"got {self.direction_mode!r}"
             )
         if not isinstance(self.direction_units, DirectionUnits):
-            raise ValueError(
+            raise TypeError(
                 f"ElevatedObject.direction_units must be a DirectionUnits member; "
                 f"got {self.direction_units!r}"
             )

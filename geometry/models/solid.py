@@ -59,9 +59,7 @@ class Solid(GeoObject):
         # treated as a polygon. Reject it here rather than deferring to the
         # services layer, since a mis-prefixed ID is a real correctness footgun.
         bad_prefixes = [
-            layer_id
-            for layer_id in self.layers
-            if not (layer_id.startswith("pg_") or layer_id.startswith("pt_"))
+            layer_id for layer_id in self.layers if not layer_id.startswith(("pg_", "pt_"))
         ]
         if bad_prefixes:
             raise ValueError(
